@@ -1,0 +1,13 @@
+{
+  "name": "token-world-web",
+  "private": true,
+  "type": "module",
+  "description": "The Tetris world model in the browser (WebGPU); see docs/guides/dynamics.md",
+  "scripts": {
+    "test": "node test_dreamer.mjs"
+  },
+  "devDependencies": {
+    "onnxruntime-node": "1.30.0",
+    "puppeteer-core": "^25.12.0"
+  }
+}
