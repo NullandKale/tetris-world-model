@@ -17,6 +17,8 @@ const FRAME_MS = 1000 / 60;
 const $ = (id) => document.getElementById(id);
 const screen = $("screen"), ctx = screen.getContext("2d"), image = ctx.createImageData(256, 256);
 let held = 0, paused = false, pending = Promise.resolve(), dreamer, context, palette, backend;
+let keyboard = 0;                                   // buttons held on the keyboard
+const touches = new Map();                          // on-screen button held by each pointer (finger, mouse)
 
 const load = async (name) => {
   const response = await fetch(`model/${name}`);
@@ -116,17 +118,36 @@ async function run() {
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+// The controller byte the next frame gets: the keyboard's buttons and the on-screen ones, together.
+function update() {
+  held = keyboard;
+  for (const bit of touches.values()) held |= bit;
+  $("held").textContent = NAMES.filter(([, b]) => held & b).map(([n]) => n).join(" ");
+  for (const button of $("pad").querySelectorAll("button"))
+    button.classList.toggle("down", (held & Number(button.dataset.bit)) !== 0);
+}
+
 function key(event, down) {
   const bit = KEYS[event.key];
   if (bit === undefined) return;
   event.preventDefault();
-  held = down ? held | bit : held & ~bit;
-  $("held").textContent = NAMES.filter(([, b]) => held & b).map(([n]) => n).join(" ");
+  keyboard = down ? keyboard | bit : keyboard & ~bit;
+  update();
 }
+
+for (const button of $("pad").querySelectorAll("button")) {
+  const bit = Number(button.dataset.bit);
+  const release = (e) => { touches.delete(e.pointerId); update(); };
+  button.addEventListener("pointerdown", (e) => { e.preventDefault(); touches.set(e.pointerId, bit); update(); });
+  button.addEventListener("pointerup", release);
+  button.addEventListener("pointercancel", release);
+  button.addEventListener("pointerleave", release);
+}
+$("pad").addEventListener("contextmenu", (e) => e.preventDefault());   // no long-press menu on phones
 
 addEventListener("keydown", (e) => key(e, true));
 addEventListener("keyup", (e) => key(e, false));
-addEventListener("blur", () => { held = 0; $("held").textContent = ""; });
+addEventListener("blur", () => { keyboard = 0; touches.clear(); update(); });
 $("level").addEventListener("change", () => { dreamer.level = Number($("level").value); screen.focus(); });
 $("restart").addEventListener("click", async () => {
   paused = true;
