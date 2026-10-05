@@ -3,9 +3,9 @@
 // and anything onnxruntime-web logged (nodes it could not run on WebGPU, errors). Uses the GPU, so not
 // while training runs.
 //
-//     cd web && npm install && node check_browser.mjs [path to chrome.exe] [--root ../site]
+//     cd web && npm install && node check_browser.mjs [path to chrome.exe] [--root ../site/web]
 //
-// --root serves another folder (a built site/); without model/reference.bin there it plays only.
+// --root serves another folder (a built site's page, site/web); without model/reference.bin there it plays only.
 import { createServer } from "node:http";
 import { existsSync, writeFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
