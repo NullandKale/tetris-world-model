@@ -40,23 +40,27 @@ def load(run: Path) -> tuple[Dynamics, int]:
     return model, int(saved["step"])
 
 
-def sheet(path: Path, frames: np.ndarray, rollouts: dict[str, np.ndarray], palette: np.ndarray, title: str) -> None:
-    """Columns: last context frame, then SHEET_HORIZONS. Rows: real, then each model's rollout."""
+def sheet(path: Path, frames: np.ndarray, rollouts: dict[str, tuple[np.ndarray, np.ndarray]], palette: np.ndarray,
+          title: str) -> None:
+    """Columns: last context frame, then SHEET_HORIZONS. Rows: real, then each model's rollout (expected colours,
+    magenta in proportion to each pixel's probability of being wrong)."""
     size, label = 256, 18
-    rows = [("real", [frames[CONTEXT - 1]] + [frames[CONTEXT - 1 + h] for h in SHEET_HORIZONS])]
-    rows += [(name, [frames[CONTEXT - 1]] + [gen[h - 1] for h in SHEET_HORIZONS]) for name, gen in rollouts.items()]
+    context = palette[frames[CONTEXT - 1]]
+    rows = [("real", [context] + [palette[frames[CONTEXT - 1 + h]] for h in SHEET_HORIZONS])]
+    for name, (rgb, wrong) in rollouts.items():
+        pictures = [context]
+        for h in SHEET_HORIZONS:
+            w = wrong[h - 1].astype(np.float32)[..., None]
+            pictures.append(rgb[h - 1] * (1 - w) + np.array([255, 0, 200]) * w)
+        rows.append((name, pictures))
     image = Image.new("RGB", ((1 + len(SHEET_HORIZONS)) * size, 20 + len(rows) * (size + label)), "#181820")
     draw = ImageDraw.Draw(image)
     draw.text((4, 4), title, fill="white")
     for r, (name, row) in enumerate(rows):
         y = 20 + r * (size + label)
-        for c, frame in enumerate(row):
+        for c, picture in enumerate(row):
             caption = "context" if c == 0 else f"+{SHEET_HORIZONS[c - 1]}"
             draw.text((c * size + 4, y + 3), f"{name} {caption}", fill="white")
-            picture = palette[frame]
-            if r and c:                                               # mark this model's wrong pixels
-                picture = picture.copy()
-                picture[frame != rows[0][1][c]] = (255, 0, 200)
             image.paste(Image.fromarray(picture.astype(np.uint8), "RGB"), (c * size, y + label))
     image.save(path)
 
@@ -97,11 +101,11 @@ def main():
     def flush(scenario: str) -> None:
         batch = pending.pop(scenario)
         for name, model in models.items():
-            scores, generated = evaluate(model, batch)
+            scores, rgb, wrong = evaluate(model, batch, palette)
             rows.extend({"model": name, "scenario": scenario, "stream": i.stream, "game": f"{i.stream}:{i.game}",
                          "level": i.level, **s} for i, s in zip(batch, scores))
             if scenario not in first or name not in first[scenario][1]:
-                first.setdefault(scenario, (batch[0].frames, {}))[1][name] = generated[0]
+                first.setdefault(scenario, (batch[0].frames, {}))[1][name] = (rgb[0], wrong[0])
 
     started = time.time()
     for instance in spread(live_instances(args.seed, args.workers), args.per, args.minutes * 60, args.workers):
@@ -120,7 +124,7 @@ def main():
     for scenario, (frames, rollouts) in first.items():
         slug = scenario.replace(" ", "_").replace(":", "").replace("(", "").replace(")", "")
         sheet(args.out / f"{slug}.png", frames, rollouts, palette,
-              f"{scenario}: first visible change at +{LEAD}; magenta = wrong pixels")
+              f"{scenario}: first visible change at +{LEAD}; magenta = likely wrong pixels")
 
     rng = np.random.default_rng(0)
     print(f"\nevent pixels wrong at +{LEAD} and +16, and exact at +{LEAD}: mean [95% interval over games]")

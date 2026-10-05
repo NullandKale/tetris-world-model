@@ -140,6 +140,8 @@ def best_placement(board: np.ndarray, piece: str, next_piece: str | None, well: 
 
 
 PATIENT_FRAMES = (30, 180)                          # no-button wait of a patient piece, then soft drop
+SPIN_HEIGHT = 8                                     # a spinning piece needs a stack at most this many rows high
+SPIN_RATE = 1 / 8                                   # chance per waiting frame that a spinning piece rotates
 
 
 class PerfectBrain:
@@ -148,14 +150,18 @@ class PerfectBrain:
     well: build for tetrises (scores). patience: the chance that a piece, once
     lined up, is left to fall by gravity for PATIENT_FRAMES frames before it is
     soft-dropped (drawn per piece), so the data shows pieces falling on their
-    own at every level without slow levels taking ~860 frames a piece. Call
+    own at every level without slow levels taking ~860 frames a piece. spin: the
+    chance that a patient piece over a low stack (SPIN_HEIGHT rows or fewer)
+    spins while it waits, A or B at random (SPIN_RATE a frame), so the data shows
+    rotations in every orientation as a player makes them, not only the few on
+    the way to a planned one; when the wait ends it turns back and drops. Call
     reset() when it takes over mid-game: it replans only when a new piece
     spawns, so a stale target from an earlier piece would otherwise steer the
     falling one.
     """
 
-    def __init__(self, well: bool = False, patience: float = 0.0):
-        self.well, self.patience = well, patience
+    def __init__(self, well: bool = False, patience: float = 0.0, spin: float = 0.0):
+        self.well, self.patience, self.spin = well, patience, spin
         self.reset()
 
     def reset(self) -> None:
@@ -163,6 +169,7 @@ class PerfectBrain:
         self.last_y = None
         self.last_action = 0
         self.wait = 0
+        self.waiting = self.spinning = False
 
     def choose(self, ram: np.ndarray, orientation: int, rng: np.random.Generator):
         return best_placement(settled_board(ram), TYPE_OF[orientation], TYPE_OF.get(int(ram[NEXT])), self.well)
@@ -175,6 +182,11 @@ class PerfectBrain:
         if self.target is None or self.last_y is None or y < self.last_y:     # a new piece spawned
             self.target = self.choose(ram, orientation, rng)
             self.wait = int(rng.integers(*PATIENT_FRAMES)) if rng.random() < self.patience else 0
+            self.waiting = False
+            board = settled_board(ram)
+            height = 20 - int(board.any(1).argmax()) if board.any() else 0
+            self.spinning = (self.spin > 0 and self.wait > 0 and height <= SPIN_HEIGHT
+                             and rng.random() < self.spin)
             self.last_y = y
             self.last_action = 0
             return 0                                         # soft drop only re-arms after Down is released
@@ -182,17 +194,64 @@ class PerfectBrain:
         action = DOWN
         if self.target is not None:
             goal, column = self.target
-            if orientation != goal:
+            if not self.waiting and orientation == goal and x == column and self.wait > 0:
+                self.waiting = True                              # lined up, patient: let gravity work
+            if self.waiting:
+                self.wait -= 1
+                self.waiting = self.wait > 0
+                action = int(rng.choice((A, B))) if self.spinning and rng.random() < SPIN_RATE else 0
+            elif orientation != goal:
                 action = A
             elif x < column:
                 action = RIGHT
             elif x > column:
                 action = LEFT
-            elif self.wait > 0:                                  # lined up, patient: let gravity work
-                self.wait -= 1
-                action = 0
         if action != DOWN and self.last_action & action:                     # release: moves act on press edges
             action = 0
+        self.last_action = action
+        return action
+
+
+ROTATE_HOLD = (2, 7)                                # frames a holding brain keeps A or B down per turn
+
+
+class HoldingBrain(PerfectBrain):
+    """Plans each piece like the perfect brain, then plays like a patient person who holds buttons: A or B
+    held a few frames per turn (a turn registers on the press; released a frame between turns), Left or
+    Right held until the piece reaches its column (the game's autorepeat moves it: a cell on the press,
+    then one every 6 frames after 16), and never Down: every piece falls by gravity all the way, lands,
+    locks and is followed by a spawn untouched. The other brains tap and soft-drop, so held shifts (0.45
+    per 1,000 frames), landings by gravity (1.9) and untouched falls over 180 frames (none) were rare
+    in training (event census 2026-10-02, docs/guides/dynamics.md)."""
+
+    def reset(self) -> None:
+        super().reset()
+        self.turn = 0                                   # frames left holding the current turn's button
+
+    def __call__(self, ram: np.ndarray, rng: np.random.Generator) -> int:
+        orientation, x, y = int(ram[PIECE]), int(ram[X]), int(ram[Y])
+        if orientation not in ORIENTATIONS:
+            self.last_action = self.turn = 0
+            return 0
+        if self.target is None or self.last_y is None or y < self.last_y:     # a new piece spawned
+            self.target = self.choose(ram, orientation, rng)
+            self.last_y, self.last_action, self.turn = y, 0, 0
+            return 0
+        self.last_y = y
+        action = 0
+        if self.target is not None:
+            goal, column = self.target
+            if orientation != goal or self.turn > 0:
+                if self.turn > 0:                       # keep holding this turn's button
+                    self.turn -= 1
+                    action = self.last_action & (A | B)
+                elif not self.last_action & (A | B):    # press for the next turn (after a release)
+                    action = int(rng.choice((A, B)))
+                    self.turn = int(rng.integers(*ROTATE_HOLD)) - 1
+            elif x < column:
+                action = RIGHT
+            elif x > column:
+                action = LEFT
         self.last_action = action
         return action
 
@@ -247,27 +306,33 @@ class BrainSwitcher:
     - long games (LONG frames): the perfect brain only, from start levels
       0-9, so they climb through every palette with a level-up every 10 lines
       (NES Tetris delays the first level-up to 100 lines from start levels
-      10-19) and reach levels 20+; idle or random stretches at those speeds
-      would top the game out early;
-    - short games (SHORT frames): perfect / random / idle at random intervals,
+      10-19) and reach levels 20+; idle, random or holding stretches at those
+      speeds would top the game out early (holding: autorepeat waits 16 frames,
+      and from level 15 a piece falls the well in ~40);
+    - short games (SHORT frames): perfect / holding / random / idle at random intervals,
       from any start level 0-19: the variety and the sloppy boards.
     When its length runs out the player gives up, reckless (random placements,
     soft-dropped) or random, until the stack tops out. The perfect brain leaves
-    PATIENCE of its pieces to fall by gravity. In WELL_SHARE of games
+    PATIENCE of its pieces to fall by gravity, and SPIN of those spin while they
+    fall if the stack is low. In WELL_SHARE of games
     the perfect brain builds for tetrises. Every brain resets when it takes over.
     """
 
-    INTERVALS = {"perfect": (2400, 6000), "random": (150, 500), "idle": (150, 500), "reckless": (150, 500)}
-    WEIGHTS = {"perfect": 0.60, "random": 0.25, "idle": 0.15}
+    INTERVALS = {"perfect": (2400, 6000), "holding": (2400, 6000), "random": (150, 500), "idle": (150, 500),
+                 "reckless": (150, 500)}
+    WEIGHTS = {"perfect": 0.45, "holding": 0.25, "random": 0.20, "idle": 0.10}
     LONG_WEIGHTS = {"perfect": 1.0}
     GIVE_UP = {"reckless": 0.75, "random": 0.25}
     SHORT, LONG, LONG_SHARE = (1500, 3500), (20_000, 45_000), 0.08
     SHORT_START_LEVELS, LONG_START_LEVELS = 20, 10
     WELL_SHARE = 0.5
     PATIENCE = 0.3
+    SPIN = 0.5
 
     def __init__(self, rng: np.random.Generator, long: bool):
-        self.brains = {"perfect": PerfectBrain(well=rng.random() < self.WELL_SHARE, patience=self.PATIENCE),
+        self.brains = {"perfect": PerfectBrain(well=rng.random() < self.WELL_SHARE, patience=self.PATIENCE,
+                                               spin=self.SPIN),
+                       "holding": HoldingBrain(well=rng.random() < self.WELL_SHARE),
                        "random": RandomBrain(),
                        "idle": IdleBrain(), "reckless": RecklessBrain()}
         self.mix = self.LONG_WEIGHTS if long else self.WEIGHTS

@@ -130,6 +130,52 @@ class TetrisBotTests(unittest.TestCase):
             patient.append(brain.wait > 0)
         self.assertAlmostEqual(np.mean(patient), 0.3, delta=0.03)
 
+    def test_patient_pieces_spin_over_a_low_stack_then_turn_back_and_drop(self):
+        board = np.zeros((20, 10), bool)
+        board[16:, :9] = True                                                      # 4 rows: low
+        brain, rng = T.PerfectBrain(patience=1.0, spin=1.0), np.random.default_rng(0)
+        brain(ram_with(board, 0x11, 9, 0), rng)
+        self.assertTrue(brain.spinning)
+        orientation, pressed = 0x11, []
+        for _ in range(T.PATIENT_FRAMES[1] + 20):
+            action = brain(ram_with(board, orientation, 9, 1), rng)
+            pressed.append(action)
+            if action & (T.A | T.B):                                               # I piece: 0x11 <-> 0x12
+                orientation = 0x12 if orientation == 0x11 else 0x11
+        spins = sum(1 for a in pressed if a & (T.A | T.B))
+        self.assertGreater(spins, 2)
+        self.assertNotIn(T.DOWN, pressed[:T.PATIENT_FRAMES[0]])                    # no drop while it waits
+        self.assertEqual(orientation, 0x11)                                        # turned back to the plan
+        self.assertEqual(pressed[-1], T.DOWN)
+        board[4:, :9] = True                                                       # 16 rows: too high to play
+        brain.reset()
+        brain(ram_with(board, 0x11, 9, 0), rng)
+        self.assertFalse(brain.spinning)
+
+    def test_holding_brain_holds_shifts_and_turns_and_never_drops(self):
+        board = np.zeros((20, 10), bool)
+        brain, rng = T.HoldingBrain(), np.random.default_rng(4)
+        brain(ram_with(board, 0x02, 5, 0), rng)                                    # T: plans a place
+        goal, column = brain.target
+        orientation, x, pressed = 0x02, 5, []
+        cycle = [o for o in T.ORIENTATIONS if T.TYPE_OF[o] == "T"]
+        for frame in range(200):
+            action = brain(ram_with(board, orientation, x, 1 + frame // 48), rng)
+            pressed.append(action)
+            if action & (T.A | T.B) and not (pressed[-2] if len(pressed) > 1 else 0) & (T.A | T.B):
+                orientation = cycle[(cycle.index(orientation) + 1) % len(cycle)]  # a turn on the press
+            if action & T.RIGHT and frame % 6 == 0:
+                x += 1                                                             # the game's autorepeat
+            if action & T.LEFT and frame % 6 == 0:
+                x -= 1
+        self.assertNotIn(T.DOWN, [a & T.DOWN for a in pressed if a & T.DOWN])
+        self.assertEqual((orientation, x), (goal, column))                         # it gets there
+        shifts = [i for i, a in enumerate(pressed) if a & (T.LEFT | T.RIGHT)]
+        if len(shifts) > 1:                                                        # held, never tapped
+            self.assertEqual(shifts, list(range(shifts[0], shifts[-1] + 1)))
+        self.assertEqual(pressed[-1], 0)                                           # lined up: gravity alone
+        self.assertIn("holding", T.BrainSwitcher.WEIGHTS)
+
     def test_reckless_brain_picks_legal_random_placements(self):
         rng = np.random.default_rng(1)
         board = np.zeros((20, 10), bool)

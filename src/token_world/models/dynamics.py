@@ -1,4 +1,4 @@
-"""Action-conditioned world model: a Genie-style spatiotemporal MaskGIT transformer on exact pixels.
+"""Action-conditioned world model: a Genie-style spatiotemporal MaskGIT transformer on exact pixels, soft.
 
 A frame is a [256, 256] image of palette indices (data/nes_palette.py: NES
 colours 0-54, the game's three border shades 55-57), so input and target are
@@ -7,40 +7,40 @@ per-pixel colour embedding and a 16 x 16 stride-16 conv, as in a ViT. Each
 block attends spatially within a frame (bidirectional), then temporally at
 the same position over the frames so far (causal), then applies an MLP. The
 action that produced frame t is added to frame t's tokens. The head predicts
-all 256 pixels of every token as palette indices. It is tied to the input
-colour embedding, as BERT and MaskGIT tie their output to their token
-embeddings: each pixel gets a colour_dim vector, and its logits are that
-vector against every colour's embedding (plus a bias per colour), so the head
-costs dim x 256 x colour_dim weights instead of dim x 256 x 58.
+every pixel's colour probabilities. It is tied to the input colour embedding,
+as BERT and MaskGIT tie their output to their token embeddings: each pixel
+gets a colour_dim vector, and its logits are that vector against every
+colour's embedding (plus a bias per colour).
+
+Soft, never argmax: a generated frame is its colour probabilities. It goes back
+into the context as each pixel's probability-weighted colour embedding (a soft
+frame, read like a real one), and it is shown as each pixel's expected colour.
+Nothing ever picks one colour, so an unsure piece stays in the context as a
+ghost for the next frame to resolve, instead of being rounded away.
 
 Training is MaskGIT with a masking rate drawn per frame: tokens are replaced
 by a learned mask embedding at their frame's rate, and in half the windows
 every frame before a random cut is left fully visible (a clean context, as in
 generation). Cross-entropy is taken over the pixels of masked tokens (the
-letterbox tick border included, at full weight). The context window is the
-only memory.
+letterbox border included, at full weight). The context window is the only
+memory.
 
-Rollouts build on the model's own frames, which contain confident mistakes,
-while masking only ever taught it about missing information. So, as GameNGen
-and Diffusion Forcing corrupt their context and tell the model by how much,
-every frame carries a corruption level (0 = real, an embedding per level).
-In half of each batch each frame draws a level and that share of its tokens
-is replaced by wrong but real content (corrupt_context); in the other half
-the model generates 1-32 frames one after another from the real past, as in
-a rollout, and those frames carry GENERATED_LEVEL (scheduled sampling: its
-own mistakes, compounding). Either way it trains on the real frames after
-them, so it learns to repair its context, not only to tolerate it. Generated
-frames carry Decoding.level in generation too. Generation decodes a frame from a fully masked frame in a few
-steps, unmasking the most confident tokens first. Temporal attention is causal
-and spatial attention stays within a frame, so a rollout keeps each layer's
-temporal keys and values of the frames so far (TemporalCache) and runs only
-the frame being decoded, not the whole window, through the model.
+Training is in two stages, as HorizonDrive (examples/papers) trains its
+rollout-capable model. The base model learns on real context only (teacher
+forcing: the frames before each predicted one are real and clean). Then
+scheduled rollout recovery: every window's history is the model's own soft
+frames, generated from a real start as in a dream, and the frames after them
+are scored against the real ones; the last frames before that boundary fade
+from the model's own to the real ones (own_share), so a rollout that drifted
+out of step is not scored against a real frame it contradicts. A dream decodes a frame from a fully masked frame in one
+pass. Temporal attention is causal and spatial attention stays within a frame,
+so a dream keeps each layer's temporal keys and values of the frames so far
+(TemporalCache) and runs only the frame being decoded through the model.
 See docs/guides/dynamics.md.
 """
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
 from pathlib import Path
 
 import torch
@@ -132,17 +132,23 @@ class TemporalCache:
 
 
 class Attention(nn.Module):
-    def __init__(self, dim: int, heads: int):
+    def __init__(self, dim: int, heads: int, qk_norm: bool = False):
         super().__init__()
         self.heads = heads
         self.qkv = nn.Linear(dim, 3 * dim, bias=False)
         self.out = nn.Linear(dim, dim, bias=False)
+        # QK-norm (as in recent large transformers): queries and keys at a fixed size, so attention
+        # logits cannot grow without bound
+        self.q_norm = RMSNorm(dim // heads) if qk_norm else None
+        self.k_norm = RMSNorm(dim // heads) if qk_norm else None
 
     def forward(self, x: torch.Tensor, causal: bool, cache: TemporalCache | None = None, at=0):
         """With a cache (temporal attention only): x holds frames 0..t-1 (at = 0, causal among them),
         or frames at..at+t-1 (`at` an int or 0-dim tensor), each seeing the positions up to its own."""
         b, n, d = x.shape
         q, k, v = self.qkv(x).view(b, n, 3, self.heads, d // self.heads).permute(2, 0, 3, 1, 4)
+        if self.q_norm is not None:
+            q, k = self.q_norm(q), self.k_norm(k)
         if cache is None:
             y = F.scaled_dot_product_attention(q, k, v, is_causal=causal)
         elif n > 1 and isinstance(at, int) and at == 0:
@@ -154,14 +160,40 @@ class Attention(nn.Module):
         return self.out(y.transpose(1, 2).reshape(b, n, d))
 
 
-class Block(nn.Module):
-    """Spatial attention within each frame, causal temporal attention per position, MLP."""
+class RMSNorm(nn.RMSNorm):
+    """RMSNorm in the input's dtype: under bf16 autocast the float32 weight would keep it off the fused
+    kernel (1.5x slower dreams, measured)."""
 
-    def __init__(self, dim: int, heads: int):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return F.rms_norm(x, self.normalized_shape, self.weight.to(x.dtype), self.eps)
+
+
+class SwiGLU(nn.Module):
+    """The gated MLP of Llama / PaLM: (silu(x W_gate) * x W_up) W_out, hidden 8/3 x dim (the parameters of
+    a 4 x dim GELU MLP)."""
+
+    def __init__(self, dim: int):
         super().__init__()
-        self.norm_s, self.norm_t, self.norm_m = nn.LayerNorm(dim), nn.LayerNorm(dim), nn.LayerNorm(dim)
-        self.spatial, self.temporal = Attention(dim, heads), Attention(dim, heads)
-        self.mlp = nn.Sequential(nn.Linear(dim, 4 * dim), nn.GELU(), nn.Linear(4 * dim, dim))
+        hidden = 8 * dim // 3
+        self.gate_up = nn.Linear(dim, 2 * hidden)
+        self.out = nn.Linear(hidden, dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        gate, up = self.gate_up(x).chunk(2, -1)
+        return self.out(F.silu(gate) * up)
+
+
+class Block(nn.Module):
+    """Spatial attention within each frame, causal temporal attention per position, MLP. modern: RMSNorm,
+    QK-norm and a SwiGLU MLP (Llama-style) instead of LayerNorm and a GELU MLP."""
+
+    def __init__(self, dim: int, heads: int, modern: bool = False):
+        super().__init__()
+        norm = RMSNorm if modern else nn.LayerNorm
+        self.norm_s, self.norm_t, self.norm_m = norm(dim), norm(dim), norm(dim)
+        self.spatial, self.temporal = Attention(dim, heads, modern), Attention(dim, heads, modern)
+        self.mlp = SwiGLU(dim) if modern else nn.Sequential(nn.Linear(dim, 4 * dim), nn.GELU(),
+                                                            nn.Linear(4 * dim, dim))
 
     def forward(self, x: torch.Tensor, cache: TemporalCache | None = None, at=0) -> torch.Tensor:
         """x [B, T, N, d]: window frames at..at+T-1. With a cache, frames before `at` come from it."""
@@ -174,7 +206,7 @@ class Block(nn.Module):
 
 class Dynamics(nn.Module):
     def __init__(self, dim: int = 512, layers: int = 12, heads: int = 8, patch: int = 16,
-                 frames: int = 64, colour_dim: int = 32, recompute: bool = False):
+                 frames: int = 64, colour_dim: int = 32, recompute: bool = False, modern: bool = False):
         super().__init__()
         self.patch, self.frames = patch, frames
         self.recompute = recompute     # keep only stage inputs for backward and recompute the rest: memory for time
@@ -183,34 +215,34 @@ class Dynamics(nn.Module):
         self.colour = nn.Embedding(COLOURS, colour_dim)
         self.patchify = nn.Conv2d(colour_dim, dim, patch, stride=patch)
         self.mask_token = nn.Parameter(torch.randn(dim) * 0.02)
-        self.level = nn.Embedding(LEVELS, dim)               # a frame's corruption level, added to its tokens
-        nn.init.zeros_(self.level.weight)                    # zero: every level starts out read as real
         self.space_pos = nn.Parameter(torch.randn(tokens, dim) * 0.02)
         self.time_pos = nn.Parameter(torch.randn(frames, dim) * 0.02)
         self.action = nn.Linear(9, dim)
-        self.blocks = nn.ModuleList(Block(dim, heads) for _ in range(layers))
-        self.norm = nn.LayerNorm(dim)
+        self.blocks = nn.ModuleList(Block(dim, heads, modern) for _ in range(layers))
+        self.norm = RMSNorm(dim) if modern else nn.LayerNorm(dim)
         self.pixel = nn.Linear(dim, patch * patch * colour_dim)       # each pixel's vector in colour space
         self.colour_bias = nn.Parameter(torch.zeros(COLOURS))
 
-    def forward(self, index: torch.Tensor, actions: torch.Tensor, mask: torch.Tensor,
-                level: torch.Tensor | None = None, cache: list[TemporalCache] | None = None,
-                at=0) -> torch.Tensor:
-        """index [B, T, 256, 256] palette indices; actions [B, T] bytes that produced each frame
-        (-1 = none); mask [B, T, N] tokens hidden from the model; level [B, T] each frame's corruption
-        level (None: all real) -> features [B, T, N, dim].
+    def forward(self, frames: torch.Tensor, actions: torch.Tensor, mask: torch.Tensor,
+                cache: list[TemporalCache] | None = None, at=0,
+                soft: tuple[torch.Tensor, torch.Tensor] | None = None) -> torch.Tensor:
+        """frames [B, T, 256, 256] palette indices, soft frames float [B, T, 256, 256, colour_dim]
+        (embed_probs), or frames already embedded as patch tokens float [B, T, N, dim]; actions [B, T] bytes
+        that produced each frame (-1 = none); mask [B, T, N] tokens hidden from the model; soft (training)
+        (where [B, T] bool, tokens [B, T, N, dim]): those frames' patch embeddings, made outside (a rollout's
+        soft frames; frames holds the real frame there), in a fixed shape so a compiled forward sees the same
+        shapes every step -> features [B, T, N, dim].
 
-        With a cache (new_cache()), index holds window frames at..at+T-1, the
+        With a cache (new_cache()), frames holds window frames at..at+T-1, the
         frames before `at` are read from the cache, and these frames' keys and
         values are written into it. `at` may be a 0-dim tensor (FrameDecoder's
         CUDA graph, the exported step graph).
         """
-        b, t = index.shape[:2]
+        b, t = frames.shape[:2]
         remember = self.recompute and self.training and torch.is_grad_enabled()
-        x = checkpoint(self._patches, index, use_reentrant=False) if remember else self._patches(index)
-        if level is None:                                    # real frames: level 0
-            level = torch.zeros(b, t, dtype=torch.long, device=index.device)
-        x = x + self.level(level).to(x.dtype)[:, :, None]
+        x = checkpoint(self._patches, frames, use_reentrant=False) if remember else self._patches(frames)
+        if soft is not None:
+            x = torch.where(soft[0][:, :, None, None], soft[1].to(x.dtype), x)
         x = torch.where(mask[..., None], self.mask_token.to(x.dtype), x)
         time = (self.time_pos[at:at + t] if isinstance(at, int) else
                 self.time_pos.index_select(0, at.view(1) + torch.arange(t, device=at.device, dtype=at.dtype)))
@@ -225,35 +257,65 @@ class Dynamics(nn.Module):
 
     embed_frames = 16                  # frames embedded at a time; ONNX export uses the window (one chunk)
 
-    def _patches(self, index: torch.Tensor) -> torch.Tensor:
-        """[B, T, 256, 256] -> [B, T, N, dim]: per-pixel colour embedding, then the patch conv.
+    def _patches(self, frames: torch.Tensor) -> torch.Tensor:
+        """[B, T, 256, 256] indices or [B, T, 256, 256, colour_dim] soft frames -> [B, T, N, dim]: per-pixel
+        colour embedding, then the patch conv. Patch tokens [B, T, N, dim] pass through.
 
         The embedded pixels are 16 values per pixel, so they are built
         embed_frames frames at a time, already in the conv's autocast dtype (the
         conv casts its input to it anyway, so the result is the same).
         """
-        b, t = index.shape[:2]
-        table = self.colour.weight
-        if torch.is_autocast_enabled(index.device.type):
-            table = table.to(torch.get_autocast_dtype(index.device.type))
-        flat = index.flatten(0, 1)
+        if frames.is_floating_point() and frames.dim() == 4:             # patch tokens already
+            return frames
+        b, t = frames.shape[:2]
+        flat = frames.flatten(0, 1)
         chunks = flat.split(self.embed_frames) if flat.shape[0] > self.embed_frames else (flat,)
+        if frames.is_floating_point():                  # embedded pixels already (soft frames, embed_probs)
+            out = [self.patchify(chunk.permute(0, 3, 1, 2)).flatten(2).transpose(1, 2) for chunk in chunks]
+            return torch.cat(out).unflatten(0, (b, t))
+        table = self.colour.weight
+        if torch.is_autocast_enabled(frames.device.type):
+            table = table.to(torch.get_autocast_dtype(frames.device.type))
         out = [self.patchify(ColourEmbedding.apply(chunk, table).permute(0, 3, 1, 2)).flatten(2).transpose(1, 2)
                for chunk in chunks]
         return torch.cat(out).unflatten(0, (b, t))
 
+    def embed_probs(self, probs: torch.Tensor) -> torch.Tensor:
+        """Each pixel's colour probabilities [B, N, P*P, COLOURS] -> its probability-weighted colour embedding
+        in frame layout [B, 256, 256, colour_dim]: a soft frame, which forward() reads like a real one."""
+        x = probs.to(self.colour.weight.dtype) @ self.colour.weight
+        return unpatch_pixels(x.permute(0, 3, 1, 2), self.patch).permute(0, 2, 3, 1)
+
+    def soft_frame(self, features: torch.Tensor) -> torch.Tensor:
+        """A frame's features [B, N, dim] -> its soft frame [B, 256, 256, colour_dim] (its probabilities'
+        colour embeddings)."""
+        return self.embed_probs(self.logits(features).float().softmax(-1))
+
+    def soft_tokens(self, features: torch.Tensor, chunk: int = 4096) -> torch.Tensor:
+        """Tokens' features [M, dim] -> [M, dim]: the token their predicted colours make, the patch conv of
+        each pixel's probability-weighted colour embedding (a soft token, as _patches embeds one), computed a
+        chunk at a time (the probabilities are 58 values per pixel). The exported step graph's output."""
+        weight = self.patchify.weight.flatten(1)                     # [dim, colour_dim * P * P]
+        out = []
+        for h in features.split(chunk):
+            probs = self.logits(h).float().softmax(-1)               # [c, P*P, COLOURS]
+            pixels = probs.to(self.colour.weight.dtype) @ self.colour.weight            # [c, P*P, colour_dim]
+            pixels = pixels.transpose(1, 2).flatten(1)               # [c, colour_dim * P * P], the conv's order
+            out.append(F.linear(pixels.to(weight.dtype), weight, self.patchify.bias))
+        return torch.cat(out) if out else features.new_zeros(0, features.shape[-1])
+
     def new_cache(self) -> list[TemporalCache]:
         return [TemporalCache(self.frames) for _ in self.blocks]
 
-    def decoder(self, batch: int, decoding: "Decoding", device, compiled: bool = False) -> "FrameDecoder":
-        """This model's FrameDecoder for a batch size, Decoding, the caller's autocast setting and
-        `compiled` (see FrameDecoder), made on first use (its cache and CUDA graph are kept)."""
+    def decoder(self, batch: int, device, compiled: bool = False, scored: bool = False) -> "FrameDecoder":
+        """This model's FrameDecoder for a batch size, the caller's autocast setting, `compiled` and `scored`
+        (see FrameDecoder), made on first use (its cache and CUDA graph are kept)."""
         device = torch.device(device)
         autocast = (torch.is_autocast_enabled(device.type), torch.get_autocast_dtype(device.type))
-        key = (batch, decoding, device, autocast, compiled)
+        key = (batch, device, autocast, compiled, scored)
         decoders = self.__dict__.setdefault("_decoders", {})
         if key not in decoders:
-            decoders[key] = FrameDecoder(self, batch, decoding, device, autocast, compiled)
+            decoders[key] = FrameDecoder(self, batch, device, autocast, compiled, scored)
         return decoders[key]
 
     def colour_table(self) -> torch.Tensor:
@@ -276,10 +338,7 @@ def pixel_logits(pixels: torch.Tensor, table: torch.Tensor, bias: torch.Tensor) 
 def build(config: dict, recompute: bool = False) -> Dynamics:
     """A Dynamics from a run's saved args (checkpoint["args"] or run_config.json)."""
     return Dynamics(config["dim"], config["layers"], config["heads"], config["patch"], config["frames"],
-                    config["colour_dim"], recompute)
-
-
-HEAD = ("pixel.weight", "pixel.bias", "colour.weight", "colour_bias")   # the pixel head (colour table tied in)
+                    config["colour_dim"], recompute, config.get("modern", False))
 
 
 def deepen(model: Dynamics, source: dict[str, torch.Tensor]) -> None:
@@ -302,7 +361,8 @@ def deepen(model: Dynamics, source: dict[str, torch.Tensor]) -> None:
     with torch.no_grad():
         for i, block in enumerate(model.blocks):
             if i % ratio:
-                for layer in (block.spatial.out, block.temporal.out, block.mlp[2]):
+                mlp_out = block.mlp.out if isinstance(block.mlp, SwiGLU) else block.mlp[2]
+                for layer in (block.spatial.out, block.temporal.out, mlp_out):
                     layer.weight.zero_()
                     if layer.bias is not None:
                         layer.bias.zero_()
@@ -439,236 +499,160 @@ def _ce_and_grad(logits: torch.Tensor, y: torch.Tensor, colours: int, scale: flo
 _head_chunk_compiled = torch.compile(_head_chunk, dynamic=True)
 
 
-@torch.no_grad()
-def corrupt_context(index: torch.Tensor, patch: int, generator: torch.Generator | None = None):
-    """GameNGen / Diffusion Forcing context corruption, for exact tokens: index [B, T, 256, 256] ->
-    (corrupted index, level [B, T] long, changed [B, T, N] tokens whose content changed).
-
-    Each frame draws a level 0..LEVELS-1 (frame 0 stays real), and that share of
-    its tokens, level / (LEVELS - 1) * MAX_CORRUPTION, is replaced by real but
-    wrong content: half by the same place 1-8 frames earlier (timing errors, a
-    piece that lags) and half by a random place in the same frame (a block
-    where there is none, a hole where there is one). Sources are only this or
-    earlier frames, so no later content leaks in. Static tokens often swap
-    with an identical one: the corruption lands where the frames change, as
-    the model's own errors do.
-    """
-    tokens = patch_pixels(index, patch)                                  # [B, T, N, P*P]
-    b, t, n = tokens.shape[:3]
-    device = index.device
-    rand = lambda *shape: torch.rand(*shape, device=device, generator=generator)
-    level = torch.randint(0, LEVELS, (b, t), device=device, generator=generator)
-    level[:, 0] = 0
-    swap = rand(b, t, n) < (level.float() / (LEVELS - 1) * MAX_CORRUPTION)[..., None]
-    earlier = rand(b, t, n) < 0.5
-    back = torch.randint(1, 9, (b, t, n), device=device, generator=generator)
-    frame = torch.arange(t, device=device)[None, :, None]
-    place = torch.arange(n, device=device)[None, None, :]
-    source_t = torch.where(earlier, (frame - back).clamp_min(0), frame)
-    source_n = torch.where(earlier, place, torch.randint(0, n, (b, t, n), device=device, generator=generator))
-    moved = tokens[torch.arange(b, device=device)[:, None, None], source_t, source_n]
-    changed = swap & (moved != tokens).any(-1)
-    return unpatch_pixels(torch.where(swap[..., None], moved, tokens), patch), level, changed
-
-
-LEVELS = 10                     # corruption levels of a frame (GameNGen buckets its noise levels in 10)
-MAX_CORRUPTION = 0.3            # share of a frame's tokens replaced at the top level
-GENERATED_LEVEL = 2             # the level generated frames carry, in training rollouts and by default in play
-
-
-@dataclass(frozen=True)
-class Decoding:
-    """How a frame is generated; training rollouts use the defaults.
-
-    steps: MaskGIT steps. refine: once the frame is complete, this fraction of
-    its least confident tokens is masked again and predicted against the rest
-    of the frame (0: no refinement pass). temperature: 0 picks each pixel's
-    most likely colour; above 0 samples it at that temperature. level: the
-    corruption level the generated frames carry (0 reads them as real;
-    training rollouts use GENERATED_LEVEL).
-    """
-    steps: int = 4
-    refine: float = 0.0
-    temperature: float = 0.0
-    level: int = GENERATED_LEVEL
-
-
-def decode_frame(logits_of, batch: int, tokens: int, patch: int, decoding: Decoding, device) -> torch.Tensor:
-    """MaskGIT-decode one frame: logits_of(frame [B, 256, 256], hidden [B, N]) -> [B, N, P*P, COLOURS].
-
-    Starts fully masked; each step unmasks the most confident tokens (summed
-    pixel log-probability of their picks) on a cosine schedule, then the
-    optional refinement pass (Decoding). Returns [B, 256, 256] int32 palette
-    indices (callers keep frames as uint8; int32 until then keeps the exported
-    graph's frame on the GPU, where WebGPU has no uint8 or int64 Where).
-    """
-    frame = torch.zeros(batch, tokens, patch * patch, dtype=torch.int32, device=device)
-    hidden = torch.ones(batch, tokens, dtype=torch.bool, device=device)
-    held = torch.zeros(batch, tokens, device=device)                   # each token's confidence when committed
-    for s in range(decoding.steps):
-        best, pick = _pick(logits_of(unpatch_pixels(frame, patch), hidden), decoding.temperature)
-        token = best.sum(-1)
-        still = int(tokens * math.cos(math.pi / 2 * (s + 1) / decoding.steps))  # left masked after this step
-        if still == 0:                                   # the last step reveals everything left: no ordering
-            reveal = hidden.clone()
-        else:
-            order = token.masked_fill(~hidden, float("inf")).argsort(1, descending=True)
-            reveal = torch.zeros_like(hidden)
-            reveal.scatter_(1, order[:, :tokens - still], True)
-            reveal &= hidden
-        frame = torch.where(reveal[..., None], pick.to(frame.dtype), frame)
-        held = torch.where(reveal, token, held)
-        hidden &= ~reveal
-    if decoding.refine > 0:
-        redo = torch.zeros_like(hidden)
-        redo.scatter_(1, held.argsort(1)[:, :max(1, round(tokens * decoding.refine))], True)
-        _, pick = _pick(logits_of(unpatch_pixels(frame, patch), redo), decoding.temperature)
-        frame = torch.where(redo[..., None], pick.to(frame.dtype), frame)
-    return unpatch_pixels(frame, patch)
-
-
-def _pick(logits: torch.Tensor, temperature: float) -> tuple[torch.Tensor, torch.Tensor]:
-    """[B, N, P*P, COLOURS] -> (log-probability of each pixel's pick, the pick): argmax at temperature 0,
-    else a sample at that temperature (Gumbel-max)."""
-    logits = logits.float()
-    if temperature <= 0:
-        # max - logsumexp: log_softmax's max without its [..., COLOURS] tensor (onnxruntime-web runs
-        # LogSoftmax on the CPU); the pick as the first colour at the max, in float32 then int32, as
-        # argmax picks (ONNX's ArgMax gives int64, which WebGPU cannot convert)
-        best = logits.max(-1, keepdim=True).values
-        count = logits.shape[-1]
-        first = (logits == best) * torch.arange(count, 0, -1, device=logits.device, dtype=logits.dtype)
-        return best[..., 0] - logits.logsumexp(-1), (count - first.amax(-1)).int()
-    logp = logits.log_softmax(-1)
-    gumbel = -torch.log(-torch.log(torch.rand_like(logp).clamp_min(1e-20)))
-    pick = (logp / temperature + gumbel).argmax(-1)
-    return logp.gather(-1, pick[..., None])[..., 0], pick
+GHOST = 0.9         # a generated pixel whose most likely colour is below this probability is unsure (a ghost)
 
 
 class FrameDecoder:
-    """Generates frames one at a time against a TemporalCache, one CUDA graph per frame.
+    """Generates soft frames one at a time against a TemporalCache, one CUDA graph per frame.
 
-    prefill() runs real (or earlier) frames through the model at positions
-    0..t-1; next() decodes the frame at position `at` in `steps` MaskGIT steps,
-    writes it into the cache at Decoding.level and returns it. Every call of
-    next() has the same shapes (the cache always holds model.frames positions),
-    so on CUDA its whole work (steps + 1 one-frame passes and the confidence
-    ordering, ~2,000 kernels) is captured once as a CUDA graph and replayed:
-    the launches, not the GPU, bounded training rollouts. The graph reads the
-    parameters in place, so it follows training. Autocast runs without its
-    weight cache inside (a cached cast would be captured stale). One decoder
-    per model, batch size, Decoding, autocast setting and `compiled`
-    (Dynamics.decoder). compiled: torch.compile the frame's work before
-    capturing it (23% less GPU time per frame, about a minute to compile).
-    Only training rollouts use it, one decoder for the whole run; previews,
-    play and checks capture the eager kernels and start at once, whatever
-    Decoding they ask for.
+    prefill() runs real (or soft) frames through the model at positions
+    0..t-1; next() decodes the frame at position `at` from a fully masked
+    frame in one pass, writes its soft frame into the cache and returns it.
+    Every call of next() has the same shapes (the cache always holds
+    model.frames positions), so on CUDA its whole work is captured once as a
+    CUDA graph and replayed: the launches, not the GPU, bounded training
+    rollouts. The graph reads the parameters in place, so it follows training.
+    Autocast runs without its weight cache inside (a cached cast would be
+    captured stale). One decoder per model, batch size, autocast setting,
+    `compiled` and `scored` (Dynamics.decoder). compiled: torch.compile the
+    frame's work before capturing it (23% less GPU time per frame, about a
+    minute to compile); only training rollouts use it. scored: next() also
+    takes the real frame and reports the pixels expected wrong (training
+    rollouts); otherwise it returns the frame's colour probabilities (dreams,
+    previews).
     """
 
-    def __init__(self, model: Dynamics, batch: int, decoding: Decoding, device, autocast, compiled: bool = False):
-        self.model, self.batch, self.decoding, self.autocast = model, batch, decoding, autocast
+    def __init__(self, model: Dynamics, batch: int, device, autocast, compiled: bool = False,
+                 scored: bool = False):
+        self.model, self.batch, self.autocast = model, batch, autocast
         self.cache = model.new_cache()
         self.act = torch.zeros(batch, 1, dtype=torch.long, device=device)
         self.at = torch.zeros((), dtype=torch.long, device=device)
-        self.level = torch.full((batch, 1), decoding.level, dtype=torch.long, device=device)
+        self.target = torch.zeros(batch, SIZE, SIZE, dtype=torch.long, device=device) if scored else None
         self.graph = self.out = None
         self._step = torch.compile(self._decode) if compiled and self.act.is_cuda else self._decode
 
-    def prefill(self, frames: torch.Tensor, actions: torch.Tensor, level: torch.Tensor | None = None) -> None:
-        """frames [B, t, 256, 256], incoming actions [B, t], level [B, t] or None (real) -> positions 0..t-1."""
+    def prefill(self, frames: torch.Tensor, actions: torch.Tensor) -> None:
+        """frames [B, t, 256, 256] (or soft frames or patch tokens, Dynamics.forward), incoming actions
+        [B, t] -> positions 0..t-1."""
         b, t = frames.shape[:2]
         visible = torch.zeros(b, t, self.model.grid ** 2, dtype=torch.bool, device=frames.device)
         with torch.no_grad():
-            self.model(frames, actions, visible, level, cache=self.cache)
+            self.model(frames, actions, visible, cache=self.cache)
 
     @torch.no_grad()
-    def next(self, action: torch.Tensor, at: int) -> torch.Tensor:
-        """action [B, 1] incoming, at: the frame's position -> [B, 256, 256] uint8."""
+    def next(self, action: torch.Tensor, at: int, target: torch.Tensor | None = None) -> dict:
+        """action [B, 1] incoming, at: the frame's position (, target [B, 256, 256] the real frame when
+        scored) -> {"soft": [B, 256, 256, colour_dim] the soft frame that went into the context, "unsure":
+        [B] its ghost pixels, "tokens": [B, N, dim] its patch tokens, and "wrong": [B] its pixels expected
+        wrong (scored) or "probs": [B, 256, 256, COLOURS] its colour probabilities}."""
         self.act.copy_(action)
         self.at.fill_(at)
+        if self.target is not None:
+            self.target.copy_(target)
         if not self.act.is_cuda:
-            return self._step()
-        if self.graph is None:                          # compile and run once on a side stream, then capture
+            out = self._step()
+        elif self.graph is None:                        # compile and run once on a side stream, then capture
             side = torch.cuda.Stream()
             side.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(side):
-                frame = self._step()
+                out = self._step()
             torch.cuda.current_stream().wait_stream(side)
             self.graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(self.graph):
                 self.out = self._step()
-            return frame
-        self.graph.replay()
-        return self.out.clone()
+        else:
+            self.graph.replay()
+            out = {k: v.clone() for k, v in self.out.items()}
+        return out
 
-    def _decode(self) -> torch.Tensor:
+    def _decode(self) -> dict:
         model, b, n = self.model, self.batch, self.model.grid ** 2
         enabled, dtype = self.autocast
-        with torch.autocast(self.act.device.type, dtype=dtype, enabled=enabled, cache_enabled=False):
-            frame = decode_frame(lambda f, hidden: model.logits(model(f[:, None], self.act, hidden[:, None],
-                                                                      self.level, self.cache, self.at)[:, 0]),
-                                 b, n, model.patch, self.decoding, self.act.device)
-            committed = torch.zeros(b, 1, n, dtype=torch.bool, device=self.act.device)
-            model(frame[:, None], self.act, committed, self.level, self.cache, self.at)
-        return frame.to(torch.uint8)
+        device = self.act.device
+        with torch.autocast(device.type, dtype=dtype, enabled=enabled, cache_enabled=False):
+            blank = torch.zeros(b, 1, SIZE, SIZE, dtype=torch.uint8, device=device)
+            hidden = torch.ones(b, 1, n, dtype=torch.bool, device=device)
+            features = model(blank, self.act, hidden, self.cache, self.at)[:, 0]
+            probs = model.logits(features).float().softmax(-1)                   # [B, N, P*P, COLOURS]
+            soft = model.embed_probs(probs)
+            tokens = model._patches(soft[:, None])
+            model(tokens, self.act, torch.zeros_like(hidden), self.cache, self.at)
+            out = {"soft": soft, "tokens": tokens[:, 0], "unsure": (probs.amax(-1) < GHOST).sum((1, 2)).float()}
+            if self.target is not None:
+                right = probs.gather(-1, patch_pixels(self.target, model.patch)[..., None])
+                out["wrong"] = 1 - right.mean((1, 2, 3))
+            else:
+                out["probs"] = unpatch_pixels(probs.permute(0, 3, 1, 2), model.patch).permute(0, 2, 3, 1)
+        return out
+
+
+def own_share(start: int, boundary: int, w: int, device=None) -> torch.Tensor:
+    """The blend on a rollout's history, frames start..boundary-1 -> each frame's share of the model's own
+    [boundary - start]: 1, then over the last w frames falling linearly from w/(w+1) to 1/(w+1), so the frame
+    before the first scored one is nearly real (w = 0: all its own, as in a dream). The scored frames, from
+    `boundary` on, are real. HorizonDrive's pred-to-real blend (eq. 8) on its history side only."""
+    i = torch.arange(start, boundary, dtype=torch.float32, device=device)
+    return (1 - (i - (boundary - w) + 1) / (w + 1)).clamp(0, 1)
 
 
 @torch.no_grad()
 def rollout(model: Dynamics, window: torch.Tensor, actions: torch.Tensor, start: int,
-            decoding: Decoding = Decoding(), compiled: bool = False) -> torch.Tensor:
-    """Generate frames start..T-1 one after another from the real frames before `start`.
+            compiled: bool = False) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Generate frames start..T-1 one after another from the real frames before `start`, scored against the
+    real ones in `window`.
 
-    window [B, T, 256, 256] (frames from `start` on are ignored), actions [B, T]
-    incoming. The real frames fill the decoder's cache once; each generated
-    frame is decoded against it and then written into it. Returns [B, T - start,
-    256, 256] uint8. compiled: see FrameDecoder (training rollouts).
+    window [B, T, 256, 256], actions [B, T] incoming. The real frames fill the
+    decoder's cache once; each generated frame is decoded against it and its
+    soft frame written into it. -> (the soft frames as patch tokens [B, T -
+    start, N, dim], each one's ghost pixels [B, T - start], each one's pixels
+    expected wrong [B, T - start]). compiled: see FrameDecoder (training rollouts).
     """
     b, t = window.shape[:2]
-    decoder = model.decoder(b, decoding, window.device, compiled)
+    decoder = model.decoder(b, window.device, compiled, scored=True)
     decoder.prefill(window[:, :start], actions[:, :start])
-    return torch.stack([decoder.next(actions[:, at:at + 1], at) for at in range(start, t)], 1)
+    out = [decoder.next(actions[:, at:at + 1], at, window[:, at]) for at in range(start, t)]
+    return tuple(torch.stack([o[k] for o in out], 1) for k in ("tokens", "unsure", "wrong"))
 
 
 class Dreamer:
     """The model as a game engine: one generated frame per action, for as long as it is played.
 
     Starts from real frames [T0, 256, 256] and the incoming actions [T0] that
-    produced them. Each step decodes the next frame against a TemporalCache;
-    when the window is full (model.frames), the last `keep` frames are
-    re-encoded at positions 0..keep-1 and generation goes on (keep up to
-    model.frames - 1: more history, re-encoded more often). Generated frames
-    carry Decoding.level, real ones 0.
+    produced them. Each step decodes the next frame against a TemporalCache
+    and keeps its soft frame's patch tokens as context (the frames as the
+    model reads them, 98 KB a frame); when the window is full
+    (model.frames), the last `keep` frames are re-encoded at positions
+    0..keep-1 and generation goes on (keep up to model.frames - 1: more
+    history, re-encoded more often).
     """
 
-    def __init__(self, model: Dynamics, frames: torch.Tensor, actions: torch.Tensor,
-                 decoding: Decoding = Decoding(), keep: int = 48):
+    def __init__(self, model: Dynamics, frames: torch.Tensor, actions: torch.Tensor, keep: int | None = None):
+        keep = model.frames * 3 // 4 if keep is None else keep
         if not 1 <= keep < model.frames:
             raise ValueError("keep must be 1..model.frames - 1")
-        self.model, self.decoding, self.keep = model, decoding, keep
-        self.frames = list(frames.unbind(0))
+        self.model, self.keep = model, keep
+        self.frames = list(model._patches(frames[None]).detach()[0].float().unbind(0))   # patch tokens
         self.actions = [int(a) for a in actions]
-        self.levels = [0] * len(self.frames)
         self._encode()
 
     def _encode(self) -> None:
         """Re-encode the window at positions 0..keep-1 (after the start, and whenever it slides)."""
-        self.frames, self.actions, self.levels = (self.frames[-self.keep:], self.actions[-self.keep:],
-                                                  self.levels[-self.keep:])
+        self.frames, self.actions = self.frames[-self.keep:], self.actions[-self.keep:]
         device = self.frames[0].device
         if not hasattr(self, "decoder"):                # its own: a dream keeps state in its cache between
             autocast = (torch.is_autocast_enabled(device.type), torch.get_autocast_dtype(device.type))
-            self.decoder = FrameDecoder(self.model, 1, self.decoding, device, autocast)   # steps
-        self.decoder.prefill(torch.stack(self.frames)[None], torch.tensor([self.actions], device=device),
-                             torch.tensor([self.levels], device=device))
+            self.decoder = FrameDecoder(self.model, 1, device, autocast)   # steps
+        self.decoder.prefill(torch.stack(self.frames)[None], torch.tensor([self.actions], device=device))
 
     @torch.no_grad()
     def step(self, action: int) -> torch.Tensor:
-        """The frame that `action` (the controller byte, -1 for none) produces -> [256, 256] uint8."""
+        """The frame that `action` (the controller byte, -1 for none) produces -> its colour probabilities
+        [256, 256, COLOURS] float32."""
         if len(self.frames) == self.model.frames:
             self._encode()
         device = self.frames[0].device
-        frame = self.decoder.next(torch.tensor([[action]], device=device), len(self.frames))
-        self.frames.append(frame[0])
+        out = self.decoder.next(torch.tensor([[action]], device=device), len(self.frames))
+        self.frames.append(out["tokens"][0].float())
         self.actions.append(action)
-        self.levels.append(self.decoding.level)
-        return frame[0]
+        return out["probs"][0]

@@ -1,6 +1,6 @@
 """Tetris next to its world model: the real game and one model's dream, frame by frame in lockstep.
 
-    python scripts/play_world_model.py [--run output/world_model_tetris_small]
+    python scripts/play_world_model.py [--run output/world_model_tetris_base]
 
 The real game runs in World NES. Every frame one controller byte (your keys,
 or the bot) goes to both the console and the model (models/dynamics.py
@@ -12,11 +12,10 @@ dream and their difference into one image per frame; the UI copies that
 image to its canvas once per frame. Frames advance at up to the speed cap
 (60 = the NES), or as fast as the model generates.
 
-The toolbar sets how the dream is generated (models/dynamics.py Decoding):
-MaskGIT steps, a refinement pass over the least confident tokens, sampling
-temperature, the corruption level generated frames carry (0 = read as real),
-and how many frames are kept when the window slides. A change starts a new
-dream.
+The dream is soft (models/dynamics.py): each pixel is a colour distribution,
+shown as its expected colour, and the difference panel shows how likely each
+pixel is to be wrong. The toolbar sets how many frames are kept when the
+window slides. A change starts a new dream.
 
 Keys: arrows move and soft-drop, X / Z rotate, Enter is Start, Right Shift is
 Select. R restarts the dream from the real game, Space pauses, Esc quits.
@@ -45,7 +44,7 @@ from token_world.data.model_frames import BORDER_VERSION, GAME_ROWS
 from token_world.data.tetris_bot import A, B, DOWN, LEFT, RIGHT, SELECT, START, UP
 from token_world.data.nes_palette import tetris_palette
 from token_world.data.real_tetris import RealTetris
-from token_world.models.dynamics import GENERATED_LEVEL, LEVELS, Decoding, Dreamer, Dynamics, load_run
+from token_world.models.dynamics import Dreamer, Dynamics, load_run
 
 KEYS = {"Left": LEFT, "Right": RIGHT, "Down": DOWN, "Up": UP, "x": A, "X": A, "z": B, "Z": B,
         "Return": START, "Shift_R": SELECT}
@@ -97,22 +96,24 @@ class Composer:
         s = self.scale
         self.image[:, self.x(i):self.x(i) + self.panel] = rgb.repeat(s, 0).repeat(s, 1)
 
-    def compose(self, real: np.ndarray, dream: np.ndarray) -> np.ndarray:
+    def compose(self, real: np.ndarray, dream: np.ndarray, wrong: np.ndarray) -> np.ndarray:
+        """real [256, 256] palette indices, dream [256, 256, 3] expected colours, wrong [256, 256] each
+        pixel's probability of anything but the real colour."""
         real_rgb = self.palette[real]
         self.put(0, real_rgb)
-        self.put(1, self.palette[dream])
-        diff = (real_rgb * 0.3).astype(np.uint8)
-        diff[dream != real] = (255, 0, 200)
-        self.put(2, diff)
+        self.put(1, dream)
+        w = wrong[..., None]
+        self.put(2, (real_rgb * 0.3 * (1 - w) + np.array([255, 0, 200]) * w).astype(np.uint8))
         return self.image
 
 
 class Engine(threading.Thread):
     """Runs the real game and the dream in lockstep; publishes one composed image per frame."""
 
-    def __init__(self, run: Path, decoding: Decoding, keep: int, palette: np.ndarray, scale: int, seed: int):
+    def __init__(self, run: Path, keep: int, palette: np.ndarray, scale: int, seed: int):
         super().__init__(daemon=True)
-        self.run_path, self.decoding, self.keep, self.seed = run, decoding, keep, seed
+        self.run_path, self.keep, self.seed = run, keep, seed
+        self.colours = torch.as_tensor(palette, dtype=torch.float32, device="cuda")
         self.composer = Composer(palette, scale)
         self.commands: queue.Queue = queue.Queue()
         self.keys: set[int] = set()
@@ -161,7 +162,7 @@ class Engine(threading.Thread):
         """A new dream from the last CONTEXT real frames."""
         frames, actions = self.real.context()
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            self.dreamer = Dreamer(self.model, frames, actions, self.decoding, self.keep)
+            self.dreamer = Dreamer(self.model, frames, actions, self.keep)
         self.dreamed, self.wrong_sum = 0, 0.0
         self.publish(None, status="dreaming", model=self.model_name)
 
@@ -169,7 +170,7 @@ class Engine(threading.Thread):
         if name == "model":
             self.load(value)
         elif name == "decoding":
-            self.decoding, self.keep = value
+            self.keep = value
             self.restart()
         elif name == "controller":
             self.controller = value
@@ -203,10 +204,12 @@ class Engine(threading.Thread):
                 started = time.monotonic()
                 frame, action = self.real.step(None if self.controller == "bot" else self.buttons())
                 with torch.autocast("cuda", dtype=torch.bfloat16):
-                    dream = self.dreamer.step(action).cpu().numpy()
-                image = self.composer.compose(frame, dream)
-                game = GAME_ROWS
-                wrong = float((dream[game] != frame[game]).mean())
+                    probs = self.dreamer.step(action).float()
+                real = torch.from_numpy(frame).cuda().long()
+                miss = (1 - probs.gather(-1, real[..., None])[..., 0]).cpu().numpy()
+                dream = (probs @ self.colours).round().clamp(0, 255).byte().cpu().numpy()
+                image = self.composer.compose(frame, dream, miss)
+                wrong = float(miss[GAME_ROWS].mean())
                 self.dreamed += 1
                 self.wrong_sum += wrong
                 fps_frames += 1
@@ -242,18 +245,12 @@ class App:
         self.model.set(engine.run_path.name)
         self.model.bind("<<ComboboxSelected>>", lambda e: self.send("model", runs[self.model.current()]))
         self.model.pack(side="left", padx=(6, 16))
-        d = engine.decoding
-        self.steps, self.refine = tk.IntVar(value=d.steps), tk.DoubleVar(value=d.refine)
-        self.temperature, self.level = tk.DoubleVar(value=d.temperature), tk.IntVar(value=d.level)
         self.keep = tk.IntVar(value=engine.keep)
-        for label, var, values in (("Steps", self.steps, (1, 2, 4, 8, 16)),
-                                   ("Refine", self.refine, (0.0, 0.1, 0.2, 0.3)),
-                                   ("Temp", self.temperature, (0.0, 0.3, 0.7, 1.0)),
-                                   ("Level", self.level, tuple(range(LEVELS))),
-                                   ("Keep", self.keep, (32, 48, 56, 63))):
-            ttk.Label(bar, text=label).pack(side="left")
-            ttk.Spinbox(bar, values=values, width=4, textvariable=var, state="readonly",
-                        command=self.decoding).pack(side="left", padx=(4, 10))
+        ttk.Label(bar, text="Keep").pack(side="left")
+        ttk.Spinbox(bar, values=tuple(sorted({engine.keep // 2, engine.keep * 2 // 3, engine.keep,
+                                              engine.keep * 4 // 3 - 1})),
+                    width=4, textvariable=self.keep, state="readonly",
+                    command=self.decoding).pack(side="left", padx=(4, 10))
         ttk.Label(bar, text="Speed cap").pack(side="left")
         self.fps = tk.IntVar(value=engine.fps_cap)
         ttk.Spinbox(bar, values=(10, 20, 30, 45, 60), width=4, textvariable=self.fps, state="readonly",
@@ -290,9 +287,8 @@ class App:
         self.poll()
 
     def decoding(self) -> None:
-        """Toolbar decoding settings changed: a new dream with them (Decoding, Dreamer keep)."""
-        self.send("decoding", (Decoding(self.steps.get(), self.refine.get(), self.temperature.get(),
-                                        self.level.get()), self.keep.get()))
+        """Toolbar decoding setting changed: a new dream with it (Dreamer keep)."""
+        self.send("decoding", self.keep.get())
 
     def send(self, *command) -> None:
         self.engine.commands.put(command)
@@ -337,11 +333,8 @@ def main():
     runs = runs_with_checkpoints()
     p.add_argument("--run", type=Path, default=None,
                    help="a run folder, any length (default: the latest run with MIN_STEPS steps)")
-    p.add_argument("--steps", type=int, default=4, help="MaskGIT decode steps per frame (fewer is faster)")
-    p.add_argument("--refine", type=float, default=0.0, help="fraction of least confident tokens predicted again")
-    p.add_argument("--temperature", type=float, default=0.0, help="0 = most likely colour; above 0 samples")
-    p.add_argument("--level", type=int, default=GENERATED_LEVEL, help="corruption level of generated frames (0 = real)")
-    p.add_argument("--keep", type=int, default=48, help="frames kept when the 64-frame window slides")
+    p.add_argument("--keep", type=int, default=None,
+                   help="frames kept when the window slides (default: three quarters of the run's window)")
     p.add_argument("--scale", type=int, default=2)
     p.add_argument("--seed", type=int, default=int(time.time()) % 100_000)
     args = p.parse_args()
@@ -351,8 +344,8 @@ def main():
     if run not in runs:
         runs.append(run)
     palette = tetris_palette().cpu().numpy().astype(np.uint8)
-    engine = Engine(run, Decoding(args.steps, args.refine, args.temperature, args.level), args.keep,
-                    palette, args.scale, args.seed)
+    keep = args.keep or json.loads((run / "run_config.json").read_text())["frames"] * 3 // 4
+    engine = Engine(run, keep, palette, args.scale, args.seed)
     root = tk.Tk()
     App(root, engine, runs)
     engine.start()

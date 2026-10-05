@@ -21,12 +21,13 @@ ROOT = Path(__file__).resolve().parents[1]
 ENTRIES = ["scripts/train_dynamics_ui.py", "scripts/export_onnx.py", "scripts/ship.py", "scripts/play_world_model.py",
            "scripts/long_dream_check.py", "scripts/view_runs.py", "scripts/tetris_scenarios.py",
            "tests/test_dynamics.py", "tests/test_onnx.py", "tests/test_world_nes_tetris.py",
-           "tests/test_tetris_events.py", "tests/test_tetris_bot.py", "tests/test_tetris_scenarios.py"]
+           "tests/test_tetris_events.py", "tests/test_tetris_bot.py", "tests/test_tetris_scenarios.py",
+           "tests/test_long_dream.py"]
 EXTRA = ["scripts/run_until_stopped.ps1"]
 SKIP = ("contra",)                               # module names: the Contra port is not shipped
 PAGE = ["index.html", "play.js", "dreamer.js", "check_browser.mjs", "test_dreamer.mjs", "package.json",
         "package-lock.json"]
-MODEL = ["prefill.onnx", "step.onnx", "model.json", "context.bin", "context.json"]
+MODEL = ["embed.onnx", "prefill.onnx", "step.onnx", "model.json", "context.bin", "context.json"]
 ROMS = (".nes", ".fds", ".unf", ".unif")
 
 WORKFLOW = """# Publishes web/ to GitHub Pages on every push to main (Pages source: GitHub Actions).
@@ -100,8 +101,8 @@ on-screen controller.
 
 ## The code
 
-- `src/token_world/models/dynamics.py`: the model, its training mask and loss, context corruption,
-  MaskGIT decoding, the cached `Dreamer`.
+- `src/token_world/models/dynamics.py`: the model, its training mask and loss, soft decoding, the
+  cached `Dreamer`, and the rollout stage's history blend (`own_share`).
 - `scripts/train_dynamics_ui.py`: training on live emulator histories (a RAM-reading bot plays), with
   a run viewer; `scripts/run_until_stopped.ps1` runs it unattended.
 - `src/token_world/diagnostics/long_dream.py`, `scripts/long_dream_check.py`: 128-frame no-button dreams
@@ -117,7 +118,7 @@ ROM**: set `TETRIS_ROM` to your copy of `Tetris (USA).nes`. No ROM is included i
 pip install -e .[onnx]
 python -m pytest tests            # tests that need World NES or the ROM skip without them
 python scripts/train_dynamics_ui.py
-python scripts/export_onnx.py output/world_model_tetris_small/model_latest.pt
+python scripts/export_onnx.py output/world_model_tetris_base/model_latest.pt
 ```
 """
 

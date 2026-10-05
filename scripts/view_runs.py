@@ -1,6 +1,6 @@
 """Look at world-model runs while they train or afterwards, without touching the training.
 
-    python scripts/view_runs.py output/world_model_tetris_small [--compare output/world_model_tetris_8m ...]
+    python scripts/view_runs.py output/world_model_tetris_base [--compare output/world_model_tetris_srr ...]
 
 The same tabs as the training window (ui/run_viewer.py), read from the run folders and refreshed as
 the trainer writes them. Compared runs are drawn dashed on the same axes, by step.

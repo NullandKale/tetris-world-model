@@ -15,12 +15,14 @@ model frames, and the NEXT box redraw (a random piece, unlearnable) at
 y 128-143, x 196-219. The events and their RAM come from
 data/tetris_events.py.
 
-Scores per instance and horizon h (generated frame +h against the real one):
+Scores per instance and horizon h (generated frame +h against the real one), as expectations over the
+model's soft frames:
 - event wrong: of the pixels that really changed since the last context frame
-  (tick border and NEXT box excluded), the fraction the model got wrong;
+  (tick border and NEXT box excluded), the share the model expects wrong;
 - false change: of the playfield pixels that really stayed the same, the
-  fraction the model changed;
-- exact: the event's first visible frame (+LEAD) has no wrong event pixel.
+  share the model expects changed;
+- exact: at the event's first visible frame (+LEAD), every event pixel is
+  more likely right than wrong.
 """
 from __future__ import annotations
 
@@ -35,7 +37,7 @@ from torch.utils.data import DataLoader
 from token_world.data.model_frames import BAND
 from token_world.data.tetris_events import CLEAR_NAMES, LEVEL, LOOKAHEAD, events_at
 from token_world.data.world_nes_tetris import WorldNesTetrisStreams
-from token_world.models.dynamics import Decoding, incoming_actions, rollout
+from token_world.models.dynamics import incoming_actions
 
 CONTEXT, FRAMES, LEAD = 48, 64, 2
 HORIZONS = (LEAD, 8, 16)
@@ -167,35 +169,50 @@ def spread(instances, per_scenario: int, seconds: float, streams: int, clock=tim
             return
 
 
-def score(real: np.ndarray, generated: np.ndarray) -> dict[str, float]:
-    """real [64, 256, 256] window, generated [16, 256, 256] frames CONTEXT..63 -> metrics."""
+def score(real: np.ndarray, right: np.ndarray, same: np.ndarray) -> dict[str, float]:
+    """real [64, 256, 256] window; for the generated frames CONTEXT..63, right [16, 256, 256] each pixel's
+    probability of the real colour and same [16, 256, 256] its probability of the last context frame's colour
+    (the model is soft: models/dynamics.py) -> metrics, as expectations."""
     last = real[CONTEXT - 1]
     keep = np.ones((256, 256), bool)
     keep[:BAND], keep[256 - BAND:] = False, False
     keep[NEXT_BOX] = False
     out = {}
     for h in HORIZONS:
-        ref, gen = real[CONTEXT - 1 + h], generated[h - 1]
+        ref = real[CONTEXT - 1 + h]
         event = (ref != last) & keep
-        wrong = gen != ref
+        wrong = 1 - right[h - 1]
         static = ~(ref != last)[PLAYFIELD]
-        out[f"event_wrong_{h}"] = float((wrong & event).sum() / event.sum()) if event.any() else float("nan")
-        out[f"false_change_{h}"] = float(((gen != last)[PLAYFIELD] & static).sum() / max(static.sum(), 1))
-        if h == LEAD:
-            out["exact"] = float(not (wrong & event).any()) if event.any() else float("nan")
+        out[f"event_wrong_{h}"] = float(wrong[event].mean()) if event.any() else float("nan")
+        out[f"false_change_{h}"] = float((1 - same[h - 1][PLAYFIELD])[static].sum() / max(static.sum(), 1))
+        if h == LEAD:                                    # every event pixel more likely right than wrong
+            out["exact"] = float((wrong[event] < 0.5).all()) if event.any() else float("nan")
     return out
 
 
 @torch.no_grad()
-def evaluate(model, instances: list[Instance], steps: int = 4, batch: int = 16) -> tuple[list[dict], np.ndarray]:
-    """Roll the model out on each instance -> (per-instance scores, generated frames [n, 16, 256, 256])."""
+def evaluate(model, instances: list[Instance], palette: np.ndarray, batch: int = 16) -> tuple[list[dict], np.ndarray, np.ndarray]:
+    """Roll the model out on each instance -> (per-instance scores, its frames' expected colours [n, 16, 256,
+    256, 3] uint8, their pixels' probability of being wrong [n, 16, 256, 256] float16)."""
     model.eval()
-    generated = []
+    colours = torch.as_tensor(palette, dtype=torch.float32, device="cuda")
+    scores, rgb, wrong = [], [], []
     for i in range(0, len(instances), batch):
         group = instances[i:i + batch]
         x = torch.from_numpy(np.stack([g.frames for g in group])).cuda()
         a = incoming_actions(torch.from_numpy(np.stack([g.actions for g in group])).cuda())
+        right, same, shown = [], [], []
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            generated.append(rollout(model, x, a, CONTEXT, Decoding(steps=steps)).cpu().numpy())
-    generated = np.concatenate(generated) if generated else np.zeros((0, FRAMES - CONTEXT, 256, 256), np.uint8)
-    return [score(g.frames, out) for g, out in zip(instances, generated)], generated
+            decoder = model.decoder(len(group), x.device)
+            decoder.prefill(x[:, :CONTEXT], a[:, :CONTEXT])
+            for at in range(CONTEXT, FRAMES):
+                probs = decoder.next(a[:, at:at + 1], at)["probs"].float()
+                right.append(probs.gather(-1, x[:, at, ..., None].long())[..., 0])
+                same.append(probs.gather(-1, x[:, CONTEXT - 1, ..., None].long())[..., 0])
+                shown.append((probs @ colours).round().clamp(0, 255).byte())
+        right, same = torch.stack(right, 1).cpu().numpy(), torch.stack(same, 1).cpu().numpy()
+        scores += [score(g.frames, r, s) for g, r, s in zip(group, right, same)]
+        rgb.append(torch.stack(shown, 1).cpu().numpy())
+        wrong.append((1 - right).astype(np.float16))
+    empty = (np.zeros((0, FRAMES - CONTEXT, 256, 256, 3), np.uint8), np.zeros((0, FRAMES - CONTEXT, 256, 256), np.float16))
+    return (scores, np.concatenate(rgb) if rgb else empty[0], np.concatenate(wrong) if wrong else empty[1])

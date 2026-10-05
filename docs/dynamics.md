@@ -4,7 +4,9 @@
 (unattended: `scripts/run_until_stopped.ps1`). Tests: `tests/test_dynamics.py`.
 
 This is the standard recipe (Genie's dynamics model), on exact frames instead
-of a learned tokenizer. It replaces the exact-token memory plan
+of a learned tokenizer. The training recipes tried from 2026-10-01 on (standard,
+noborder, noborder_soft, stage1), with their reasons and results against the
+original small model, are in `recipe_attempts.md`. It replaces the exact-token memory plan
 (`exact_token_world.md`): a separately trained recall memory plus a generator.
 
 ## Model
@@ -40,6 +42,31 @@ of a learned tokenizer. It replaces the exact-token memory plan
   activations checkpointed). The Tetris run uses 6 blocks, width 128, 4 heads,
   a 16-dimensional colour embedding and no checkpointing: 4.1M parameters, of
   which 1.9M are the pixel head and 0.5M the patchify (see "Speed").
+  `modern` blocks (the "modern" run, from scratch, 2026-10-01) are Llama-style:
+  RMSNorm instead of LayerNorm, QK-norm (queries and keys RMS-normalised per
+  head, so attention logits stay bounded) and a SwiGLU MLP with hidden 8/3 x
+  width (the parameters of the 4 x width GELU MLP). They export to the browser
+  unchanged (`tests/test_onnx.py`).
+- **Soft, never argmax (2026-10-03, the `stage1` run on).** A generated
+  frame is its colour probabilities. It goes back into the context as each
+  pixel's probability-weighted colour embedding (`embed_probs`; kept as the
+  frame's patch tokens, 98 KB a frame), is shown as each pixel's expected
+  colour, and is scored by expectation (expected wrong pixels, expected
+  piece mass). Nothing ever picks one colour: an unsure piece stays in the
+  context as a ghost for the next frame to resolve, and training on the
+  real frames after the model's own ghosts teaches it to make them definite.
+  A frame is decoded in one pass from a fully masked frame (a second pass
+  with the first pass's guess went with own guesses, 2026-10-04).
+  `rollout_ghost_px` logs the pixels per generated frame whose most likely
+  colour is under 90% (GHOST). What came before, and why it went:
+  - argmax decoding (1 or more MaskGIT steps, confidence-first) erased a
+    piece whose position was uncertain: its probability split over rows,
+    and the one background colour won;
+  - per-token codes (2026-10-01) moved that split to the codes instead of
+    removing it, and erased too: the "modern" run, 56k steps, never learned
+    the falling piece (piece +32 at most 0.36);
+  - soft context on top of argmax output (`noborder_soft`, 2026-10-03) kept
+    3/32 pieces at 4k-12k, the same as without it.
 - **Actions:** the controller byte that produced frame t (8 button bits and a
   "none" flag for the first frame) is embedded and added to frame t's tokens.
 - **Head:** all 256 pixels of a token, each a palette index. Tied to the
@@ -75,44 +102,46 @@ of a learned tokenizer. It replaces the exact-token memory plan
   generation condition. Frame 0 is always visible. The first run used Genie's
   single rate in [0.5, 1) per window, the second a uniform rate per frame; see
   "Pretraining and fine-tunes" below for why each changed.
-- **Corrupted context, half of each batch (since 2026-09-30):** the model's
-  own frames contain confident mistakes, and a dream degrades after a few
-  dozen frames (exposure bias). GameNGen adds noise of a random strength to
-  its past frames and tells the model the level (without it, its quality
-  falls apart after a few dozen frames); Diffusion Forcing does the same per
-  frame. Here, for exact tokens (`corrupt_context`): each frame draws a level
-  0-9 (frame 0 stays real) and that share of its tokens, up to 30% at level 9,
-  is replaced by wrong but real content: half by the same place 1-8 frames
-  earlier (timing errors, a lagging piece), half by a random place in the
-  same frame (a stray block, a hole). Only this or earlier frames are
-  sources, so nothing later leaks in; static tokens often swap with an
-  identical one, so the corruption lands where frames change, as the model's
-  own errors do. Logged as `corrupted_fraction` (visible tokens made wrong).
-  This replaced own guesses: the masked tokens filled with the model's argmax
-  guesses, of which only ~0.03% of pixels were wrong, so that half of the
-  batch taught almost nothing about repairing a context.
-- **Rollouts (scheduled sampling), the other half:** each step draws k
-  log-uniform in 1-32 (mean ~9 frames, 21% of steps 16 or more; the first
-  runs drew 1-8 uniformly, and slow gravity moves a piece once per 48 frames
-  at level 0, far past 8) and a start s; frames s..s+k-1 are generated one after another from the
-  real frames before s with the cached rollout (1 MaskGIT step each since step 21.7k, 4 before; real
-  actions), exactly as at play time, and replace the real ones. The training
-  mask keeps every frame before s + k visible (`training_mask(cut=...)`), so
-  the frames after are predicted from a real start followed by the model's own
-  compounding mistakes, and scored against the real frames. Logged as
-  `rollout_frames` and `rollout_wrong`.
-- **Corruption level:** every frame's level (0 real, 1-9 corrupted) is a
-  learned embedding added to its tokens (`level`, zero-initialised, so every
-  level starts out read as real), as GameNGen and Diffusion Forcing condition
-  on the noise level. Frames generated in training rollouts carry level 2
-  (`GENERATED_LEVEL`), and so do generated frames in play by default
-  (`Decoding.level`, a play-app toggle). It replaced the per-token guessed
-  flag (`guess_token`), which marked the near-perfect own guesses; at step
-  21.7k, dreams with the flag off kept the board better (block mass 0.92 vs
-  0.79 at +128), a sign the flag taught distrust rather than repair.
+- **Two stages, as HorizonDrive trains (since 2026-10-04;
+  `examples/papers/horizondrive_2605.11596.pdf`, sec. 4.1-4.2, tab. 4):**
+  - **The base model (`--models base`): teacher forcing.** Every window is
+    real and clean; nothing else. HorizonDrive's base keeps its context clean
+    (noise level 0) for 50k steps.
+  - **Scheduled rollout recovery (`--models srr --grow-from <base checkpoint>
+    --rollouts DEEPEST SHALLOWEST STEPS --blend MAX --refresh R`).** Every
+    window is a rollout (`train_step`): from a real start s, a frozen copy of
+    the model generates k frames, k uniform in 1..depth, one after another as
+    in a dream; they go in as its soft frames, and the frames from the
+    boundary s + k on are real and scored, every frame before the boundary
+    visible (`training_mask(cut=...)`). The depth bound falls from DEEPEST to
+    SHALLOWEST over STEPS steps (HorizonDrive's boundary-decay curriculum, 10
+    -> 4 chunks: the deepest drift first). The blend (`own_share`, the
+    history side of their eq. 8): the history's last w frames fade linearly
+    from the copy's own to the real ones, w drawn uniform in 0..MAX each step,
+    so the frame before the first scored one runs from nearly real to fully
+    its own (a dream's condition). The targets are always the real frames.
+    The copy is refreshed with the model's weights every R steps (2,000;
+    HorizonDrive caches its rollouts per clip and refreshes them as often), so
+    the rollouts do not chase the model being trained. Its soft frames' tokens
+    are its own embedding, mixed with the live model's embedding of the real
+    frames (they drift apart by at most R steps). Logged as `rollout_depth`,
+    `blend_frames` (the step's w), `rollout_frames` (k) and `rollout_wrong`
+    (pixels expected wrong). How we got here (`recipe_attempts.md`): the
+    rollouts drawn by the model being trained, at lr 3e-4, lost the gravity
+    clock within 400 steps; a frozen copy at lr 3e-5 with HorizonDrive's
+    two-sided blend (radius 24, the targets partly the copy's own prediction)
+    kept the clock but lost the next piece's spawn, test by test, as the
+    model learned to imitate the copy where spawns happen.
+  - **Removed with it:** context swaps and noise, the four sets of windows,
+    the frame tags, own guesses (and with them the second decoding pass),
+    Self Forcing and event tossing. The last recipe with them (stage 1, then
+    the blend run `stage1_blend`) and its results are in
+    `recipe_attempts.md`; that code is in this repository's history.
 - **Loss:** cross-entropy over every pixel of masked tokens, all pixels at the
-  same weight, always against the real frames. The letterbox tick border is in every frame and in the loss at
-  full weight. Game, border and changed-pixel losses are reported, not weighted.
+  same weight, always against the real frames. The letterbox tick border is
+  in every frame and in the loss at full weight (the `noborder` runs,
+  2026-10-02, tried a blank one and kept fewer pieces than standard; it may
+  come back as a stage 3). Game, border and changed-pixel losses are reported, not weighted.
   Measured on the 8M model at step 50,056 (8 live windows, real inputs): the
   border is 6% of masked pixels and 50% of the gradient (sum of 1 - p over
   pixels); changed game pixels 0.16% and 15%; static game pixels 94% and 36%,
@@ -122,19 +151,12 @@ of a learned tokenizer. It replaces the exact-token memory plan
   0.01 and 3.3% at 0.03, so it is not used: the loss already concentrates on
   the hard pixels.
 - **Data:** live emulator histories only, windows of 64 frames (63 new frames
-  per history per step). No eval set. Windows are tossed by the events in
-  them (`data/tetris_events.py`, `EventToss`): every window with a double,
-  triple, tetris, level up, top-out or game start is kept, 40% of those with
-  a single or a piece falling alone, 15% of the rest; an event in the last 32
-  frames of a window also counts for the next one (its animation, counters or
-  curtain), and a window is judged once the next has arrived, so detection
-  has its lookahead. About a third of windows are kept; rare events come
-  round ~3x more often per step. Tetris is deterministic given the screen and
-  buttons, so this reweights which situations are trained, not the
-  dynamics (only the random next piece is slightly biased). The emulators
-  make several times the frames training uses: 16 workers kept 18.3
-  windows/s (1,150 of 3,470 frames/s) with the GPU idle, against 12.6 used
-  per second by the 8M run. Currently Tetris only, 16 histories per
+  per history per step). No eval set. Every window is trained on, so events
+  come at the rate the game has them (the earlier event tossing kept every
+  window with a rare event and few others; it went with the two-stage
+  recipe). The emulators make several times the frames training uses: 16
+  workers kept 18.3 windows/s (1,150 of 3,470 frames/s) with the GPU idle,
+  against 12.6 used per second by the 8M run. Currently Tetris only, 16 histories per
   step (`GAMES` in the trainer). The first run (2 Tetris + 2 Contra, stopped at
   step 6,400 in `output/world_model`) had Tetris's static screen 0.1% wrong but
   Contra's static background 14-19% wrong.
@@ -484,7 +506,35 @@ Census, 4 streams, ~630,000 frames each (one event per N frames):
 | top-out | 12k | 5.6k | 6.0k | 5.9k |
 
 Uncapped patience (a patient piece fell the whole way) cost too much time at
-slow levels; the cap fixed level ups. Games now last median 3,300 frames,
+slow levels; the cap fixed level ups. Since 2026-10-01 half the patient
+pieces over a stack of 8 rows or fewer spin while they fall (A or B at
+random, 1 frame in 8), then turn back to the plan and drop: rotations went
+from 20.6 to 39.9 per 1,000 playing frames (30,000 frames, 3 games each).
+
+Event census (2026-10-02, 4 games x 50,000 frames, RAM events; per 1,000
+in-game frames) and the holding brain it led to. The other brains tap and
+soft-drop, so held shifts (the game's autorepeat), landings by gravity and long
+untouched falls were rare, while a person in the browser holds the arrows and
+the long-dream test lets pieces fall untouched. The holding brain plans like
+the perfect one but holds Left/Right until the column, holds A/B a few frames
+per turn and never presses Down; it takes 25% of short games' brain time
+(perfect 45%, random 20%, idle 10%); long games stay perfect-only, since from
+level 15 a piece falls the well in ~40 frames, faster than autorepeat moves it.
+
+| per 1,000 in-game frames | before | with the holding brain |
+|---|---|---|
+| held shift (autorepeat) | 0.45 | 2.52 |
+| lock by gravity, then spawn | 1.92 (14% of spawns) | 3.20 (25%) |
+| untouched falls of 200+ frames | 1 stretch | 44 (8.8% of frames) |
+| untouched falls of 96+ / 48+ frames | 7.7% / 13.0% of frames | 16.1% / 22.8% |
+| soft drop / gravity / shift / rotate | 155 / 33 / 30 / 22 | 118 / 40 / 27 / 18 |
+| spawn | 13.7 | 12.8 |
+| single / double / triple / tetris | 2.45 / 0.46 / 0.10 / 0.015 | 2.14 / 0.32 / 0.06 / 0.025 |
+| top-out / game start / level up | 0.18 / 0.20 / 0.17 | 0.21 / 0.23 / 0.14 |
+
+Still never in training: SELECT during play (it hides the next piece). Spawns
+draw on screen one frame after the RAM shows them; the entry delay from lock
+to spawn is 10-18 frames (median 12-14). Games now last median 3,300 frames,
 mean 5,100, and 44% of in-game frames come from games over 20,000 frames.
 
 Forced perfect brain, 30,000 frames per start level:
@@ -575,7 +625,46 @@ At level 4 no model let a piece fall, and shapes morphed; 1, 4 or 16 decode
 steps made no difference. The `falling alone` scenario (no buttons for 16
 frames after the player lets go) scores the same thing at short horizons.
 
+The scores (`diagnostics/long_dream.py score`, the same in training's tests
+every 2,000 steps). Since 2026-10-04 the falling piece is scored by position
+too: the base run's step-14,000 dream kept "24 of 32 pieces intact" by
+pixel count while its piece sat frozen at the spawn point.
+
+| score | what it measures |
+|---|---|
+| `wrong_h` | playfield pixels expected wrong at +16/+32/+64/+128 |
+| `mass` | filled pixels (p(block) >= 0.5) at +128 over the real game's |
+| `piece_h` | the piece's filled pixels over the real one's, anywhere in the upper playfield (kept, not placed) |
+| `piece_hit_h` | the share of the real piece's pixels the dream fills: a frozen or lagging piece scores 0 |
+| `piece_ghost_h` | filled pixels where the real frame has none, over the real piece's: stuck, doubled, smeared |
+| `fall` | the dream piece's drop over the real one's (centres), up to 64 frames: 1 at the real speed, 0 frozen |
+| `spawn`, `spawn_lag` | the next piece appears within 16 frames of the real one's, after the first left the spawn area |
+| `timer_wrong_h` | the border's fall-timer cells expected wrong: the gravity clock the model reads |
+
 ## Generation and previews
+
+**Decoding, measured 2026-10-02** (small 90.6k, no training, 12 games, 512-frame
+no-button dreams, the same games for every row; `Decoding.order` added):
+
+| decoding | level | wrong +16 / +128 / +512 | mass @512 | piece +32 | intact |
+|---|---|---|---|---|---|
+| 1 step | 0 | 0.51% / 2.52% / 14.55% | 0.99 | 0.98 | 11/11 |
+| 2 steps, most confident first | 0 | 0.32% / 1.96% / 6.51% | 1.00 | 0.98 | 11/11 |
+| 2 steps, random order | 0 | 0.57% / 2.62% / 15.71% | 1.03 | 0.94 | 11/11 |
+| 4 steps, most confident first | 0 | 0.68% / 2.32% / 6.26% | 0.99 | 0.99 | 11/11 |
+| 4 steps, random order | 0 | 0.87% / 2.85% / 20.14% | 0.91 | 0.88 | 10/11 |
+| 8 steps, random order | 0 | 1.13% / 3.51% / 21.23% | 1.01 | 0.86 | 9/11 |
+| 4 steps, random, temperature 0.5 | 0 | 0.38% / 3.29% / 14.80% | 0.96 | 0.96 | 11/11 |
+| 1 step | 2 | 1.72% / 4.03% / 21.41% | 0.92 | 0.79 | 7/11 |
+| 2 steps, most confident first | 2 | 1.81% / 3.62% / 21.26% | 0.91 | 1.01 | 10/11 |
+
+Two steps, most confident first, at level 0 halve the error at +512 and keep
+every piece. Random order (1X's open Genie reference, which finds
+confident-first copies the previous frame for its VQ tokens) is worse here, and
+gets worse with more steps; sampling does not help. Level 0 beats level 2 at
+every horizon, as GameNGen finds noise in training and little or none at
+inference best. The papers and reference code behind these choices are in
+`examples/` (not committed; `examples/README.md`).
 
 A frame is decoded from a fully masked frame in 4 MaskGIT steps: argmax picks,
 the most confident tokens (summed pixel log-probability) unmasked first on a
@@ -601,10 +690,13 @@ wrong on the border (`border_copy`). Four of the windows, from the most
 changing to the quietest, are saved as animated GIFs (`previews/`: real |
 generated | wrong, frame by frame).
 
-Every 1,000 steps (`--long-dream-every`) the trainer runs the long-dream test
-on each model's averaged weights: 6 live trials (one low-priority worker
-plays them ahead of time; every model gets the same ones), dreamed at
-corruption level 2 and level 0 with 1 decode step. Rows are appended to
+Every 2,000 steps (`--long-dream-every`) the trainer runs the long-dream test
+on each model's averaged weights: 32 trials, the same games at every test
+and in every run with the same `--seed` (one low-priority worker plays them
+from the seed at launch), so steps and runs are compared on the same games;
+until 2026-10-01 it was 6 new games every 1,000 steps, too few to tell runs
+apart. They are dreamed at corruption level 2 and level 0 with 1 decode
+step. Rows are appended to
 `long_dream.csv` per trial, with the first trial animated in
 `long_dream.gif`. A test takes under 10 s (8 s at step 29,000). The checkpoint of every tested step is
 copied to `D:/token_world_checkpoints/<run folder>/model_step<step>.pt`
@@ -623,37 +715,43 @@ python scripts/export_onnx.py [checkpoint.pt]     # -> web/model/ (needs pip ins
 python -m http.server 8000 -d web                 # open http://localhost:8000 in Chrome or Edge
 ```
 
-The export (`models/onnx_export.py`) writes the averaged weights as two
-graphs, plus the page's start (`context.bin`: the last 48 real frames of a
-live game paused at a fresh piece; `context.json`: their buttons, the
-palette, the default level):
+The export (`models/onnx_export.py`) writes the averaged weights as three
+graphs, plus the page's start (`context.bin`: the start of a level-0 game;
+`context.json`: its buttons and the palette). The model is soft, so the
+context is kept as each frame's patch tokens (98 KB a frame) and a frame is
+shown as its expected colours (2026-10-03; the argmax version passed palette
+indices):
 
-- `prefill.onnx`: real frames [T, 256, 256] uint8, their incoming actions and
-  levels -> the key/value cache, positions 0..T-1 filled (2 <= T < 64).
-- `step.onnx`: action, level, position and the cache -> the next frame and the
-  cache with it.
+- `embed.onnx`: real frames [T, 256, 256] uint8 -> their patch tokens.
+- `prefill.onnx`: patch tokens [T, 256, dim] and their incoming actions -> the
+  key/value cache, positions 0..T-1 filled (2 <= T < 64).
+- `step.onnx`: the previous frame's tokens, actions, position and the cache ->
+  the new frame's expected colours [256, 256, 3] (the palette is in the
+  graph), its tokens, and the cache with it.
 
 The cache goes in and out whole, so the page keeps it in GPU buffers from step
 to step (`preferredOutputLocation: "gpu-buffer"`, as onnxruntime-web runs
-LLMs' caches) and only the 64 KB frame reaches JavaScript. `web/dreamer.js`
-plays the graphs as `Dreamer` does (re-encoding the last 48 frames when the
-window fills); `models/onnx_dreamer.py` is the same in Python. Decoding is
-argmax at the exported number of steps (1); the level is an input (the page
-starts at 0, which kept the falling piece in 91% of trials against 45% at
-2). Both graphs run the model's own forward against a cache passed in
+LLMs' caches); the picture (768 KB) and the tokens (98 KB) reach JavaScript.
+`web/dreamer.js` plays the graphs as `Dreamer` does (re-encoding the last 48
+frames' tokens when the window fills); `models/onnx_dreamer.py` is the same in
+Python. All graphs run the model's own forward against a cache passed in
 (`GraphCache`), so there is one model path; exporting needed `button_bits`
 without `>>` (ONNX shifts no int64) and the patch embedding in one chunk.
 
 Checks, all against PyTorch's `Dreamer` on the page's start with no buttons:
 the export script (onnxruntime, Python) and `web/test_dreamer.mjs`
-(`dreamer.js` on onnxruntime-node; `cd web && npm install && npm test`) both
-dreamed 96 frames pixel-identical at step 98,000. `tests/test_onnx.py`
-checks a small model through a window slide. `web/check_browser.mjs` opens
+(`dreamer.js` on onnxruntime-node; `cd web && npm install && npm test`;
+`MODEL=folder` for another export). Soft (2026-10-03, a 320-step stage1
+checkpoint): expected colours within 0.0001 of PyTorch's over 24 frames, and
+`dreamer.js` within 2 of them as bytes. `tests/test_onnx.py` checks small
+models (plain and modern blocks) through a window slide. The argmax
+version dreamed 96 frames pixel-identical at step 98,000. `web/check_browser.mjs` opens
 the page in Chrome with `?check`, which does the same on WebGPU and reports
 the time per frame (`--profile` also lists the nodes onnxruntime-web runs on
 the CPU).
 
-On the RTX 3090 in Chrome (step 101,000, after the cooldown), the dream
+The timings below are the argmax version's; the soft step has not been
+timed in the browser yet. On the RTX 3090 in Chrome (step 101,000, after the cooldown), the dream
 matched PyTorch (from the black start, 2 pixels in 96 frames differ: blacks
 that are separate palette entries the model cannot tell apart, a logit gap of
 6e-6), and a step went from 122 ms to 18.6 ms (56 frames/s playing) by keeping every node of the step on the GPU: a node

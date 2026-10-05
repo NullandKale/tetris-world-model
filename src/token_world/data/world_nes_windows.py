@@ -50,8 +50,8 @@ def world_nes_windows(rom: Path, session: Session, slots: np.ndarray, state: tup
 
     slots: the game's three border shades (model_frames.border_slots); state:
     the RAM addresses drawn in every frame's border, or None. toss: an object
-    whose push(window, ram, actions) returns a window to keep or None
-    (tetris_events.EventToss); the frame counter then jumps by whole strides.
+    whose push(window, ram, actions) returns a window to keep or None; the
+    frame counter then jumps by whole strides.
     Yields x [frames, 256, 256] uint8 model indices; action [frames] long,
     where action[t] took frame t to t + 1 and the last entry repeats the one
     before it as padding; ram [frames, 2048] uint8, each frame's console RAM

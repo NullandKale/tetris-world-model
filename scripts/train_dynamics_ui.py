@@ -12,21 +12,18 @@ number of histories from each game (GAMES); each game's frames map through
 its own palette into the shared index space (NES colours 0-54, the game's
 three border shades 55-57), so one model and one vocabulary cover both.
 Loss: cross-entropy over the pixels of masked tokens, every pixel at the same
-weight, the letterbox tick border included. The game, border and changed-pixel
-parts are reported, not weighted. The model's own frames are part of every
-step (models/dynamics.py): half the windows have their context corrupted at a
-level per frame (wrong but real content, as GameNGen and Diffusion Forcing
-corrupt theirs), the other half carry 1-32 frames it generated one after
-another from the real past; the training pass is told each frame's level and
-scores the real pixels.
+weight, the letterbox border included. The game, border and changed-pixel
+parts are reported, not weighted. The model is soft: its frames are colour
+distributions, never argmax (models/dynamics.py).
 
-Windows are tossed by the events in them (data/tetris_events.py): every
-window with a rare event is kept, few ordinary ones, so level ups, top-outs
-and big line clears come round several times more often per step.
---keep-all-windows trains on the game as it is played instead: tossing makes
-events look more frequent than they are, and dreams may then run ahead. Alongside
-the trained weights the checkpoint keeps an exponential moving average of
-them (EMA_DECAY), which play and the checks load.
+Two stages, as HorizonDrive trains (examples/papers/horizondrive_2605.11596):
+the base model on real, clean context (teacher forcing: --models base), then
+scheduled rollout recovery from its weights (--models srr --grow-from ...
+--rollouts ... --blend ...), where every window's history is the model's own
+rollout, its last frames fading to the real ones, and the frames after it are
+scored against the real ones. Every window is trained on, at the rate the game has its
+events. Alongside the trained weights the checkpoint keeps an exponential
+moving average of them (EMA_DECAY), which play and the checks load.
 
 Previews roll the model out on the current batch: the first 48 frames of each
 window are context, the last 16 are generated one after another with the real
@@ -42,6 +39,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import gc
 import json
 import logging
 import os
@@ -65,8 +63,8 @@ from token_world.data.nes_palette import tetris_palette
 from token_world.data.world_nes_tetris import WorldNesTetrisStreams
 from token_world.diagnostics.long_dream import TrialStream, animation, dream, score
 from token_world.diagnostics.long_dream import sheet as dream_sheet
-from token_world.models.dynamics import (HEAD, SIZE, Decoding, Dynamics, build, corrupt_context, deepen, incoming_actions, masked_loss,
-                                         patch_pixels, rollout, training_mask)
+from token_world.models.dynamics import (SIZE, Dynamics, build, deepen, incoming_actions, masked_loss,
+                                         own_share, patch_pixels, rollout, training_mask)
 from token_world.data.live_batches import LiveBatches
 
 # Tetris only: the small, fast model on the simpler game first. GameBatches supports
@@ -75,26 +73,23 @@ from token_world.data.live_batches import LiveBatches
 GAMES = ("tetris",)
 # recompute: keep only the patch and block inputs for backward and recompute the rest (same model and
 # gradients, less memory, one more forward): the large model needs it, the small one is 7% faster without.
-MODELS = {"small": {"dim": 96, "layers": 8, "heads": 4, "recompute": False},   # ~2.0M parameters
-          # ~3.2M: the small model grown deeper (--grow-from, models/dynamics.py deepen), its pixel head
-          # frozen: the trunk learns more dynamics against the head the small model trained
-          "deep": {"dim": 96, "layers": 16, "heads": 4, "recompute": True, "frozen_head": True},   # 24 GB: recompute
-          "large": {"dim": 192, "layers": 10, "heads": 6, "recompute": True}}  # ~7.6M parameters
+MODELS = {# HorizonDrive's two stages at the small model's size (~2.0M parameters): the base model on real
+          # context only, then scheduled rollout recovery from its weights (--grow-from, --rollouts, --blend)
+          "base": {"dim": 96, "layers": 8, "heads": 4, "recompute": False},
+          "srr": {"dim": 96, "layers": 8, "heads": 4, "recompute": False}}
 HORIZONS = (1, 2, 4, 8, 16)
 WINDOW_STRIDE = 16                                # a window every 16 frames: each frame in four windows
 STOP_FILE = ROOT / "output" / "stop_training"      # create it to stop cleanly, like Stop Training
 EMA_DECAY = 0.999                                 # averaged weights: about the last 1,000 steps
-ROLLOUT_FRAMES = 32                               # longest rollout generated inside a training step
-# How training rollouts generate: one MaskGIT step, as in play (lowest long-dream error at step 21.7k).
-ROLLOUT_DECODING = Decoding(steps=1)
 KINDS = ("wrong", "changed", "wrong_changed", "wrong_static", "border_wrong", "border_copy")
-LONG_DREAM_EVERY = 1000                           # steps between long-dream tests
-LONG_DREAM_TRIALS = 6                             # live trials per test, the same for every model
-LONG_DREAM_VARIANTS = {"level 2": Decoding(steps=1), "level 0": Decoding(steps=1, level=0)}
+LONG_DREAM_EVERY = 2000                           # steps between long-dream tests
+LONG_DREAM_TRIALS = 32                            # trials per test: the same games at every test and in every
+                                                  # run with the same --seed, so tests compare like with like
+LONG_DREAM_VARIANT = "1 pass"                     # long_dream.csv's variant column (earlier runs had two)
 PREVIEW_GIFS = 4                                  # preview windows saved as animated GIFs
 FIELDS = ["step", "seconds", "lr", "train_loss", "train_loss_game", "train_loss_border",
-          "train_loss_changed", "masked_fraction", "corrupted_fraction",
-          "rollout_frames", "rollout_wrong",
+          "train_loss_changed", "masked_fraction", "rollout_depth", "blend_frames",
+          "rollout_frames", "rollout_wrong", "rollout_ghost_px",
           "data_wait_ms_mean", "data_wait_ms_max",
           "stream_tick_min", "stream_tick_max", "in_game_restarts",
           *(f"{g}_h{h}_{kind}" for g in GAMES for h in HORIZONS for kind in KINDS)]
@@ -115,8 +110,7 @@ class GameBatches:
     """Each step's batch: workers_per_game live histories of every game, in GAMES order.
 
     Streams come from World NES (../llm-thing23) and arrive as uint8 model index
-    frames in one layout (data/model_frames.py). Tetris windows are tossed by
-    their events; Contra has no event detector, so every Contra window is kept.
+    frames in one layout (data/model_frames.py). Every window is kept.
     """
 
     def __init__(self, frames: int, seed: int, args):
@@ -126,8 +120,7 @@ class GameBatches:
         self.palettes, streams = {}, {}
         if "tetris" in GAMES:
             self.palettes["tetris"] = tetris_palette()
-            streams["tetris"] = WorldNesTetrisStreams(frames, seed, args.tetris_repo,
-                                                      toss=not args.keep_all_windows, stride=WINDOW_STRIDE)
+            streams["tetris"] = WorldNesTetrisStreams(frames, seed, args.tetris_repo, stride=WINDOW_STRIDE)
         if "contra" in GAMES:                     # imported only when used: Contra can't break a Tetris run
             from token_world.data.world_nes_contra import WorldNesContraStreams, contra_palette
             self.palettes["contra"] = contra_palette()
@@ -163,82 +156,103 @@ def border_pixels(model: Dynamics, device) -> torch.Tensor:
     return patch_pixels((rows < BAND) | (rows >= SIZE - BAND), model.patch)
 
 
-def train_step(model, forward, index, actions, max_rollout: int = ROLLOUT_FRAMES):
+def train_step(model, forward, index, actions, depth: int = 0, blend: int = 0,
+               generator: torch.Generator | None = None, drawer: Dynamics | None = None):
     """One MaskGIT step on windows index [B, T, 256, 256] -> losses (total has the graph).
 
-    Every window's context is corrupted, at a level per frame the model is told, and the loss is always
-    on the real pixels:
-    - corrupted context (the first half): each frame draws a level and that share of its tokens is
-      replaced by wrong but real content (corrupt_context);
-    - rollouts (the second half): frames s..s+k-1 (k log-uniform in 1..max_rollout, one draw per step:
-      long rollouts regularly, short ones mostly, so the average cost stays near 9 frames) are
-      generated one after another from the real frames before s, exactly as in a rollout, and
-      every frame before s + k stays visible, so the frames after them are predicted from a real
-      start followed by the model's own frames, which carry ROLLOUT_DECODING.level.
+    depth 0, the base model (HorizonDrive's first stage): teacher forcing. Every window is real and clean;
+    each frame's tokens are hidden at a rate drawn per frame and predicted from the real frames before it
+    (training_mask: half the windows with every frame before a random cut fully visible).
+    depth > 0, scheduled rollout recovery (its second stage, sec. 4.2): every window is a rollout. From a
+    real start s, `drawer` generates k frames (k uniform in 1..depth) one after another, as in a dream, and
+    they go in as its soft frames; the frames from the boundary s + k on are real and scored, every frame
+    before the boundary visible. blend: the history's last w frames (w uniform in 0..blend each step)
+    fade from the drawer's own to the real ones (own_share), so the frame before the first scored one runs
+    from nearly real (w = blend) to fully its own (w = 0, a dream's condition); the targets are always the
+    real frames. drawer: the model that draws the rollouts (HorizonDrive's cached rollouts: a frozen copy
+    refreshed every --refresh steps; default the model itself).
     """
+    drawer = model if drawer is None else drawer
     b, t = index.shape[:2]
     n = model.grid ** 2
     device = index.device
     incoming = incoming_actions(actions)
     target = patch_pixels(index, model.patch)                             # [B, T, N, P*P]
-    own = b - b // 2                                                      # windows [0, own): corrupted
-    corrupted, own_level, changed_tokens = corrupt_context(index[:own], model.patch)
-    k = int(np.exp(np.random.uniform(0, np.log(min(max_rollout, t - 2) + 1))))  # log-uniform 1..max
-    s = int(torch.randint(1, t - k, ()))                                  # s >= 1 and s + k <= t - 1
-    generated = rollout(model, index[own:, :s + k], incoming[own:, :s + k], s, ROLLOUT_DECODING, compiled=True)
-    inputs = index.clone()
-    inputs[:own] = corrupted
-    inputs[own:, s:s + k] = generated
-    level = torch.zeros(b, t, dtype=torch.long, device=device)
-    level[:own] = own_level
-    level[own:, s:s + k] = ROLLOUT_DECODING.level
-    cut = torch.zeros(b, dtype=torch.long, device=device)
-    cut[own:] = s + k
-    mask = training_mask(b, t, n, device, cut=cut)
-    features = forward(inputs, incoming, mask, level)
+    cut = torch.zeros(b, dtype=torch.long, device=device)                 # 0: a random clean cut, half the time
+    soft = unsure = wrong = None
+    k = w = 0
+    if depth:
+        k = int(torch.randint(1, min(depth, t - 2) + 1, (), generator=generator))
+        s = int(torch.randint(1, t - k, (), generator=generator))           # s >= 1, the boundary s + k <= t - 1
+        w = int(torch.randint(0, blend + 1, (), generator=generator))
+        boundary = s + k
+        tokens, unsure, wrong = rollout(drawer, index[:, :boundary], incoming[:, :boundary], s, compiled=True)
+        lo = max(s, boundary - w)                                           # the first frame with a real part
+        if lo < boundary:
+            real = model._patches(index[:, lo:boundary]).to(tokens.dtype)
+            part = own_share(s, boundary, w, device)[lo - s:][None, :, None, None].to(tokens.dtype)
+            tokens = torch.cat((tokens[:, :lo - s], part * tokens[:, lo - s:] + (1 - part) * real), 1)
+        where = torch.zeros(b, t, dtype=torch.bool, device=device)
+        where[:, s:boundary] = True
+        values = torch.zeros(b, t, n, tokens.shape[-1], dtype=tokens.dtype, device=device)
+        values[:, s:boundary] = tokens
+        soft = (where, values)
+        cut[:] = boundary
+    mask = training_mask(b, t, n, device, generator, cut=cut)
+    features = forward(index, incoming, mask, soft=soft)
     total, per_pixel, where = masked_loss(model, features, target, mask)
     per_pixel = per_pixel.detach()
     border = border_pixels(model, index.device)[where[2]]
     changed = (target[:, 1:] != target[:, :-1])[where[0], where[1] - 1, where[2]]   # frame 0 is never masked
     mean = lambda v, m: (v * m).sum() / m.sum().clamp_min(1)
+    nan = torch.tensor(float("nan"))
     return {"total": total, "game": mean(per_pixel, ~border), "border": mean(per_pixel, border),
             "changed": mean(per_pixel, changed & ~border), "masked": mask[:, 1:].float().mean(),
-            "corrupted": (changed_tokens & ~mask[:own])[:, 1:].float().mean(),   # visible tokens made wrong
-            "rollout_frames": torch.tensor(float(k)),
-            "rollout_wrong": (generated != index[own:, s:s + k]).float().mean()}
+            "rollout_frames": torch.tensor(float(k)), "blend": torch.tensor(float(w)),
+            "rollout_wrong": wrong.mean() if wrong is not None else nan,          # its frames' pixels expected wrong
+            "rollout_ghost_px": unsure.mean() if unsure is not None else nan}     # unsure pixels per generated frame
 
 
 def preview(model, index, actions, palettes, out: Path, args) -> dict[str, float]:
     """Per game: generated vs real frames at each horizon, contact sheets and horizon_curve.csv.
 
-    The last max(HORIZONS) frames of each window are generated one after another from the rest.
+    The last max(HORIZONS) frames of each window are generated one after another from the rest, as soft
+    frames; "wrong" is each pixel's probability of anything but the real colour (expected wrong pixels).
     """
-    start = index.shape[1] - max(HORIZONS)
-    model.eval()
-    generated = rollout(model, index, incoming_actions(actions), start, Decoding(steps=args.decode_steps))
-    model.train()
+    b, t = index.shape[:2]
+    start = t - max(HORIZONS)
+    incoming = incoming_actions(actions)
     real, last_context = index[:, start:], index[:, start - 1]
-    game_rows = GAME_ROWS
+    model.eval()
+    decoder = model.decoder(b, index.device)
+    decoder.prefill(index[:, :start], incoming[:, :start])
+    wrong, rgb = [], []
+    colours = {g: palettes[g].to(index.device, torch.float32) for g in GAMES}
     per = args.workers_per_game
+    for i, at in enumerate(range(start, t)):
+        probs = decoder.next(incoming[:, at:at + 1], at)["probs"].float()           # [B, 256, 256, COLOURS]
+        wrong.append(1 - probs.gather(-1, real[:, i, ..., None].long())[..., 0])
+        rgb.append(torch.cat([probs[g * per:(g + 1) * per] @ colours[game] for g, game in enumerate(GAMES)])
+                   .round().clamp(0, 255).byte())
+    model.train()
+    wrong, rgb = torch.stack(wrong, 1), torch.stack(rgb, 1)                         # [B, H, 256, 256], [.., 3]
     m = {}
     for g, game in enumerate(GAMES):
         rows = slice(g * per, (g + 1) * per)
         for h in HORIZONS:
-            gen, ref, before = generated[rows, h - 1], real[rows, h - 1], last_context[rows]
-            wrong = gen != ref
-            changed = (ref != before)[:, game_rows]
-            wg = wrong[:, game_rows]
-            rate = lambda a, b: (a & b).sum().item() / max(b.sum().item(), 1)
-            m.update({f"{game}_h{h}_wrong": wg.float().mean().item(),
+            miss, ref, before = wrong[rows, h - 1], real[rows, h - 1], last_context[rows]
+            changed = (ref != before)[:, GAME_ROWS]
+            mg = miss[:, GAME_ROWS]
+            rate = lambda m_, c: (m_ * c).sum().item() / max(c.sum().item(), 1)
+            m.update({f"{game}_h{h}_wrong": mg.mean().item(),
                       f"{game}_h{h}_changed": changed.float().mean().item(),
-                      f"{game}_h{h}_wrong_changed": rate(wg, changed),
-                      f"{game}_h{h}_wrong_static": rate(wg, ~changed),
-                      f"{game}_h{h}_border_wrong": torch.cat((wrong[:, :BAND], wrong[:, -BAND:]),
-                                                             1).float().mean().item(),
+                      f"{game}_h{h}_wrong_changed": rate(mg, changed),
+                      f"{game}_h{h}_wrong_static": rate(mg, ~changed),
+                      f"{game}_h{h}_border_wrong": torch.cat((miss[:, :BAND], miss[:, -BAND:]), 1).mean().item(),
                       f"{game}_h{h}_border_copy": torch.cat(((ref != before)[:, :BAND], (ref != before)[:, -BAND:]),
                                                             1).float().mean().item()})   # copying frame 47
-        save_sheet(real[rows], generated[rows], last_context[rows], palettes[game], out / f"rollout_{game}.png")
-        save_previews(real[rows], generated[rows], last_context[rows], palettes[game], out / "previews", game)
+        save_sheet(real[rows], rgb[rows], wrong[rows], last_context[rows], palettes[game], out / f"rollout_{game}.png")
+        save_previews(real[rows], rgb[rows], wrong[rows], last_context[rows], palettes[game], out / "previews", game)
     temporary = out / "horizon_curve.csv.tmp"
     with temporary.open("w", newline="") as file:
         writer = csv.writer(file)
@@ -268,45 +282,49 @@ def save_gif(frames: list, path: Path, ms: int) -> None:
     replace(temporary, path)
 
 
-def save_previews(real, generated, last_context, palette, folder: Path, game: str) -> None:
+def wrong_panel(reference: np.ndarray, wrong: np.ndarray) -> np.ndarray:
+    """The real frame dimmed, magenta in proportion to each pixel's expected wrongness."""
+    w = wrong.astype(np.float32)[..., None]
+    return (reference * 0.35 * (1 - w) + np.array([255, 0, 200]) * w).astype(np.uint8)
+
+
+def save_previews(real, rgb, wrong, last_context, palette, folder: Path, game: str) -> None:
     """PREVIEW_GIFS windows, from the most changing to the quieter ones, as animated GIFs: the last
-    context frame, then each generated frame, as REAL | GENERATED | WRONG (magenta)."""
+    context frame, then each generated frame, as REAL | GENERATED (expected colours) | WRONG (magenta)."""
     change = (real[:, -1] != last_context).float().mean((1, 2))
     order = change.argsort(descending=True).tolist()
     picks = list(dict.fromkeys(order[i * len(order) // PREVIEW_GIFS] for i in range(PREVIEW_GIFS)))
     palette = palette.cpu()
-    rgb = lambda frame: palette[frame.long().cpu()].numpy()
+    colour = lambda frame: palette[frame.long().cpu()].numpy()
     for slot, w in enumerate(picks):
         frames = []
         for t in range(-1, real.shape[1]):
-            ref = last_context[w] if t < 0 else real[w, t]
-            gen = last_context[w] if t < 0 else generated[w, t]
-            miss = (rgb(ref) * 0.35).astype(np.uint8)
-            miss[(gen != ref).cpu().numpy()] = (255, 0, 200)
+            ref = colour(last_context[w] if t < 0 else real[w, t])
+            gen = ref if t < 0 else rgb[w, t].cpu().numpy()
+            miss = wrong_panel(ref, np.zeros(ref.shape[:2]) if t < 0 else wrong[w, t].float().cpu().numpy())
             image = Image.new("RGB", (3 * SIZE + 16, SIZE + 18), "#181820")
             draw = ImageDraw.Draw(image)
-            for c, (title, panel) in enumerate((("REAL", rgb(ref)), ("GENERATED", rgb(gen)), ("WRONG", miss))):
+            for c, (title, panel) in enumerate((("REAL", ref), ("GENERATED", gen), ("WRONG", miss))):
                 image.paste(Image.fromarray(panel, "RGB"), (c * (SIZE + 8), 18))
                 draw.text((c * (SIZE + 8) + 2, 3), f"{title} {'context' if t < 0 else f'+{t + 1}'}", fill="white")
             frames.append(image)
         save_gif(frames, folder / f"{game}_{slot}.gif", 160)
 
 
-def save_sheet(real, generated, last_context, palette, path: Path) -> None:
+def save_sheet(real, rgb, wrong, last_context, palette, path: Path) -> None:
     """Columns: last context frame, then each horizon. Rows: real, generated, wrong pixels."""
     show = int((real[:, -1] != last_context).float().mean((1, 2)).argmax())   # the most-changing history
     palette = palette.cpu()
-    rgb = lambda frame: palette[frame.long().cpu()].numpy()
-    columns = [("context t", last_context[show], last_context[show])]
-    columns += [(f"+{h}", real[show, h - 1], generated[show, h - 1]) for h in HORIZONS]
+    colour = lambda frame: palette[frame.long().cpu()].numpy()
+    context = colour(last_context[show])
+    columns = [("context t", context, context, np.zeros(context.shape[:2]))]
+    columns += [(f"+{h}", colour(real[show, h - 1]), rgb[show, h - 1].cpu().numpy(),
+                 wrong[show, h - 1].float().cpu().numpy()) for h in HORIZONS]
     label = 20
     sheet = Image.new("RGB", (len(columns) * SIZE, 3 * (SIZE + label)), "#181820")
     draw = ImageDraw.Draw(sheet)
-    for c, (name, ref, gen) in enumerate(columns):
-        wrong = (gen != ref).cpu().numpy()
-        miss = (rgb(ref) * 0.35).astype(np.uint8)
-        miss[wrong] = (255, 0, 200)
-        for r, (title, image) in enumerate((("REAL", rgb(ref)), ("GENERATED", rgb(gen)), ("WRONG", miss))):
+    for c, (name, ref, gen, miss) in enumerate(columns):
+        for r, (title, image) in enumerate((("REAL", ref), ("GENERATED", gen), ("WRONG", wrong_panel(ref, miss)))):
             y = r * (SIZE + label)
             draw.text((c * SIZE + 4, y + 4), f"{title} {name}", fill="white")
             sheet.paste(Image.fromarray(image, "RGB"), (c * SIZE, y + label))
@@ -340,16 +358,13 @@ class Member:
         self.model = build(self.config, self.config["recompute"]).cuda()
         self.path = self.out / "model_latest.pt"
         saved = torch.load(self.path, map_location="cuda", weights_only=False) if self.path.is_file() else None
-        if saved is None and args.grow_from:              # a new run grown from a trained shallower one
+        if saved is None and args.grow_from:              # a new run grown from a trained one (deepen)
             source = torch.load(args.grow_from, map_location="cuda", weights_only=False)
             deepen(self.model, source["ema"])
             print(f"{name}: grown from {args.grow_from} (step {source['step']})", flush=True)
-        if self.config.get("frozen_head"):
-            for n, p in self.model.named_parameters():
-                p.requires_grad_(n not in HEAD)
         self.forward = torch.compile(self.model)          # one compiled graph per model (about a minute each)
         trained = [(n, p) for n, p in self.model.named_parameters() if p.requires_grad]
-        decay = [p for n, p in trained if p.ndim >= 2 and "pos" not in n and "colour" not in n and "level" not in n]
+        decay = [p for n, p in trained if p.ndim >= 2 and "pos" not in n and "colour" not in n]
         rest = [p for n, p in trained if not any(p is q for q in decay)]
         self.optimizer = torch.optim.AdamW([{"params": decay, "weight_decay": args.weight_decay},
                                             {"params": rest, "weight_decay": 0.0}],
@@ -366,6 +381,7 @@ class Member:
         self.parameters = sum(p.numel() for p in self.model.parameters())
         self.losses = None
         self.averaged = None                              # an eval copy holding the averaged weights
+        self.drawer = None                                # the frozen copy that draws rollouts (--refresh)
 
     def archive(self, folder: Path) -> None:
         """Keep this step's checkpoint as folder/<run>/model_step<step>.pt, next to its long-dream test, so
@@ -387,17 +403,22 @@ class Member:
         return self.averaged
 
     def long_dream_test(self, trials: list, palette: np.ndarray) -> dict[str, dict[str, float]]:
-        """Dream the trials with each LONG_DREAM_VARIANTS; append long_dream.csv, write long_dream.gif and
-        .png (the first trial, real next to every variant) -> mean scores per variant."""
+        """Dream the trials; append long_dream.csv, write long_dream.gif and .png (the first trial, real next
+        to the dream) -> {LONG_DREAM_VARIANT: mean scores}."""
         model = self.averaged_model()
         rows, first = [], {}
-        for name, decoding in LONG_DREAM_VARIANTS.items():
-            for i, trial in enumerate(trials):
-                frames = dream(model, trial, decoding)
-                rows.append({"step": self.step, "variant": name, "level": trial.level, **score(trial, frames)})
-                if i == 0:
-                    first[name] = frames
+        for i, trial in enumerate(trials):
+            dreamed = dream(model, trial, palette)
+            rows.append({"step": self.step, "variant": LONG_DREAM_VARIANT, "level": trial.level,
+                         **score(trial, dreamed)})
+            if i == 0:
+                first[LONG_DREAM_VARIANT] = dreamed
         path = self.out / "long_dream.csv"
+        if path.exists():                                 # other columns (an older score): archive it
+            with path.open(newline="") as file:
+                header = next(csv.reader(file), [])
+            if header != list(rows[0]):
+                replace(path, path.with_name(f"long_dream_schema_{int(time.time())}.csv"))
         new = not path.exists()
         with path.open("a", newline="") as file:
             writer = csv.DictWriter(file, fieldnames=list(rows[0]))
@@ -408,15 +429,21 @@ class Member:
         temporary = self.out / "long_dream.tmp.png"
         dream_sheet(trials[0], first, palette).save(temporary)
         replace(temporary, self.out / "long_dream.png")
-        return {name: {k: float(np.mean([r[k] for r in rows if r["variant"] == name]))
-                       for k in rows[0] if k not in ("step", "variant", "level")} for name in LONG_DREAM_VARIANTS}
+        return {LONG_DREAM_VARIANT: {k: float(np.nanmean([r[k] for r in rows]))
+                                     for k in rows[0] if k not in ("step", "variant", "level")}}
 
     def train_step(self, index, actions, args) -> None:
         for group in self.optimizer.param_groups:
             group["lr"] = learning_rate(self.step, args)
+        depth = rollout_depth(self.step, args)
+        if depth and (self.drawer is None or self.step % args.refresh == 0):
+            if self.drawer is None:                       # rollouts drawn by weights that hold still for
+                self.drawer = build(self.config).cuda().eval()   # --refresh steps (HorizonDrive's cache)
+            self.drawer.load_state_dict(self.model.state_dict())  # in place: its CUDA graph stays valid
         self.optimizer.zero_grad(set_to_none=True)
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            self.losses = train_step(self.model, self.forward, index, actions)
+            self.losses = train_step(self.model, self.forward, index, actions, depth, args.blend or 0,
+                                     drawer=self.drawer)
         self.losses["total"].backward()
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
         self.optimizer.step()
@@ -436,9 +463,10 @@ class Member:
                   "train_loss_border": losses["border"].item(),
                   "train_loss_changed": losses["changed"].item(),
                   "masked_fraction": losses["masked"].item(),
-                  "corrupted_fraction": losses["corrupted"].item(),
+                  "rollout_depth": rollout_depth(step - 1, args), "blend_frames": losses["blend"].item(),
                   "rollout_frames": losses["rollout_frames"].item(),
-                  "rollout_wrong": losses["rollout_wrong"].item()})
+                  "rollout_wrong": losses["rollout_wrong"].item(),
+                  "rollout_ghost_px": losses["rollout_ghost_px"].item()})
         writer.writerow({"step": step, **m})
         temporary = self.out / "model_latest.pt.tmp"
         torch.save({"step": step, "model": self.model.state_dict(), "optimizer": self.optimizer.state_dict(),
@@ -454,6 +482,18 @@ class Member:
         return m
 
 
+def rollout_depth(step: int, args) -> int:
+    """--rollouts DEEPEST SHALLOWEST STEPS -> the deepest rollout at this step of the run (a new run,
+    --grow-from the base, so its steps count from its start): linear from DEEPEST to SHALLOWEST over STEPS
+    steps, then stays (HorizonDrive's boundary-decay curriculum: 10 -> 4 chunks over 8k of 10k steps, the
+    deepest drift first); 0 without --rollouts (the base model: teacher forcing)."""
+    if not args.rollouts:
+        return 0
+    deepest, shallowest, steps = args.rollouts
+    return round(deepest + (shallowest - deepest) * min(1.0, step / max(steps, 1)))
+
+
+
 def learning_rate(step: int, args) -> float:
     """Linear warmup, then constant; with --cooldown START LENGTH, linear to zero from START to
     START + LENGTH, where training ends (the warmup-stable-decay schedule). START is fixed on the
@@ -466,9 +506,9 @@ def learning_rate(step: int, args) -> float:
 
 
 class LongDreams:
-    """Live long-dream trials for training: one low-priority DataLoader worker plays real games to a fresh
-    piece and records the no-button future (diagnostics/long_dream.py); a thread keeps a few ready, so a
-    test waits for games only at the start."""
+    """Long-dream trials for training: one low-priority DataLoader worker plays real games (from the run's
+    seed) to a fresh piece and records the no-button future (diagnostics/long_dream.py). The first
+    LONG_DREAM_TRIALS are kept and every test dreams those: a paired comparison across steps and runs."""
 
     def __init__(self, seed: int):
         self.ready: queue.Queue = queue.Queue(maxsize=2 * LONG_DREAM_TRIALS)
@@ -481,7 +521,9 @@ class LongDreams:
             self.ready.put(trial)
 
     def take(self, n: int) -> list:
-        return [self.ready.get() for _ in range(n)]
+        if not hasattr(self, "kept"):
+            self.kept = [self.ready.get() for _ in range(n)]
+        return self.kept
 
 
 def train(args, events: queue.Queue, stop: threading.Event) -> None:
@@ -503,16 +545,18 @@ def train(args, events: queue.Queue, stop: threading.Event) -> None:
                 "stream_seed": stream_seed, "parameters": m.parameters, "trained_with": list(args.models),
                 "games": GAMES, "palettes": {g: p.tolist() for g, p in batches.palettes.items()},
                 "source": "fresh continuous World NES frames (../llm-thing23), RAM-driven Tetris bot "
-                          "(data/tetris_bot.py), windows tossed by events (data/tetris_events.py); exact "
-                          "palette pixels; no archive or eval set; the same batches as every model in "
-                          "trained_with",
+                          "(data/tetris_bot.py), every window; exact palette pixels; no archive or eval set; "
+                          "the same batches as every model in trained_with",
             }, default=str, indent=2))
         events.put(("ready", {m.name: m.parameters for m in members}, histories))
         print("World models: " + ", ".join(f"{m.name} {m.parameters:,} params (resume {m.step})" for m in members)
               + f"; {histories} histories ({args.workers_per_game} per game: {', '.join(GAMES)}) x "
               f"{args.frames}-frame windows, shared", flush=True)
         files = {m.name: open_metrics(m.out / "metrics.csv") for m in members}
-        long_dreams = LongDreams(stream_seed % 100_000)
+        # the trials depend on --seed alone (the stream seed of a launch at step 0), so a run's tests stay the
+        # same games after a relaunch, and runs with the same --seed are tested on the same games
+        trial_seed = int(np.random.SeedSequence([args.seed, *[0] * len(members)]).generate_state(1)[0])
+        long_dreams = LongDreams(trial_seed % 100_000)
         palette = batches.palettes["tetris"].cpu().numpy().astype(np.uint8)
         started = time.monotonic()
         index = actions = None
@@ -543,10 +587,18 @@ def train(args, events: queue.Queue, stop: threading.Event) -> None:
                             checkpoint(member)
                         member.archive(args.archive)
                         summary = member.long_dream_test(trials, palette)
+                        # each dream captured its own CUDA graph (Dreamer); give their memory back, or
+                        # training allocates on top of it until the GPU spills into system memory
+                        # (32 trials filled the 24 GB card and slowed training ~10x, 2026-10-01)
+                        gc.collect()
+                        torch.cuda.empty_cache()
                         events.put(("longdream", member.name, member.step, summary))
                         print(f"{member.name} step={member.step} long dream: " + "; ".join(
-                            f"{v} wrong +16/+128 {r['wrong_16']:.2%}/{r['wrong_128']:.2%} mass {r['mass']:.2f}"
-                            for v, r in summary.items()), flush=True)
+                            f"wrong +16/+128 {r['wrong_16']:.2%}/{r['wrong_128']:.2%} mass {r['mass']:.2f} "
+                            f"piece +32 {r['piece_32']:.2f} hit {r['piece_hit_32']:.2f} ghost "
+                            f"{r['piece_ghost_32']:.2f} fall {r['fall']:.2f} spawn {r['spawn']:.2f} "
+                            f"timer wrong +16/+128 {r['timer_wrong_16']:.2%}/{r['timer_wrong_128']:.2%}"
+                            for r in summary.values()), flush=True)
                 if args.seconds > 0 and time.monotonic() - started >= args.seconds:
                     break
             if index is not None:
@@ -568,12 +620,21 @@ def train(args, events: queue.Queue, stop: threading.Event) -> None:
 def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--keep-all-windows", action="store_true",
-                   help="no event tossing: every window, so events come at the rate the game has them")
+    p.add_argument("--rollouts", type=int, nargs=3, metavar=("DEEPEST", "SHALLOWEST", "STEPS"),
+                   help="scheduled rollout recovery: every window a rollout of 1..depth of the model's own frames, "
+                        "depth falling from DEEPEST to SHALLOWEST over STEPS steps (HorizonDrive); without it, "
+                        "teacher forcing (the base model)")
+    p.add_argument("--refresh", type=int, default=2000,
+                   help="with --rollouts: the rollouts are drawn by a frozen copy of the model, refreshed with its "
+                        "weights every this many steps (HorizonDrive's rollout cache, R = 2,000)")
+    p.add_argument("--blend", type=int, metavar="MAX",
+                   help="with --rollouts: the history's last w frames fade from the model's own to the real ones, "
+                        "w drawn uniform in 0..MAX each step; the scored frames are always real "
+                        "(HorizonDrive's blend, history side; models/dynamics.py own_share)")
     p.add_argument("--grow-from", type=Path, default=None,
-                   help="a shallower run's checkpoint a new deeper run starts from (deepen); ignored on resume")
-    p.add_argument("--models", nargs="+", choices=list(MODELS), default=["small"],
-                   help="models trained side by side on the same batches (MODELS; large is paused)")
+                   help="a checkpoint a new run starts from (the base, for --rollouts; deepen); ignored on resume")
+    p.add_argument("--models", nargs="+", choices=list(MODELS), default=["base"],
+                   help="models trained side by side on the same batches (MODELS)")
     p.add_argument("--output-root", type=Path, default=ROOT / "output",
                    help="each model's run folder is world_model_tetris_<name> in here")
     p.add_argument("--compare", type=Path, nargs="*", default=[],
@@ -595,12 +656,13 @@ def main():
     p.add_argument("--cooldown", type=int, nargs=2, metavar=("START", "LENGTH"), default=None,
                    help="decay the learning rate linearly to zero from step START over LENGTH steps, then stop")
     p.add_argument("--weight-decay", type=float, default=0.05)
-    p.add_argument("--decode-steps", type=int, default=1, help="MaskGIT steps per previewed frame")
     p.add_argument("--seed", type=int, default=43)
     p.add_argument("--tetris-repo", type=str, default=None)
     p.add_argument("--close-when-done", action="store_true",
                    help="close the window after training finishes or fails (unattended runs)")
     args = p.parse_args()
+    if args.blend and not args.rollouts:
+        p.error("--blend blends rollouts: it needs --rollouts")
     if args.cooldown and not args.steps:
         args.steps = sum(args.cooldown)
     args.failed, args.games = False, GAMES

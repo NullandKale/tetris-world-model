@@ -25,7 +25,6 @@ from torch.utils.data import IterableDataset
 from token_world.data.model_frames import border_slots
 from token_world.data.rom import tetris_rom
 from token_world.data.tetris_bot import A, DOWN, LEFT, RIGHT, START, UP, BrainSwitcher
-from token_world.data.tetris_events import EventToss
 from token_world.data.world_nes_windows import window_stride, world_nes_windows, worker_seed
 
 BORDER_STATE = (0x45, 0x46)     # drawn in every frame's border: the fall timer and the autorepeat counter
@@ -140,19 +139,16 @@ class WorldNesTetrisStreams(IterableDataset):
     Each window adds `stride` new observations (default frames - 1: consecutive
     windows share one). A smaller stride uses every emulated frame in more
     windows, at different positions: the emulator is 83% of a worker's CPU, so
-    this is how the stream keeps up with a fast model. toss: keep only some
-    windows, by the events in them (EventToss in data/tetris_events.py: every
-    window with a rare event, few ordinary ones); the stream's frame counter
-    then jumps by whole strides. Yields x
+    this is how the stream keeps up with a fast model. Every window is kept.
+    Yields x
     [frames, 256, 256] uint8 model indices; action [frames]
     long, where action[t] took frame t to t + 1 and the last entry repeats the
     one before it as padding; ram [frames, 2048] uint8, each frame's console RAM
     (for event detection, not training); tick = the last frame's counter.
     """
 
-    def __init__(self, frames: int = 64, seed: int = 17, repo: str | None = None, toss: bool = False,
-                 stride: int | None = None):
-        self.frames, self.seed, self.repo, self.toss = int(frames), int(seed), repo, toss
+    def __init__(self, frames: int = 64, seed: int = 17, repo: str | None = None, stride: int | None = None):
+        self.frames, self.seed, self.repo = int(frames), int(seed), repo
         self.new_frames = window_stride(self.frames, stride)
 
     def __iter__(self):
@@ -160,6 +156,5 @@ class WorldNesTetrisStreams(IterableDataset):
         worker_id, seed = worker_seed(self.seed)
         rom = tetris_rom(self.repo)
         session = TetrisSession(seed)
-        toss = EventToss(np.random.default_rng([seed, 1]), self.new_frames) if self.toss else None
         yield from world_nes_windows(rom, session, border_slots(tetris_palette()), BORDER_STATE,
-                                     self.frames, self.new_frames, worker_id, toss)
+                                     self.frames, self.new_frames, worker_id)

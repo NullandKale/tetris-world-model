@@ -26,11 +26,21 @@ const load = async (name) => {
   return new Uint8Array(await response.arrayBuffer());
 };
 
-function draw(frame) {
+// A real frame (Uint8Array(65536) palette indices), through the palette.
+function drawReal(frame) {
   const px = image.data;
   for (let i = 0; i < frame.length; i++) {
     const c = frame[i] * 3, o = i * 4;
     px[o] = palette[c]; px[o + 1] = palette[c + 1]; px[o + 2] = palette[c + 2]; px[o + 3] = 255;
+  }
+  ctx.putImageData(image, 0, 0);
+}
+
+// A dreamed frame: each pixel's expected colour (Float32Array(65536 * 3)).
+function draw(rgb) {
+  const px = image.data;
+  for (let i = 0, o = 0; i < rgb.length; i += 3, o += 4) {
+    px[o] = rgb[i]; px[o + 1] = rgb[i + 1]; px[o + 2] = rgb[i + 2]; px[o + 3] = 255;
   }
   ctx.putImageData(image, 0, 0);
 }
@@ -49,11 +59,9 @@ async function start() {
     const pixels = await load("context.bin");
     context = { frames: Array.from({ length: meta.actions.length }, (_, i) => pixels.subarray(i * 65536, (i + 1) * 65536)),
                 actions: meta.actions };
-    for (let level = 0; level < meta.levels; level++) $("level").add(new Option(level === 0 ? "0 (as real)" : `${level}`, level));
-    $("level").value = meta.level;
-    draw(context.frames.at(-1));
+    drawReal(context.frames.at(-1));
     dreamer = await Dreamer.create(ort, load, context.frames, context.actions,
-                                   { level: meta.level, keep: meta.keep, executionProviders: [backend],
+                                   { executionProviders: [backend],
                                      sessionOptions: PROFILE ? { logSeverityLevel: 0, logVerbosityLevel: 0 } : {} });
     screen.focus();
     if (new URLSearchParams(location.search).has("check")) await check();
@@ -67,11 +75,11 @@ async function start() {
 // ?check: dream the start with no buttons and compare with PyTorch's frames (model/reference.bin, written
 // by scripts/export_onnx.py), then play. The result is in the status and in document.body.dataset.check.
 async function check() {
-  const reference = await load("reference.bin"), count = reference.length / 65536;
+  const reference = await load("reference.bin"), count = reference.length / (65536 * 3);
   let first = -1, wrong = 0, worst = 0, ms = 0;
   const plain = [], slides = [];
   for (let i = 0; i < count; i++) {
-    const slide = dreamer.frames.length === dreamer.meta.frames;     // this step re-encodes the window first
+    const slide = dreamer.tokens.length === dreamer.meta.frames;     // this step re-encodes the window first
     const began = performance.now();
     const frame = await dreamer.next(0);
     const took = performance.now() - began;
@@ -79,14 +87,14 @@ async function check() {
     (slide ? slides : plain).push(took);
     draw(frame);
     let differ = 0;
-    for (let j = 0; j < 65536; j++) differ += frame[j] !== reference[i * 65536 + j];
+    for (let j = 0; j < 65536 * 3; j++) differ += Math.abs(frame[j] - reference[i * 65536 * 3 + j]) > TOLERANCE;
     if (differ && first < 0) first = i;
     wrong += differ;
     worst = Math.max(worst, differ);
   }
-  const result = `${count} frames, level ${dreamer.level}: ` +
-    (first < 0 ? "identical to PyTorch" : `${worst <= 4 ? "near-ties only" : "DIFFERENT"}: first differs at +${first + 1}, ` +
-                                          `${wrong} pixels in all, at most ${worst} in a frame`) +
+  const result = `${count} frames: ` +
+    (first < 0 ? `as PyTorch (colours within ${TOLERANCE})` : `DIFFERENT: first differs at +${first + 1}, ` +
+                                          `${wrong} colour values in all, at most ${worst} in a frame`) +
     `; ${(ms / count).toFixed(1)} ms per frame on ${backend} (median ${median(plain).toFixed(1)} ms a step, ` +
     `${median(slides).toFixed(1)} ms with a re-encode, ${slides.length} of them)`;
   document.body.dataset.check = result;
@@ -94,6 +102,7 @@ async function check() {
   await dreamer.reset(context.frames, context.actions);
 }
 
+const TOLERANCE = 2;                             // colour values: PyTorch's are rounded to bytes
 const median = (xs) => xs.length ? [...xs].sort((a, b) => a - b)[xs.length >> 1] : NaN;
 
 async function run() {
@@ -111,7 +120,7 @@ async function run() {
     if (frames % 10 === 0) {
       status(`${backend === "webgpu" ? "WebGPU" : "WebAssembly (no WebGPU: slow)"}\n` +
              `${average.toFixed(1)} ms per frame, ${Math.min(fps, 60).toFixed(0)} frames/s\n` +
-             `frame ${frames}, window position ${dreamer.frames.length}`, backend !== "webgpu");
+             `frame ${frames}, window position ${dreamer.tokens.length}`, backend !== "webgpu");
     }
   }
 }
@@ -148,12 +157,11 @@ $("pad").addEventListener("contextmenu", (e) => e.preventDefault());   // no lon
 addEventListener("keydown", (e) => key(e, true));
 addEventListener("keyup", (e) => key(e, false));
 addEventListener("blur", () => { keyboard = 0; touches.clear(); update(); });
-$("level").addEventListener("change", () => { dreamer.level = Number($("level").value); screen.focus(); });
 $("restart").addEventListener("click", async () => {
   paused = true;
   await pending;
   await dreamer.reset(context.frames, context.actions);
-  draw(context.frames.at(-1));
+  drawReal(context.frames.at(-1));
   paused = false;
   $("pause").textContent = "Pause";
   screen.focus();

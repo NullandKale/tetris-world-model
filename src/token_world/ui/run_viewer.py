@@ -68,16 +68,23 @@ def load_metrics(run: Path) -> dict[str, np.ndarray]:
 
 
 def load_long_dream(run: Path) -> dict[str, dict[str, np.ndarray]]:
-    """long_dream.csv -> variant -> column -> per-test means over the tested steps (with "step")."""
-    rows = _read_rows(run / "long_dream.csv")
+    """Every long_dream*.csv (archived column sets too) -> variant -> column -> per-test means over the
+    tested steps (with "step"); NaN where a test lacks the column."""
+    rows = [r for path in sorted(run.glob("long_dream*.csv")) for r in _read_rows(path)]
+    value = lambda r, k: float(r[k]) if r.get(k) not in (None, "") else math.nan
     out: dict[str, dict[str, np.ndarray]] = {}
     for variant in dict.fromkeys(r["variant"] for r in rows):
         mine = [r for r in rows if r["variant"] == variant]
         steps = sorted({int(r["step"]) for r in mine})
-        keys = [k for k in mine[0] if k not in ("step", "variant", "level")]
+        keys = list(dict.fromkeys(k for r in mine for k in r if k not in ("step", "variant", "level")))
         out[variant] = {"step": np.array(steps, float)} | {
-            k: np.array([np.mean([float(r[k]) for r in mine if int(r["step"]) == s]) for s in steps]) for k in keys}
+            k: np.array([_nanmean([value(r, k) for r in mine if int(r["step"]) == s]) for s in steps]) for k in keys}
     return out
+
+
+def _nanmean(values: list[float]) -> float:
+    finite = [v for v in values if math.isfinite(v)]
+    return float(np.mean(finite)) if finite else math.nan
 
 
 def smooth(values: np.ndarray, window: int = 9) -> np.ndarray:
@@ -100,7 +107,7 @@ class RunData:
         self.long_dream: dict[str, dict[str, np.ndarray]] = {}
 
     def refresh(self) -> bool:
-        files = [*self.path.glob("metrics*.csv"), self.path / "long_dream.csv"]
+        files = [*self.path.glob("metrics*.csv"), *self.path.glob("long_dream*.csv")]
         stamp = tuple(sorted((f.name, f.stat().st_mtime) for f in files if f.exists()))
         if stamp == self.stamp:
             return False
@@ -154,22 +161,29 @@ def draw_curves(fig: Figure, runs: list[RunData], compare: list[RunData]) -> Non
                 _plot(axes[1, 0], run, f"{GAME}_h{h}_border_copy", label(f"+{h} copying"), COLOURS[i], ":",
                       raw=False)
         _plot(axes[1, 1], run, f"{GAME}_h16_wrong_static", label("static +16"), COLOURS[3], dash)
-        _plot(axes[1, 1], run, "corrupted_fraction", label("context corrupted"), COLOURS[4], dash)
+        _plot(axes[1, 1], run, "blend_frames", label("blend radius"), COLOURS[4], dash)
         for v, (variant, d) in enumerate(run.long_dream.items()):
             for i, h in enumerate((16, 128)):
                 axes[2, 0].plot(d["step"], d[f"wrong_{h}"], color=COLOURS[(2 * v + i) % len(COLOURS)],
                                 linestyle=dash, marker=".", label=label(f"{variant} +{h}"))
             axes[2, 1].plot(d["step"], d["mass"], color=COLOURS[v % len(COLOURS)], linestyle=dash, marker=".",
-                            label=label(variant))
+                            label=label(f"{variant} mass"))
+            if "piece_32" in d:
+                axes[2, 1].plot(d["step"], d["piece_32"], color=COLOURS[v % len(COLOURS)], linestyle=dash,
+                                marker="x", alpha=0.7, label=label(f"{variant} piece +32"))
+            for key, marker in (("piece_hit_32", "o"), ("fall", "^"), ("spawn", "s")):
+                if key in d:
+                    axes[2, 1].plot(d["step"], d[key], color=COLOURS[(v + 2 + "o^s".index(marker)) % len(COLOURS)],
+                                    linestyle=dash, marker=marker, alpha=0.7, label=label(f"{variant} {key}"))
     fig.suptitle("   ".join(f"{'solid' if dash == '-' else {'--': 'dashed', ':': 'dotted', '-.': 'dash-dot'}[dash]}: "
                            f"{run.name}" for run, dash in every), color=TEXT, fontsize=9)
     axes[2, 1].axhline(1.0, color=TEXT, linewidth=0.8, linestyle=":")
     _style(axes[0, 0], "Train loss (masked pixels)", "cross-entropy", log=True)
     _style(axes[0, 1], "Preview: changed game pixels wrong (copying = 100%)", "fraction")
     _style(axes[1, 0], "Preview: border pixels wrong vs copying the last frame (thin dotted)", "fraction", log=True)
-    _style(axes[1, 1], "Static pixels wrong at +16; share of context corrupted", "fraction", log=True)
+    _style(axes[1, 1], "Static pixels wrong at +16; blend radius (frames)", "fraction", log=True)
     _style(axes[2, 0], "Long dream: playfield pixels wrong (no buttons)", "fraction")
-    _style(axes[2, 1], "Long dream: block mass at +128 (1.0 = real)", "ratio")
+    _style(axes[2, 1], "Long dream: block mass at +128, falling piece kept at +32 (1.0 = real)", "ratio")
     for ax in axes.flat:
         _legend(ax)
     fig.tight_layout()
@@ -336,13 +350,16 @@ class RunViewer:
 
 
 def long_dream_table(runs: list[RunData], last: int = 6) -> str:
-    lines = ["run / variant                          step     wrong +16   +32     +64     +128    mass"]
+    lines = ["run / variant                          step     wrong +16   +32     +64     +128    mass  piece+32"
+             "  hit+32  fall  spawn"]
     for run in runs:
         for variant, d in run.long_dream.items():
             for i in range(max(0, len(d["step"]) - last), len(d["step"])):
                 lines.append(f"{run.name[:24]:24s} {variant:12s} {int(d['step'][i]):>7,}   "
                              + "  ".join(f"{d[f'wrong_{h}'][i]:6.2%}" for h in (16, 32, 64, 128))
-                             + f"   {d['mass'][i]:.2f}")
+                             + f"   {d['mass'][i]:.2f}  "
+                             + "  ".join(f"{d.get(k, np.full(len(d['step']), np.nan))[i]:6.2f}"
+                                         for k in ("piece_32", "piece_hit_32", "fall", "spawn")))
     return "\n".join(lines) if len(lines) > 1 else "No long-dream tests yet (every 1,000 steps)."
 
 
@@ -355,7 +372,7 @@ def stats_text(run: RunData) -> str:
              f"  train loss {last.get('train_loss', math.nan):.4f}: game {last.get('train_loss_game', math.nan):.4f}, "
              f"border {last.get('train_loss_border', math.nan):.4f}, changed pixels "
              f"{last.get('train_loss_changed', math.nan):.4f}; masked {last.get('masked_fraction', math.nan):.0%}",
-             f"  context corrupted {last.get('corrupted_fraction', math.nan):.1%}; last training rollout "
+             f"  blend radius {last.get('blend_frames', math.nan):.0f}; last training rollout "
              f"{last.get('rollout_frames', math.nan):.0f} frames, pixels wrong {last.get('rollout_wrong', math.nan):.3%}"]
     for h in (1, 2, 4, 8, 16):
         k = f"{GAME}_h{h}_"
