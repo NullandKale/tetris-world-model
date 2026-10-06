@@ -1,5 +1,6 @@
 """World model: exact pixel patches, causality, masking, the masked loss, action conditioning, soft decoding,
-and the two training stages (teacher forcing; rollouts with the pred-to-real blend)."""
+the two training stages (teacher forcing; rollouts with the pred-to-real blend) and the sampled choice per
+frame (the latent)."""
 import sys
 import unittest
 from pathlib import Path
@@ -9,8 +10,9 @@ import torch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT / "src"), str(ROOT / "scripts")]
 
-from token_world.models.dynamics import (COLOURS, Dreamer, Dynamics, build, deepen, incoming_actions, masked_loss,
-                                         own_share, patch_pixels, rollout, training_mask, unpatch_pixels)
+from token_world.models.dynamics import (COLOURS, Dreamer, Dynamics, build, choice_kl, deepen, incoming_actions,
+                                         masked_loss, own_share, patch_pixels, rollout, sample_choice, training_mask,
+                                         unpatch_pixels, weigh_changes)
 
 
 def tiny():
@@ -300,6 +302,24 @@ class SoftDecodingTests(unittest.TestCase):
             dreamer.step(0)
         self.assertLessEqual(len(dreamer.frames), model.frames)
 
+    def test_weighing_changes_multiplies_their_odds(self):
+        probs = torch.tensor([[0.75, 0.15, 0.10], [0.2, 0.3, 0.5]])
+        last = torch.tensor([0, 2])                                                # the colour each pixel had
+        out = weigh_changes(probs, last, 3.0)
+        self.assertTrue(torch.allclose(out[0], torch.tensor([0.5, 0.3, 0.2])))   # change 0.25 -> 0.5, split as before
+        self.assertTrue(torch.allclose(out.sum(-1), torch.ones(2)))
+        self.assertTrue(torch.allclose(weigh_changes(probs, last, 1.0), probs))
+
+    def test_a_change_weight_draws_more_change(self):
+        model = tiny().eval()
+        x, acts = window(1, 6, 13), torch.randint(0, 256, (1, 6))
+        changed = []
+        for weight in (1.0, 4.0):
+            dreamer = Dreamer(model, x[0, :3], acts[0, :3], keep=3, change_weight=weight)
+            probs = dreamer.step(0)
+            changed.append(1 - probs.gather(-1, x[0, 2].long()[..., None]).mean().item())
+        self.assertGreater(changed[1], changed[0])
+
     def test_dreamers_with_the_same_settings_do_not_share_a_cache(self):
         model = tiny().eval()
         x, acts = window(2, 6, 12), torch.randint(0, 256, (2, 6))
@@ -373,6 +393,67 @@ class TrainingTests(unittest.TestCase):
         args = argparse.Namespace(rollouts=[62, 16, 8000])
         self.assertEqual([D.rollout_depth(s, args) for s in (0, 4000, 8000, 20000)], [62, 39, 16, 16])
         self.assertEqual(D.rollout_depth(0, argparse.Namespace(rollouts=None)), 0)
+
+
+def tiny_latent():
+    torch.manual_seed(1)
+    return Dynamics(dim=32, layers=2, heads=2, patch=16, frames=6, colour_dim=8, latent=(2, 4))
+
+
+class LatentTests(unittest.TestCase):
+    def test_a_choice_is_one_option_per_group_with_a_straight_through_gradient(self):
+        logits = torch.randn(3, 2, 4, requires_grad=True)
+        z = sample_choice(logits, straight_through=True)
+        self.assertEqual(z.shape, (3, 8))
+        self.assertTrue(torch.equal(z.detach().view(3, 2, 4).sum(-1), torch.ones(3, 2)))
+        (z * torch.arange(8.0)).sum().backward()
+        self.assertGreater(logits.grad.abs().sum().item(), 0)
+
+    def test_kl_is_zero_for_equal_choices_and_positive_otherwise(self):
+        a, b = torch.randn(5, 2, 4), torch.randn(5, 2, 4)
+        self.assertTrue(torch.allclose(choice_kl(a, a)[0], torch.zeros(5), atol=1e-6))
+        self.assertTrue((choice_kl(a * 5, b * 5)[0] > 0).all())
+
+    def test_grown_from_a_model_without_it_starts_as_that_model(self):
+        base = tiny().eval()
+        model = tiny_latent().eval()
+        deepen(model, base.state_dict())
+        x, acts = window(1, 6, 40), torch.randint(0, 256, (1, 6))
+        mask = training_mask(1, 6, base.grid ** 2, "cpu", torch.Generator().manual_seed(0))
+        z = sample_choice(torch.randn(1, 6, 2, 4))
+        with torch.no_grad():
+            self.assertTrue(torch.allclose(model(x, acts, mask, z=z), base(x, acts, mask), atol=1e-5))
+
+    def test_the_latent_step_trains_its_choice_and_both_reads(self):
+        import train_dynamics_ui as D
+        model = tiny_latent()
+        with torch.no_grad():                                   # a sure posterior: KL above the free nats
+            model.posterior_out.weight.normal_(0, 3.0)
+        optimizer = torch.optim.SGD(model.parameters(), lr=1.0)
+        for step in range(2):                                   # the choice starts at zero: step 1 opens it
+            x = window(2, 6, 41 + step)
+            losses = D.train_step(model, model, x, torch.randint(0, 256, (2, 6)),
+                                  generator=torch.Generator().manual_seed(step))
+            self.assertTrue(torch.isfinite(losses["latent_kl"]))
+            optimizer.zero_grad()
+            losses["total"].backward()
+            self.assertGreater(model.choice.weight.grad.abs().sum().item(), 0)
+            optimizer.step()
+        self.assertGreater(model.posterior_out.weight.grad.abs().sum().item(), 0)
+        self.assertGreater(model.prior_out[0].weight.grad.abs().sum().item(), 0)
+
+    def test_a_dream_samples_its_choices(self):
+        model = tiny_latent().eval()
+        with torch.no_grad():
+            model.choice.weight.normal_(0, 1.0)                 # a trained choice changes the frame
+        x, acts = window(1, 6, 43), torch.randint(0, 256, (1, 6))
+        dreams = []
+        for seed in (0, 1):
+            torch.manual_seed(seed)
+            dreamer = Dreamer(model, x[0, :3], acts[0, :3], keep=3)
+            dreams.append(torch.stack([dreamer.step(0) for _ in range(3)]))
+        self.assertTrue(torch.allclose(dreams[0].sum(-1), torch.ones(3, 256, 256), atol=1e-4))
+        self.assertFalse(torch.allclose(dreams[0], dreams[1]))  # another draw, another dream
 
 
 if __name__ == "__main__":

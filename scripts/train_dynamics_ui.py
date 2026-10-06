@@ -61,10 +61,13 @@ sys.path.insert(0, str(ROOT / "src"))
 from token_world.data.model_frames import BAND, BORDER_VERSION, GAME_ROWS
 from token_world.data.nes_palette import tetris_palette
 from token_world.data.world_nes_tetris import WorldNesTetrisStreams
+from token_world.diagnostics.coherence import PatchBank
+from token_world.diagnostics.coherence import score as coherence
 from token_world.diagnostics.long_dream import TrialStream, animation, dream, score
 from token_world.diagnostics.long_dream import sheet as dream_sheet
-from token_world.models.dynamics import (SIZE, Dynamics, build, deepen, incoming_actions, masked_loss,
-                                         own_share, patch_pixels, rollout, training_mask)
+from token_world.models.dynamics import (FREE_NATS, SIZE, Dynamics, build, choice_kl, deepen, incoming_actions,
+                                         masked_loss, own_share, patch_pixels, rollout, sample_choice,
+                                         training_mask)
 from token_world.data.live_batches import LiveBatches
 
 # Tetris only: the small, fast model on the simpler game first. GameBatches supports
@@ -76,7 +79,10 @@ GAMES = ("tetris",)
 MODELS = {# HorizonDrive's two stages at the small model's size (~2.0M parameters): the base model on real
           # context only, then scheduled rollout recovery from its weights (--grow-from, --rollouts, --blend)
           "base": {"dim": 96, "layers": 8, "heads": 4, "recompute": False},
-          "srr": {"dim": 96, "layers": 8, "heads": 4, "recompute": False}}
+          "srr": {"dim": 96, "layers": 8, "heads": 4, "recompute": False},
+          # the base with a sampled choice per frame (4 categoricals of 8, models/dynamics.py latent), grown from
+          # the base (--grow-from): random outcomes are chosen, not averaged
+          "latent": {"dim": 96, "layers": 8, "heads": 4, "recompute": False, "latent": [4, 8]}}
 HORIZONS = (1, 2, 4, 8, 16)
 WINDOW_STRIDE = 16                                # a window every 16 frames: each frame in four windows
 STOP_FILE = ROOT / "output" / "stop_training"      # create it to stop cleanly, like Stop Training
@@ -88,7 +94,7 @@ LONG_DREAM_TRIALS = 32                            # trials per test: the same ga
 LONG_DREAM_VARIANT = "1 pass"                     # long_dream.csv's variant column (earlier runs had two)
 PREVIEW_GIFS = 4                                  # preview windows saved as animated GIFs
 FIELDS = ["step", "seconds", "lr", "train_loss", "train_loss_game", "train_loss_border",
-          "train_loss_changed", "masked_fraction", "rollout_depth", "blend_frames",
+          "train_loss_changed", "masked_fraction", "rollout_depth", "blend_frames", "latent_kl",
           "rollout_frames", "rollout_wrong", "rollout_ghost_px",
           "data_wait_ms_mean", "data_wait_ms_max",
           "stream_tick_min", "stream_tick_max", "in_game_restarts",
@@ -171,6 +177,10 @@ def train_step(model, forward, index, actions, depth: int = 0, blend: int = 0,
     from nearly real (w = blend) to fully its own (w = 0, a dream's condition); the targets are always the
     real frames. drawer: the model that draws the rollouts (HorizonDrive's cached rollouts: a frozen copy
     refreshed every --refresh steps; default the model itself).
+    With a latent (models/dynamics.py), every frame after the first gets the choice its posterior reads from
+    the real frame and the one before (sampled, straight-through), and the prior learns to predict it from
+    the previous frame's features: DreamerV3's KL balancing (0.5 dynamics, 0.1 representation, FREE_NATS
+    free), in nats per pixel as the reconstruction.
     """
     drawer = model if drawer is None else drawer
     b, t = index.shape[:2]
@@ -199,8 +209,19 @@ def train_step(model, forward, index, actions, depth: int = 0, blend: int = 0,
         soft = (where, values)
         cut[:] = boundary
     mask = training_mask(b, t, n, device, generator, cut=cut)
-    features = forward(index, incoming, mask, soft=soft)
+    z = posterior = None
+    if model.latent:
+        posterior = model.posterior(model._patches(index))                 # [B, T, groups, classes]
+        z = sample_choice(posterior, straight_through=True)
+        z = z * (torch.arange(t, device=device) > 0)[None, :, None]       # frame 0 has no choice
+    features = forward(index, incoming, mask, soft=soft, z=z)
     total, per_pixel, where = masked_loss(model, features, target, mask)
+    kl = torch.tensor(float("nan"))
+    if model.latent:
+        dynamics_kl, representation_kl = choice_kl(posterior[:, 1:], model.prior(features[:, :-1]))
+        total = total + (0.5 * dynamics_kl.clamp_min(FREE_NATS) + 0.1 * representation_kl.clamp_min(FREE_NATS)
+                         ).mean() / SIZE ** 2
+        kl = dynamics_kl.detach().mean()
     per_pixel = per_pixel.detach()
     border = border_pixels(model, index.device)[where[2]]
     changed = (target[:, 1:] != target[:, :-1])[where[0], where[1] - 1, where[2]]   # frame 0 is never masked
@@ -208,7 +229,7 @@ def train_step(model, forward, index, actions, depth: int = 0, blend: int = 0,
     nan = torch.tensor(float("nan"))
     return {"total": total, "game": mean(per_pixel, ~border), "border": mean(per_pixel, border),
             "changed": mean(per_pixel, changed & ~border), "masked": mask[:, 1:].float().mean(),
-            "rollout_frames": torch.tensor(float(k)), "blend": torch.tensor(float(w)),
+            "rollout_frames": torch.tensor(float(k)), "blend": torch.tensor(float(w)), "latent_kl": kl,
             "rollout_wrong": wrong.mean() if wrong is not None else nan,          # its frames' pixels expected wrong
             "rollout_ghost_px": unsure.mean() if unsure is not None else nan}     # unsure pixels per generated frame
 
@@ -402,15 +423,17 @@ class Member:
         self.averaged.load_state_dict(dict(zip(self.model.state_dict(), self.ema)))
         return self.averaged
 
-    def long_dream_test(self, trials: list, palette: np.ndarray) -> dict[str, dict[str, float]]:
+    def long_dream_test(self, trials: list, palette: np.ndarray, bank: PatchBank) -> dict[str, dict[str, float]]:
         """Dream the trials; append long_dream.csv, write long_dream.gif and .png (the first trial, real next
-        to the dream) -> {LONG_DREAM_VARIANT: mean scores}."""
+        to the dream) -> {LONG_DREAM_VARIANT: mean scores}. Scored against the real game (long_dream.py)
+        and, generically, against real play's patches and changes (bank, diagnostics/coherence.py)."""
         model = self.averaged_model()
         rows, first = [], {}
         for i, trial in enumerate(trials):
             dreamed = dream(model, trial, palette)
             rows.append({"step": self.step, "variant": LONG_DREAM_VARIANT, "level": trial.level,
-                         **score(trial, dreamed)})
+                         **score(trial, dreamed),
+                         **coherence(bank, trial.context[-1], dreamed.likely, dreamed.sure)})
             if i == 0:
                 first[LONG_DREAM_VARIANT] = dreamed
         path = self.out / "long_dream.csv"
@@ -464,6 +487,7 @@ class Member:
                   "train_loss_changed": losses["changed"].item(),
                   "masked_fraction": losses["masked"].item(),
                   "rollout_depth": rollout_depth(step - 1, args), "blend_frames": losses["blend"].item(),
+                  "latent_kl": losses["latent_kl"].item(),
                   "rollout_frames": losses["rollout_frames"].item(),
                   "rollout_wrong": losses["rollout_wrong"].item(),
                   "rollout_ghost_px": losses["rollout_ghost_px"].item()})
@@ -558,6 +582,10 @@ def train(args, events: queue.Queue, stop: threading.Event) -> None:
         trial_seed = int(np.random.SeedSequence([args.seed, *[0] * len(members)]).generate_state(1)[0])
         long_dreams = LongDreams(trial_seed % 100_000)
         palette = batches.palettes["tetris"].cpu().numpy().astype(np.uint8)
+        # real play's patches and changes for the coherence scores: one window of every batch, hashed on the
+        # GPU (it holds most of real play's vocabulary within a few hundred steps); kept with the run
+        bank_path = members[0].out / "patch_bank.npz"
+        bank = PatchBank.load(bank_path) if bank_path.is_file() else PatchBank()
         started = time.monotonic()
         index = actions = None
 
@@ -573,6 +601,7 @@ def train(args, events: queue.Queue, stop: threading.Event) -> None:
                     print(f"{STOP_FILE} found: stopping", flush=True)
                     break
                 index, actions = batches.next()
+                bank.add(index[0])
                 for member in members:
                     member.train_step(index, actions, args)
                 due = [m for m in members if m.step == m.start_step + 1 or m.step % args.preview_every == 0]
@@ -582,11 +611,12 @@ def train(args, events: queue.Queue, stop: threading.Event) -> None:
                         checkpoint(member)
                 if members[0].step % args.long_dream_every == 0:
                     trials = long_dreams.take(LONG_DREAM_TRIALS)   # the same trials for every model
+                    bank.save(bank_path)
                     for member in members:
                         if member.saved_step != member.step:
                             checkpoint(member)
                         member.archive(args.archive)
-                        summary = member.long_dream_test(trials, palette)
+                        summary = member.long_dream_test(trials, palette, bank)
                         # each dream captured its own CUDA graph (Dreamer); give their memory back, or
                         # training allocates on top of it until the GPU spills into system memory
                         # (32 trials filled the 24 GB card and slowed training ~10x, 2026-10-01)
@@ -597,7 +627,9 @@ def train(args, events: queue.Queue, stop: threading.Event) -> None:
                             f"wrong +16/+128 {r['wrong_16']:.2%}/{r['wrong_128']:.2%} mass {r['mass']:.2f} "
                             f"piece +32 {r['piece_32']:.2f} hit {r['piece_hit_32']:.2f} ghost "
                             f"{r['piece_ghost_32']:.2f} fall {r['fall']:.2f} spawn {r['spawn']:.2f} "
-                            f"timer wrong +16/+128 {r['timer_wrong_16']:.2%}/{r['timer_wrong_128']:.2%}"
+                            f"timer wrong +16/+128 {r['timer_wrong_16']:.2%}/{r['timer_wrong_128']:.2%} "
+                            f"unseen patch/change {r['unseen_patch']:.2%}/{r['unseen_change']:.2%} "
+                            f"change {r['change_px']:.2%} unsure {r['unsure_px']:.2%}"
                             for r in summary.values()), flush=True)
                 if args.seconds > 0 and time.monotonic() - started >= args.seconds:
                     break

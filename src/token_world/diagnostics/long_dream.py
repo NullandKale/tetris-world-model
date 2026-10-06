@@ -106,13 +106,15 @@ class Dream:
     rgb: np.ndarray               # [FUTURE, 256, 256, 3] uint8: each pixel's expected colour
     right: dict[int, np.ndarray]  # frame h (HORIZONS) -> [256, 256] each pixel's probability of the real colour
     filled: np.ndarray            # [FUTURE, 256, 256] float16: each pixel's probability of a block, every frame
+    likely: np.ndarray            # [FUTURE, 256, 256] uint8: each pixel's most likely colour (coherence scores)
+    sure: np.ndarray              # [FUTURE, 256, 256] float16: its probability
 
     @classmethod
     def of_frames(cls, trial: "Trial", frames: np.ndarray, palette: np.ndarray) -> "Dream":
         """Exact frames [FUTURE, 256, 256] as a dream that is sure of every pixel (tests, the real game)."""
         empty = empty_colour(trial)
         return cls(palette[frames], {h: (frames[h - 1] == trial.future[h - 1]).astype(np.float32) for h in HORIZONS},
-                   (frames != empty).astype(np.float16))
+                   (frames != empty).astype(np.float16), frames, np.ones(frames.shape, np.float16))
 
 
 def empty_colour(trial: "Trial") -> int:
@@ -121,15 +123,15 @@ def empty_colour(trial: "Trial") -> int:
 
 
 @torch.no_grad()
-def dream(model, trial: Trial, palette: np.ndarray, keep: int | None = None) -> Dream:
-    """The model's FUTURE frames from the trial's context, nobody pressing anything."""
+def dream(model, trial: Trial, palette: np.ndarray, keep: int | None = None, change_weight: float = 1.0) -> Dream:
+    """The model's FUTURE frames from the trial's context, nobody pressing anything (change_weight: Dreamer's)."""
     device = next(model.parameters()).device
     colours = torch.as_tensor(palette, dtype=torch.float32, device=device)
     empty = empty_colour(trial)
-    rgb, right, filled = [], {}, []
+    rgb, right, filled, likely, sure = [], {}, [], [], []
     with torch.autocast(device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
         dreamer = Dreamer(model, torch.from_numpy(trial.context).to(device),
-                          torch.from_numpy(trial.actions).to(device), keep)
+                          torch.from_numpy(trial.actions).to(device), keep, change_weight)
         for h in range(1, FUTURE + 1):
             probs = dreamer.step(0).float()                                   # [256, 256, COLOURS]
             rgb.append((probs @ colours).round().clamp(0, 255).byte().cpu().numpy())
@@ -137,7 +139,10 @@ def dream(model, trial: Trial, palette: np.ndarray, keep: int | None = None) -> 
                 real = torch.from_numpy(trial.future[h - 1]).to(device).long()
                 right[h] = probs.gather(-1, real[..., None])[..., 0].cpu().numpy()
             filled.append((1 - probs[..., empty]).half().cpu().numpy())
-    return Dream(np.stack(rgb), right, np.stack(filled))
+            top = probs.max(-1)
+            likely.append(top.indices.byte().cpu().numpy())
+            sure.append(top.values.half().cpu().numpy())
+    return Dream(np.stack(rgb), right, np.stack(filled), np.stack(likely), np.stack(sure))
 
 
 def score(trial: Trial, dreamed: Dream) -> dict[str, float]:

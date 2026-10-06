@@ -87,6 +87,12 @@ original small model, are in `recipe_attempts.md`. It replaces the exact-token m
   |---|---|---|---|---|
   | small | 96 x 8 x 4 | 2.01M | 1.19M | 0.40M |
   | large | 192 x 10 x 6 | 7.56M | 5.92M | 0.79M |
+- **Random latent (optional, `latent=(groups, classes)`):** a sampled choice per frame, groups
+  one-hot categoricals (DreamerV3), added to the frame's tokens like the action through a
+  zero-initialised layer (`choice`), so a model grown from one without it starts identical. Training
+  reads the choice from the real frame and the one before (`posterior`, straight-through samples) and
+  teaches `prior` to predict it from the previous frame's features (KL balancing 0.5 / 0.1, 1 free
+  nat); dreams sample it from the prior. Not in the ONNX export yet.
 - **Memory:** the 64-frame window is the only memory. It covers Tetris's
   slowest timer (48 frames per drop at level 0). Scrolling needs nothing
   special: attention reaches the shifted position in the previous frame, and a
@@ -640,6 +646,19 @@ pixel count while its piece sat frozen at the spawn point.
 | `fall` | the dream piece's drop over the real one's (centres), up to 64 frames: 1 at the real speed, 0 frozen |
 | `spawn`, `spawn_lag` | the next piece appears within 16 frames of the real one's, after the first left the spawn area |
 | `timer_wrong_h` | the border's fall-timer cells expected wrong: the gravity clock the model reads |
+| `unseen_patch` | changed tokens whose exact 16 x 16 patch never occurs in real play (`diagnostics/coherence.py`) |
+| `unseen_change` | token changes (a patch, then the next frame's there) never seen in real play |
+| `change_px`, `unsure_px` | pixels changing per frame (frozen or flickering dreams), most likely colour under 0.9 |
+
+The last four are generic: no game knowledge, and a different legal outcome (another piece, another
+place) scores as well as the real one, while blends, ghosts, half pieces and morphs do not. Training
+keeps the bank of real patches and changes from one window of every batch, hashed on the GPU, in the
+run folder (`patch_bank.npz`); the real future scores 0.5% / 0.1% against a 160k-frame bank.
+
+The play app's **change weight** multiplies the odds of every pixel change by w as it decodes
+(`weigh_changes`): an unsure piece is drawn with too many cells instead of four spread thin. It takes
+effect on the next frame. Measured on stage B (docs/guides/recipe_attempts.md), w = 2 or 3 makes
+every long-dream score worse; the dreams and the browser decode at 1.
 
 ## Generation and previews
 
@@ -711,7 +730,7 @@ WebGPU through onnxruntime-web, falling back to WebAssembly without it.
 
 ```powershell
 python scripts/export_onnx.py [checkpoint.pt]     # -> web/model/ (needs pip install .[onnx]); the page
-                                                  # has step 90,607: its long dreams beat the cooled-down 101,000
+                                                  # has stage B's step 20,000 (recipe_attempts.md)
 python -m http.server 8000 -d web                 # open http://localhost:8000 in Chrome or Edge
 ```
 

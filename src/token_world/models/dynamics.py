@@ -33,7 +33,17 @@ frames, generated from a real start as in a dream, and the frames after them
 are scored against the real ones; the last frames before that boundary fade
 from the model's own to the real ones (own_share), so a rollout that drifted
 out of step is not scored against a real frame it contradicts. A dream decodes a frame from a fully masked frame in one
-pass. Temporal attention is causal and spatial attention stays within a frame,
+pass.
+
+With a latent (`latent=(groups, classes)`), each frame also gets a sampled
+choice: groups x classes one-hot categoricals (DreamerV3's latents), added to
+its tokens like the action. In training a posterior reads the real frame and
+the one before it and says which choice happened, so the frame is predicted
+given its outcome and a random event (a next piece) need not be averaged; a
+prior learns to predict the choice from the previous frame's features
+(KL-balanced, with free bits), and a dream samples it from the prior, so the
+dream commits to one outcome. The layer that adds the choice starts at zero, so
+a model grown from one without a latent starts as it. Temporal attention is causal and spatial attention stays within a frame,
 so a dream keeps each layer's temporal keys and values of the frames so far
 (TemporalCache) and runs only the frame being decoded through the model.
 See docs/guides/dynamics.md.
@@ -206,7 +216,8 @@ class Block(nn.Module):
 
 class Dynamics(nn.Module):
     def __init__(self, dim: int = 512, layers: int = 12, heads: int = 8, patch: int = 16,
-                 frames: int = 64, colour_dim: int = 32, recompute: bool = False, modern: bool = False):
+                 frames: int = 64, colour_dim: int = 32, recompute: bool = False, modern: bool = False,
+                 latent: tuple[int, int] | None = None):
         super().__init__()
         self.patch, self.frames = patch, frames
         self.recompute = recompute     # keep only stage inputs for backward and recompute the rest: memory for time
@@ -222,16 +233,25 @@ class Dynamics(nn.Module):
         self.norm = RMSNorm(dim) if modern else nn.LayerNorm(dim)
         self.pixel = nn.Linear(dim, patch * patch * colour_dim)       # each pixel's vector in colour space
         self.colour_bias = nn.Parameter(torch.zeros(COLOURS))
+        self.latent = tuple(latent) if latent else None                # a sampled choice per frame (groups, classes)
+        if self.latent:
+            size = self.latent[0] * self.latent[1]
+            self.choice = nn.Linear(size, dim, bias=False)             # the choice, added to its frame's tokens:
+            nn.init.zeros_(self.choice.weight)                         # zero at first, so it starts as without
+            self.posterior_in = nn.Linear(2 * dim, dim)                # (the frame's change, the frame) per token
+            self.posterior_out = nn.Linear(2 * dim, size)              # pooled (mean, max) -> logits
+            self.prior_out = nn.Sequential(nn.Linear(2 * dim, dim), nn.GELU(), nn.Linear(dim, size))
 
     def forward(self, frames: torch.Tensor, actions: torch.Tensor, mask: torch.Tensor,
                 cache: list[TemporalCache] | None = None, at=0,
-                soft: tuple[torch.Tensor, torch.Tensor] | None = None) -> torch.Tensor:
+                soft: tuple[torch.Tensor, torch.Tensor] | None = None, z: torch.Tensor | None = None) -> torch.Tensor:
         """frames [B, T, 256, 256] palette indices, soft frames float [B, T, 256, 256, colour_dim]
         (embed_probs), or frames already embedded as patch tokens float [B, T, N, dim]; actions [B, T] bytes
         that produced each frame (-1 = none); mask [B, T, N] tokens hidden from the model; soft (training)
         (where [B, T] bool, tokens [B, T, N, dim]): those frames' patch embeddings, made outside (a rollout's
         soft frames; frames holds the real frame there), in a fixed shape so a compiled forward sees the same
-        shapes every step -> features [B, T, N, dim].
+        shapes every step; z [B, T, groups * classes] each frame's choice (with a latent; None: none) ->
+        features [B, T, N, dim].
 
         With a cache (new_cache()), frames holds window frames at..at+T-1, the
         frames before `at` are read from the cache, and these frames' keys and
@@ -247,6 +267,8 @@ class Dynamics(nn.Module):
         time = (self.time_pos[at:at + t] if isinstance(at, int) else
                 self.time_pos.index_select(0, at.view(1) + torch.arange(t, device=at.device, dtype=at.dtype)))
         x = x + self.space_pos + time[:, None] + self.action(button_bits(actions))[:, :, None]
+        if z is not None:
+            x = x + self.choice(z.to(x.dtype))[:, :, None]
         if cache is not None:
             for block, layer in zip(self.blocks, cache):
                 x = block(x, layer, at)
@@ -304,6 +326,17 @@ class Dynamics(nn.Module):
             out.append(F.linear(pixels.to(weight.dtype), weight, self.patchify.bias))
         return torch.cat(out) if out else features.new_zeros(0, features.shape[-1])
 
+    def posterior(self, tokens: torch.Tensor) -> torch.Tensor:
+        """Real frames' patch tokens [B, T, N, dim] -> logits [B, T, groups, classes] of each frame's choice,
+        read from the frame and the one before it (frame 0's from itself: its logits go unused)."""
+        before = torch.cat((tokens[:, :1], tokens[:, :-1]), 1)
+        h = F.gelu(self.posterior_in(torch.cat((tokens - before, tokens), -1)) + self.space_pos)
+        return self.posterior_out(torch.cat((h.mean(-2), h.amax(-2)), -1)).unflatten(-1, self.latent)
+
+    def prior(self, features: torch.Tensor) -> torch.Tensor:
+        """A frame's features [..., N, dim] -> logits [..., groups, classes] of the next frame's choice."""
+        return self.prior_out(torch.cat((features.mean(-2), features.amax(-2)), -1)).unflatten(-1, self.latent)
+
     def new_cache(self) -> list[TemporalCache]:
         return [TemporalCache(self.frames) for _ in self.blocks]
 
@@ -338,7 +371,7 @@ def pixel_logits(pixels: torch.Tensor, table: torch.Tensor, bias: torch.Tensor) 
 def build(config: dict, recompute: bool = False) -> Dynamics:
     """A Dynamics from a run's saved args (checkpoint["args"] or run_config.json)."""
     return Dynamics(config["dim"], config["layers"], config["heads"], config["patch"], config["frames"],
-                    config["colour_dim"], recompute, config.get("modern", False))
+                    config["colour_dim"], recompute, config.get("modern", False), config.get("latent"))
 
 
 def deepen(model: Dynamics, source: dict[str, torch.Tensor]) -> None:
@@ -500,6 +533,45 @@ _head_chunk_compiled = torch.compile(_head_chunk, dynamic=True)
 
 
 GHOST = 0.9         # a generated pixel whose most likely colour is below this probability is unsure (a ghost)
+UNIMIX = 0.01       # each choice keeps 1% uniform probability (DreamerV3): no option is ever impossible
+FREE_NATS = 1.0     # KL below this many nats per frame is free (DreamerV3's free bits)
+
+
+def weigh_changes(probs: torch.Tensor, last: torch.Tensor, weight: torch.Tensor | float) -> torch.Tensor:
+    """Colour probabilities [..., COLOURS] and the last frame's colours [...] -> the same with the odds of
+    every change times `weight` (1: as they were): a pixel that changes with probability p is drawn
+    changing with w p / (w p + 1 - p), as a loss weighting changed pixels w times would train it. An
+    unsure piece is then drawn with too many cells, not with its four spread thin."""
+    stay = probs.gather(-1, last[..., None])
+    weighted = (probs * weight).scatter(-1, last[..., None], stay)
+    return weighted / weighted.sum(-1, keepdim=True)
+
+
+def choice_probs(logits: torch.Tensor) -> torch.Tensor:
+    """Choice logits [..., groups, classes] -> probabilities, with UNIMIX uniform mixed in."""
+    return (1 - UNIMIX) * logits.float().softmax(-1) + UNIMIX / logits.shape[-1]
+
+
+def sample_choice(logits: torch.Tensor, straight_through: bool = False) -> torch.Tensor:
+    """Choice logits [..., groups, classes] -> one sampled option per group, one-hot, flattened
+    [..., groups * classes] (Gumbel-max, so it can run inside a CUDA graph); straight_through: the
+    probabilities' gradient passes through the sample (training)."""
+    probs = choice_probs(logits)
+    u = torch.rand_like(probs).clamp(1e-9, 1 - 1e-9)
+    pick = (probs.log() - (-u.log()).log()).argmax(-1)
+    one_hot = F.one_hot(pick, probs.shape[-1]).to(probs.dtype)
+    if straight_through:
+        one_hot = one_hot + probs - probs.detach()
+    return one_hot.flatten(-2)
+
+
+def choice_kl(posterior: torch.Tensor, prior: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Logits [..., groups, classes] -> (KL(sg(posterior) || prior), KL(posterior || sg(prior))) [...], nats
+    summed over groups: DreamerV3's dynamics and representation losses."""
+    def kl(p, q):
+        return (p * (p.log() - q.log())).sum((-2, -1))
+    post, pri = choice_probs(posterior), choice_probs(prior)
+    return kl(post.detach(), pri), kl(post, pri.detach())
 
 
 class FrameDecoder:
@@ -529,6 +601,12 @@ class FrameDecoder:
         self.act = torch.zeros(batch, 1, dtype=torch.long, device=device)
         self.at = torch.zeros((), dtype=torch.long, device=device)
         self.target = torch.zeros(batch, SIZE, SIZE, dtype=torch.long, device=device) if scored else None
+        # with a latent: the next frame's choice logits, from the last frame's features (prefill, then each frame)
+        self.choices = torch.zeros(batch, *model.latent, device=device) if model.latent else None
+        # dreams: the last frame's most likely colours and the weight on changes from them (weigh_changes; the
+        # graph reads both in place, so the weight can change between frames)
+        self.last = None if scored else torch.zeros(batch, SIZE, SIZE, dtype=torch.long, device=device)
+        self.change_weight = None if scored else torch.ones((), device=device)
         self.graph = self.out = None
         self._step = torch.compile(self._decode) if compiled and self.act.is_cuda else self._decode
 
@@ -538,7 +616,9 @@ class FrameDecoder:
         b, t = frames.shape[:2]
         visible = torch.zeros(b, t, self.model.grid ** 2, dtype=torch.bool, device=frames.device)
         with torch.no_grad():
-            self.model(frames, actions, visible, cache=self.cache)
+            features = self.model(frames, actions, visible, cache=self.cache)
+            if self.choices is not None:
+                self.choices.copy_(self.model.prior(features[:, -1]).float())
 
     @torch.no_grad()
     def next(self, action: torch.Tensor, at: int, target: torch.Tensor | None = None) -> dict:
@@ -573,11 +653,17 @@ class FrameDecoder:
         with torch.autocast(device.type, dtype=dtype, enabled=enabled, cache_enabled=False):
             blank = torch.zeros(b, 1, SIZE, SIZE, dtype=torch.uint8, device=device)
             hidden = torch.ones(b, 1, n, dtype=torch.bool, device=device)
-            features = model(blank, self.act, hidden, self.cache, self.at)[:, 0]
+            z = sample_choice(self.choices)[:, None] if self.choices is not None else None   # this frame's choice
+            features = model(blank, self.act, hidden, self.cache, self.at, z=z)[:, 0]
             probs = model.logits(features).float().softmax(-1)                   # [B, N, P*P, COLOURS]
+            if self.last is not None:
+                probs = weigh_changes(probs, patch_pixels(self.last, model.patch), self.change_weight)
+                self.last.copy_(unpatch_pixels(probs.argmax(-1), model.patch))
             soft = model.embed_probs(probs)
             tokens = model._patches(soft[:, None])
-            model(tokens, self.act, torch.zeros_like(hidden), self.cache, self.at)
+            written = model(tokens, self.act, torch.zeros_like(hidden), self.cache, self.at, z=z)
+            if self.choices is not None:                                         # the next frame's choice logits
+                self.choices.copy_(model.prior(written[:, 0]).float())
             out = {"soft": soft, "tokens": tokens[:, 0], "unsure": (probs.amax(-1) < GHOST).sum((1, 2)).float()}
             if self.target is not None:
                 right = probs.gather(-1, patch_pixels(self.target, model.patch)[..., None])
@@ -627,7 +713,8 @@ class Dreamer:
     history, re-encoded more often).
     """
 
-    def __init__(self, model: Dynamics, frames: torch.Tensor, actions: torch.Tensor, keep: int | None = None):
+    def __init__(self, model: Dynamics, frames: torch.Tensor, actions: torch.Tensor, keep: int | None = None,
+                 change_weight: float = 1.0):
         keep = model.frames * 3 // 4 if keep is None else keep
         if not 1 <= keep < model.frames:
             raise ValueError("keep must be 1..model.frames - 1")
@@ -635,6 +722,12 @@ class Dreamer:
         self.frames = list(model._patches(frames[None]).detach()[0].float().unbind(0))   # patch tokens
         self.actions = [int(a) for a in actions]
         self._encode()
+        self.decoder.last.copy_(frames[-1][None])
+        self.set_change_weight(change_weight)
+
+    def set_change_weight(self, weight: float) -> None:
+        """The odds of every pixel change times `weight` from the next frame on (weigh_changes; 1: none)."""
+        self.decoder.change_weight.fill_(weight)
 
     def _encode(self) -> None:
         """Re-encode the window at positions 0..keep-1 (after the start, and whenever it slides)."""

@@ -166,6 +166,10 @@ def draw_curves(fig: Figure, runs: list[RunData], compare: list[RunData]) -> Non
             for i, h in enumerate((16, 128)):
                 axes[2, 0].plot(d["step"], d[f"wrong_{h}"], color=COLOURS[(2 * v + i) % len(COLOURS)],
                                 linestyle=dash, marker=".", label=label(f"{variant} +{h}"))
+            for i, key in enumerate(("unseen_patch", "unseen_change")):        # generic: not like real play
+                if key in d:
+                    axes[2, 0].plot(d["step"], d[key], color=COLOURS[(2 * v + 2 + i) % len(COLOURS)],
+                                    linestyle=dash, marker="dx"[i], alpha=0.7, label=label(f"{variant} {key}"))
             axes[2, 1].plot(d["step"], d["mass"], color=COLOURS[v % len(COLOURS)], linestyle=dash, marker=".",
                             label=label(f"{variant} mass"))
             if "piece_32" in d:
@@ -182,7 +186,8 @@ def draw_curves(fig: Figure, runs: list[RunData], compare: list[RunData]) -> Non
     _style(axes[0, 1], "Preview: changed game pixels wrong (copying = 100%)", "fraction")
     _style(axes[1, 0], "Preview: border pixels wrong vs copying the last frame (thin dotted)", "fraction", log=True)
     _style(axes[1, 1], "Static pixels wrong at +16; blend radius (frames)", "fraction", log=True)
-    _style(axes[2, 0], "Long dream: playfield pixels wrong (no buttons)", "fraction")
+    _style(axes[2, 0], "Long dream: playfield pixels wrong (no buttons); patches/changes unseen in real play",
+           "fraction")
     _style(axes[2, 1], "Long dream: block mass at +128, falling piece kept at +32 (1.0 = real)", "ratio")
     for ax in axes.flat:
         _legend(ax)
@@ -351,7 +356,7 @@ class RunViewer:
 
 def long_dream_table(runs: list[RunData], last: int = 6) -> str:
     lines = ["run / variant                          step     wrong +16   +32     +64     +128    mass  piece+32"
-             "  hit+32  fall  spawn"]
+             "  hit+32  fall  spawn  unseen patch/change"]
     for run in runs:
         for variant, d in run.long_dream.items():
             for i in range(max(0, len(d["step"]) - last), len(d["step"])):
@@ -359,7 +364,9 @@ def long_dream_table(runs: list[RunData], last: int = 6) -> str:
                              + "  ".join(f"{d[f'wrong_{h}'][i]:6.2%}" for h in (16, 32, 64, 128))
                              + f"   {d['mass'][i]:.2f}  "
                              + "  ".join(f"{d.get(k, np.full(len(d['step']), np.nan))[i]:6.2f}"
-                                         for k in ("piece_32", "piece_hit_32", "fall", "spawn")))
+                                         for k in ("piece_32", "piece_hit_32", "fall", "spawn"))
+                             + "  " + "/".join(f"{d.get(k, np.full(len(d['step']), np.nan))[i]:6.2%}"
+                                               for k in ("unseen_patch", "unseen_change")))
     return "\n".join(lines) if len(lines) > 1 else "No long-dream tests yet (every 1,000 steps)."
 
 

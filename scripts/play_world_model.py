@@ -15,7 +15,9 @@ image to its canvas once per frame. Frames advance at up to the speed cap
 The dream is soft (models/dynamics.py): each pixel is a colour distribution,
 shown as its expected colour, and the difference panel shows how likely each
 pixel is to be wrong. The toolbar sets how many frames are kept when the
-window slides. A change starts a new dream.
+window slides (a change starts a new dream) and the change weight, at once:
+the odds of every pixel change times it (models/dynamics.py weigh_changes),
+so an unsure piece is drawn with too many cells instead of thin ones.
 
 Keys: arrows move and soft-drop, X / Z rotate, Enter is Start, Right Shift is
 Select. R restarts the dream from the real game, Space pauses, Esc quits.
@@ -121,6 +123,7 @@ class Engine(threading.Thread):
         self.lock = threading.Lock()
         self.version, self.image, self.stats = 0, None, {"status": "starting"}
         self.controller, self.paused, self.fps_cap, self.stopping = "you", False, 60, False
+        self.change_weight = 1.0
         self.model = self.dreamer = None
         self.model_name = ""
 
@@ -162,7 +165,7 @@ class Engine(threading.Thread):
         """A new dream from the last CONTEXT real frames."""
         frames, actions = self.real.context()
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            self.dreamer = Dreamer(self.model, frames, actions, self.keep)
+            self.dreamer = Dreamer(self.model, frames, actions, self.keep, self.change_weight)
         self.dreamed, self.wrong_sum = 0, 0.0
         self.publish(None, status="dreaming", model=self.model_name)
 
@@ -172,6 +175,10 @@ class Engine(threading.Thread):
         elif name == "decoding":
             self.keep = value
             self.restart()
+        elif name == "change_weight":
+            self.change_weight = value
+            if self.dreamer is not None:
+                self.dreamer.set_change_weight(value)
         elif name == "controller":
             self.controller = value
             if value == "bot":
@@ -251,6 +258,11 @@ class App:
                                               engine.keep * 4 // 3 - 1})),
                     width=4, textvariable=self.keep, state="readonly",
                     command=self.decoding).pack(side="left", padx=(4, 10))
+        ttk.Label(bar, text="Change weight").pack(side="left")
+        self.change_weight = tk.DoubleVar(value=engine.change_weight)
+        ttk.Spinbox(bar, values=(1.0, 1.5, 2.0, 3.0, 5.0, 8.0), width=4, textvariable=self.change_weight,
+                    state="readonly", command=lambda: self.send("change_weight", self.change_weight.get())
+                    ).pack(side="left", padx=(4, 10))
         ttk.Label(bar, text="Speed cap").pack(side="left")
         self.fps = tk.IntVar(value=engine.fps_cap)
         ttk.Spinbox(bar, values=(10, 20, 30, 45, 60), width=4, textvariable=self.fps, state="readonly",

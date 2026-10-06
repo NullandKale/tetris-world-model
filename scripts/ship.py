@@ -22,7 +22,7 @@ ENTRIES = ["scripts/train_dynamics_ui.py", "scripts/export_onnx.py", "scripts/sh
            "scripts/long_dream_check.py", "scripts/view_runs.py", "scripts/tetris_scenarios.py",
            "tests/test_dynamics.py", "tests/test_onnx.py", "tests/test_world_nes_tetris.py",
            "tests/test_tetris_events.py", "tests/test_tetris_bot.py", "tests/test_tetris_scenarios.py",
-           "tests/test_long_dream.py"]
+           "tests/test_long_dream.py", "tests/test_coherence.py"]
 EXTRA = ["scripts/run_until_stopped.ps1"]
 SKIP = ("contra",)                               # module names: the Contra port is not shipped
 PAGE = ["index.html", "play.js", "dreamer.js", "check_browser.mjs", "test_dreamer.mjs", "package.json",
@@ -92,7 +92,9 @@ README = """# Tetris world model
 
 A {params} world model of NES Tetris: a spatiotemporal MaskGIT transformer over exact palette pixels
 (64-frame windows, 16 x 16 tokens). Every frame is generated from the frames before it and the
-controller; no emulator runs while it plays.
+controller; no emulator runs while it plays. Trained in two stages (HorizonDrive's recipe): next-frame
+prediction from clean real context, then rollouts, where the model learns to predict real frames from
+its own dreamed history.
 
 **Play it:** the page in `web/` (published by GitHub Pages) runs the step-{step:,} checkpoint with
 onnxruntime-web on WebGPU (Chrome or Edge; elsewhere a slow WebAssembly fallback), from the very
@@ -102,11 +104,13 @@ on-screen controller.
 ## The code
 
 - `src/token_world/models/dynamics.py`: the model, its training mask and loss, soft decoding, the
-  cached `Dreamer`, and the rollout stage's history blend (`own_share`).
+  cached `Dreamer`, the rollout stage's history blend (`own_share`), and an optional sampled choice per
+  frame (a DreamerV3-style latent, not in the browser version yet).
 - `scripts/train_dynamics_ui.py`: training on live emulator histories (a RAM-reading bot plays), with
   a run viewer; `scripts/run_until_stopped.ps1` runs it unattended.
 - `src/token_world/diagnostics/long_dream.py`, `scripts/long_dream_check.py`: 128-frame no-button dreams
-  against the real game.
+  against the real game; `src/token_world/diagnostics/coherence.py`: game-agnostic coherence scores
+  (the share of a dream's patches and patch changes that never occur in real play).
 - `scripts/export_onnx.py`, `src/token_world/models/onnx_export.py`, `web/`: the browser version, checked
   frame for frame against PyTorch (`web/test_dreamer.mjs`, `web/check_browser.mjs`).
 - `docs/dynamics.md`: the design, the measurements and the decisions behind them.
@@ -118,7 +122,9 @@ ROM**: set `TETRIS_ROM` to your copy of `Tetris (USA).nes`. No ROM is included i
 pip install -e .[onnx]
 python -m pytest tests            # tests that need World NES or the ROM skip without them
 python scripts/train_dynamics_ui.py
-python scripts/export_onnx.py output/world_model_tetris_base/model_latest.pt
+python scripts/train_dynamics_ui.py --models srr --grow-from output/world_model_tetris_base/model_latest.pt \
+    --rollouts 62 16 8000 --blend 8 --refresh 2000 --lr 3e-5 --weight-decay 1e-5 --warmup 500
+python scripts/export_onnx.py output/world_model_tetris_srr/model_latest.pt
 ```
 """
 

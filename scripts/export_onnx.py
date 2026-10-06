@@ -62,7 +62,7 @@ def game_start(seed: int = 0) -> tuple[np.ndarray, np.ndarray]:
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("checkpoint", type=Path, nargs="?",
-                   default=ROOT / "output/world_model_tetris_base/model_latest.pt")
+                   default=ROOT / "output/world_model_tetris_srr/model_latest.pt")
     p.add_argument("--out", type=Path, default=ROOT / "web/model")
     p.add_argument("--frames", type=int, default=96, help="frames dreamed by both for the check")
     p.add_argument("--threads", type=int, default=4, help="CPU threads for each runtime")

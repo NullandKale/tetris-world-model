@@ -117,6 +117,8 @@ def export(model: Dynamics, folder: Path, palette: torch.Tensor) -> None:
     """Write embed.onnx, prefill.onnx, step.onnx and model.json (cache shape, frames, keep) for a CPU
     float32 copy of `model` in eval mode (the model passed in is left as it is); palette [COLOURS, 3] is the
     game's (the picture's expected colours)."""
+    if model.latent:
+        raise NotImplementedError("the sampled choice is not in the exported graphs yet")
     model = copy.deepcopy(model).float().cpu().eval()
     model.embed_frames = model.frames                    # one embedding chunk: a traced loop would fix T
     folder.mkdir(parents=True, exist_ok=True)
