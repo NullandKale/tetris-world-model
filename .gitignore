@@ -3,7 +3,6 @@ __pycache__/
 output/
 web/node_modules/
 web/model/reference.bin
-web/profile.log
 # game ROMs are never published
 *.nes
 *.fds

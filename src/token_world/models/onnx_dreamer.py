@@ -2,9 +2,10 @@
 
 OnnxDreamer does what the layered model's Dreamer (models/layered.py) does, as web/dreamer.js does in the
 browser: a start's real layered frames are embedded as their content and fill the cache, each step decodes the
-next frame for an action, returns its picture (rgb) and its content, and returns the cache with it; when the
-window is full the last `keep` frames' content is encoded again at positions 0..keep-1. The cache always holds
-every frame but the last, which the next step writes in as it decodes (one pass a frame, models/onnx_export.py).
+next frame for an action and returns its picture (rgb), its content and the previous frame's keys and values,
+which go into the cache in place; when the window is full the last `keep` frames' content is encoded again at
+positions 0..keep-1. The cache holds every frame but the last, which the next step reads as `previous` (one
+pass a frame, models/onnx_export.py).
 """
 from __future__ import annotations
 
@@ -22,7 +23,7 @@ class OnnxDreamer:
         incoming button bytes (-1 = none)."""
         folder = Path(folder)
         meta = json.loads((folder / "model.json").read_text())
-        self.window, self.prefilled = meta["frames"], meta["prefill"]
+        self.window, self.prefilled, self.names = meta["frames"], meta["prefill"], meta["cache"]["names"]
         keep = meta["keep"] if keep is None else keep
         if not 3 <= keep <= self.prefilled + 1 or not 3 <= len(actions) <= self.prefilled + 1:
             raise ValueError(f"keep and the start: 3..{self.prefilled + 1} frames (prefill takes {self.prefilled})")
@@ -42,7 +43,9 @@ class OnnxDreamer:
         t, pad = len(self.content) - 1, self.prefilled - (len(self.content) - 1)    # padded after the frames
         content = np.concatenate([np.stack(self.content[:t]), np.zeros((pad, *self.content[0].shape), np.float32)])
         actions = np.array(self.actions[:t] + [-1] * pad, np.int32)
-        self.keys, self.values = self.prefill.run(None, {"content": content, "actions": actions})
+        cache = self.prefill.run(None, {"content": content, "actions": actions})
+        half = len(cache) // 2
+        self.keys, self.values = cache[:half], cache[half:]               # each layer's [n, h, hd, F], [n, h, F, hd]
 
     def step(self, action: int) -> np.ndarray:
         """The frame that `action` (the controller byte, -1 for none) produces -> its colours [256, 256, 3]
@@ -50,9 +53,13 @@ class OnnxDreamer:
         if len(self.content) == self.window:
             self._encode()
         at = len(self.content)
-        rgb, content, self.keys, self.values = self.decode.run(None, {
+        rgb, content, keys, values = self.decode.run(None, {
             "previous": self.content[-1], "actions": np.array([self.actions[-1], action], np.int32),
-            "at": np.array([at], np.int32), "keys": self.keys, "values": self.values})
+            "at": np.array([at], np.int32), **dict(zip(self.names, self.keys + self.values))})
+        for cached, new in zip(self.keys, keys):                         # the previous frame, at at - 1
+            cached[..., at - 1] = new
+        for cached, new in zip(self.values, values):
+            cached[..., at - 1, :] = new
         self.content.append(content)
         self.actions.append(action)
         return rgb

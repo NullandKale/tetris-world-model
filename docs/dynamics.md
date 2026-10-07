@@ -784,16 +784,20 @@ backdrop, [543, 96]):
 
 - `embed.onnx`: the start's layers (cells, cell_known, sprite_layer, border,
   backdrop; uint8) -> their content.
-- `prefill.onnx`: content [T, 543, dim] and incoming actions -> the key/value
-  cache, positions 0..T-1 filled (2 <= T < 64).
+- `prefill.onnx`: content [47, 543, dim] and incoming actions -> the key/value
+  cache, one keys and one values tensor a layer, positions 0..46 filled. The
+  length is fixed (a shorter start is padded after its frames): a dynamic
+  length put about 190 shape nodes on the CPU in onnxruntime-web.
 - `step.onnx`: the previous frame's content, actions, position and the cache
   -> the new frame composed (cells, the sprite picture over them, the border
-  bands; each pixel's most likely colour, through the palette in the graph),
-  its content, and the cache with it.
+  bands; each pixel's most likely colour, through the palette in the graph,
+  all in float so it stays on the GPU), its content, and the previous frame's
+  keys and values [8, 543, 4, 24], which the host writes into the cache.
 
 A dream holds the start's camera, so every token keeps its identity and the
-routed temporal attention is attention per token (the cache is [8, 543, 4, 64,
-24] per keys and values). The model's camera head moves the camera at a game
+routed temporal attention is attention per token (each layer's keys are
+[543, 4, 24, 64], transposed as attention reads them, its values [543, 4, 64,
+24]). The model's camera head moves the camera at a game
 start (the menus and the playfield are different nametables), so the start is
 taken after that switch; the browser dream stays on the game screen (after a
 top-out it cannot change screens). A step is one pass over two frames, the
@@ -805,16 +809,35 @@ with no buttons: the export script (onnxruntime, Python; 96 frames, 0 pixels
 differ, a window slide included), `web/test_dreamer.mjs` (`dreamer.js` on
 onnxruntime-node: as PyTorch), `tests/test_onnx.py` (small models with a fixed
 camera and with camera tokens, through a window slide), and
-`web/check_browser.mjs` (the page in Chrome with `?check`: as PyTorch, 32 ms a
-step on the RTX 3090, 184 ms with a re-encode).
+`web/check_browser.mjs` (the page in Chrome with `?check`, or `--firefox`: as
+PyTorch).
 
-What the pixel model's export learned about WebGPU still applies and is the
-next speed: every node of a step should run on the GPU, since one on the CPU in
-the middle of a step stops the GPU for a round trip. Boolean attention masks
-(guarded with IsNaN) are additive here; but ArgMax gives int64, which WebGPU
-cannot convert (the pixel export took the first colour at the max, in float),
-and the picture is composed with int64 indices and a Gather: the pixel model's
-step took 14.4 ms once all of it ran on the GPU.
+Speed (2026-10-07; a laptop's integrated AMD GPU played at 4 frames/s):
+
+- Every node of a step and of the re-encode runs on the GPU: one on the CPU
+  stops the GPU for a round trip. ArgMax's int64 indices had sent the picture's
+  composition to the CPU, and the dynamic prefill length its shape arithmetic.
+- The graphs never copy the cache. A step attends over the cache's earlier
+  frames and its own two in one softmax and returns only the previous frame's
+  keys and values; `web/dreamer.js` writes them in place with a compute shader
+  on the GPU buffers the cache stays in (`onnx_dreamer.py`, and `dreamer.js` on
+  the CPU, write them into arrays). Passing the cache through whole rewrote all
+  214 MB of it every step, copied about five times (Gather, Where, Concat,
+  Transpose): 12-14 ms of a 34 ms step's GPU time on the RTX 3090 (shared with
+  training), and integrated GPUs have far less memory bandwidth.
+- A step is still about 660 kernels, 32 ms of GPU time on the shared 3090; the
+  matrix products are 40% of it, the patch convolutions that re-embed the soft
+  picture about 1 ms each.
+
+The page logs to the console (`web/diagnostics.js`, lines starting
+`[world-model]`): the browser, the WebGPU adapter (vendor, architecture,
+software fallback), its features and limits, or why it has none; each file's
+load and each graph's setup time; a lost device or GPU error; and every 5 s the
+frame rate and a step's times (the graph's run, the cache write, the draw, the
+re-encodes). `?profile` adds onnxruntime's profile of each graph after 120
+frames, summed by kind of operation and by node (GPU time from timestamp
+queries) with every node placed on the CPU; `?backend=wasm|webgpu` and
+`?verbose` (onnxruntime's own log) help on other browsers.
 
 ## The training window and the run viewer
 

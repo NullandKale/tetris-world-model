@@ -5,16 +5,18 @@ backdrop colour), [n, dim] float32.
 
     embed.onnx    a real frame's layers, uint8: cells and cell_known [T, BANDS, VIEW, 16, 16], sprite_layer
                   [T, 240, 256], border [T, 32, 256], backdrop [T] -> content [T, n, dim]
-    prefill.onnx  content [P, n, dim], actions [P] int32 (incoming, -1 = none) -> keys, values [layers,
-                  tokens, heads, frames, head_dim] at positions 0..P-1, the rest zero. P is fixed, keep - 1 (the
-                  frames a window slide encodes): a start with fewer frames is padded after them, which no real
-                  frame sees (causal) and the steps write over (a dynamic length put its shape arithmetic,
+    prefill.onnx  content [P, n, dim], actions [P] int32 (incoming, -1 = none) -> the cache, each layer's
+                  keys_i [tokens, heads, head_dim, frames] (transposed, as attention reads them) and values_i
+                  [tokens, heads, frames, head_dim], at positions 0..P-1, the rest zero. P is fixed, keep - 1
+                  (the frames a window slide encodes): a start with fewer frames is padded after them, which no
+                  real frame sees (causal) and the steps write over (a dynamic length put its shape arithmetic,
                   about 190 nodes, on the CPU in onnxruntime-web)
     step.onnx     previous [n, dim] (the last frame's content), actions [2] int32 (the previous frame's, the
-                  new one's), at [1] int32 (the new frame's position), keys, values (positions before at - 1)
-                  -> rgb [256, 256, 3] float32 (the new model frame: its layers composed, each pixel's most
-                  likely colour, through the palette in the graph), content [n, dim] (the new frame's, soft, as
-                  the Dreamer's commit pass keeps it), new_keys, new_values (the previous frame at at - 1)
+                  new one's), at [1] int32 (the new frame's position), the cache (keys_i, values_i: positions
+                  before at - 1 are read) -> rgb [256, 256, 3] float32 (the new model frame: its layers
+                  composed, each pixel's most likely colour, through the palette in the graph), content [n, dim]
+                  (the new frame's, soft, as the Dreamer's commit pass keeps it), new_keys, new_values [layers,
+                  tokens, heads, head_dim]: the previous frame's, which the host writes into the cache at at - 1
 
 A dream holds its camera, the start frame's (the page's start is one frame's layers; docs/guides/
 layered_tokens.md): the export is for a game whose camera does not move, as Tetris (a model trained with
@@ -24,9 +26,13 @@ is attention per token over the earlier frames, and each token's place is a cons
 
 One step is one pass over two frames, as the pixel model's export was: the previous frame, written into the
 cache at at - 1 from its soft content (the Dreamer's commit pass), and the hidden new frame at `at` (its decide
-pass), which sees it. So prefill takes every frame but the last, which is the first step's `previous`. The
-cache goes in and comes out whole, so a WebGPU host keeps it in GPU buffers; masks are additive (a boolean
-mask's softmax guard runs on the CPU in onnxruntime-web).
+pass), which sees it. So prefill takes every frame but the last, which is the first step's `previous`. A step
+attends over the cache's earlier frames and its own two together (one softmax over both) and never copies the
+cache: the host writes the previous frame's keys and values in place (web/dreamer.js: a compute shader on the
+GPU buffers the cache stays in). Passing the cache through whole was a rewrite of all of it a step (214 MB,
+copied about five times: Gather, Where, Concat, Transpose), 40% of a step's GPU time on a 3090, more on an
+integrated GPU's shared memory. Masks are additive (a boolean mask's softmax guard runs on the CPU in
+onnxruntime-web).
 """
 from __future__ import annotations
 
@@ -128,12 +134,12 @@ class PrefillGraph(Constants):
         def temporal(i, layer, h):
             q, k, v = heads(layer, h, times)
             pad = (0, 0, 0, model.frames - t)
-            keys.append(F.pad(k, pad))
+            keys.append(F.pad(k, pad).transpose(-1, -2))
             values.append(F.pad(v, pad))
             return merge(layer, F.scaled_dot_product_attention(q, k, v, attn_mask=causal))
 
         self.run(x, temporal)
-        return torch.stack(keys), torch.stack(values)
+        return (*keys, *values)
 
 
 class StepGraph(Constants):
@@ -143,8 +149,9 @@ class StepGraph(Constants):
         colours[:TRANSPARENT] = palette.float()[:TRANSPARENT]
         self.register_buffer("colours", colours)
 
-    def forward(self, previous, actions, at, keys, values):
+    def forward(self, previous, actions, at, *cache):
         model = self.model
+        keys, values = cache[:len(model.blocks)], cache[len(model.blocks):]
         hidden = torch.zeros(1, 2, model.tokens, dtype=torch.bool)
         hidden[0, 1] = True
         hidden[0, 1, model.camera_at:model.frame_at] = False                            # the camera is no content
@@ -152,18 +159,18 @@ class StepGraph(Constants):
         x = model.join(pair, self.place.expand(1, 2, -1, -1), actions.view(1, 2), hidden)
         times = at.view(()) - 1 + torch.arange(2, dtype=at.dtype)
         positions = torch.arange(model.frames, dtype=at.dtype)
-        seen = torch.zeros(2, model.frames).masked_fill(positions[None] > times[:, None], float("-inf"))
+        earlier = torch.zeros(model.frames).masked_fill(positions >= times[0], float("-inf"))   # the cache's
+        own = torch.tensor([[0.0, float("-inf")], [0.0, 0.0]])                     # the pair: causal
         new_keys, new_values = [], []
 
         def temporal(i, layer, h):
-            q, k, v = heads(layer, h, times)
-            kk, vv = keys[i], values[i]
-            for j in range(2):                                   # the previous frame at at - 1, the new at at
-                here = (positions == times[j]).view(1, 1, -1, 1)
-                kk, vv = torch.where(here, k[:, :, j:j + 1], kk), torch.where(here, v[:, :, j:j + 1], vv)
-            new_keys.append(kk)
-            new_values.append(vv)
-            return merge(layer, F.scaled_dot_product_attention(q, kk, vv, attn_mask=seen))
+            q, k, v = heads(layer, h, times)                                          # [n, heads, 2, hd]
+            new_keys.append(k[:, :, 0])                         # the previous frame's, for the cache at at - 1
+            new_values.append(v[:, :, 0])
+            scale = q.shape[-1] ** -0.5
+            weights = torch.cat((q @ keys[i] * scale + earlier, q @ k.transpose(-1, -2) * scale + own), -1)
+            weights = weights.softmax(-1)
+            return merge(layer, weights[..., :model.frames] @ values[i] + weights[..., model.frames:] @ v)
 
         f = self.run(x, temporal)[0, 1]                                                 # the new frame's
         cells = model.pixel_logits(f[:CELLS]).float().softmax(-1)                       # [CELLS, 256, C]
@@ -211,10 +218,14 @@ def pictures(tokens: torch.Tensor) -> torch.Tensor:
     return tokens.view(rows, 16, CELL, CELL, k).permute(0, 2, 1, 3, 4).reshape(rows * CELL, 16 * CELL, k)
 
 
-def cache_shape(model: PixelLayers) -> list[int]:
-    """[layers, tokens, heads, frames, head_dim]: the cache the graphs pass around."""
+def cache_layout(model: PixelLayers) -> dict:
+    """The cache the graphs read, one keys and one values tensor a layer (keys transposed, as attention reads
+    them), and their names in the graphs."""
     layer = model.blocks[0].temporal
-    return [len(model.blocks), model.tokens, layer.heads, model.frames, model.dim // layer.heads]
+    n, h, f, hd = model.tokens, layer.heads, model.frames, model.dim // layer.heads
+    count = len(model.blocks)
+    return {"layers": count, "keys": [n, h, hd, f], "values": [n, h, f, hd],
+            "names": [f"keys_{i}" for i in range(count)] + [f"values_{i}" for i in range(count)]}
 
 
 @torch.no_grad()
@@ -227,7 +238,7 @@ def export(model: PixelLayers, folder: Path, palette: torch.Tensor, start: dict)
     model = copy.deepcopy(model).float().cpu().eval()
     camera = held_camera(model, start)
     folder.mkdir(parents=True, exist_ok=True)
-    shape = cache_shape(model)
+    cache = cache_layout(model)
     n, dim = model.border_end, model.dim
     t = torch.export.Dim("frames", min=2, max=model.frames - 1)
     example = model.frames // 2
@@ -240,16 +251,16 @@ def export(model: PixelLayers, folder: Path, palette: torch.Tensor, start: dict)
     prefill = model.frames * 3 // 4 - 1                   # keep - 1
     torch.onnx.export(PrefillGraph(model, camera).eval(),
                       (torch.zeros(prefill, n, dim), torch.zeros(prefill, dtype=torch.int32)),
-                      folder / "prefill.onnx", input_names=["content", "actions"], output_names=["keys", "values"],
+                      folder / "prefill.onnx", input_names=["content", "actions"], output_names=cache["names"],
                       dynamo=True, external_data=False, verbose=False)
-    cache = torch.zeros(shape)
+    empty = [torch.zeros(cache[name.split("_")[0]]) for name in cache["names"]]
     torch.onnx.export(StepGraph(model, camera, palette).eval(),
                       (torch.zeros(n, dim), torch.zeros(2, dtype=torch.int32), torch.tensor([example], dtype=torch.int32),
-                       cache, cache.clone()), folder / "step.onnx",
-                      input_names=["previous", "actions", "at", "keys", "values"],
+                       *empty), folder / "step.onnx",
+                      input_names=["previous", "actions", "at", *cache["names"]],
                       output_names=["rgb", "content", "new_keys", "new_values"], dynamo=True, external_data=False,
                       verbose=False)
-    (folder / "model.json").write_text(json.dumps({"cache": shape, "frames": model.frames, "content": [n, dim],
+    (folder / "model.json").write_text(json.dumps({"cache": cache, "frames": model.frames, "content": [n, dim],
                                                    "keep": model.frames * 3 // 4, "prefill": prefill,
                                                    "inputs": list(INPUTS),
                                                    "parameters": sum(p.numel() for p in model.parameters())},

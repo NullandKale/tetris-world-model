@@ -26,7 +26,7 @@ ENTRIES = ["scripts/train_layered.py", "scripts/export_onnx.py", "scripts/ship.p
            "tests/test_restart.py", "tests/test_run_outputs.py", "tests/test_dynamics.py"]
 EXTRA = ["scripts/run_until_stopped.ps1"]
 SKIP = ("contra", "smb")                        # module names: the Contra port and SMB work are not shipped
-PAGE = ["index.html", "play.js", "dreamer.js", "check_browser.mjs", "test_dreamer.mjs", "package.json",
+PAGE = ["index.html", "play.js", "dreamer.js", "diagnostics.js", "check_browser.mjs", "test_dreamer.mjs", "package.json",
         "package-lock.json"]
 MODEL = ["embed.onnx", "prefill.onnx", "step.onnx", "model.json", "context.bin", "context.json"]
 ROMS = (".nes", ".fds", ".unf", ".unif")
@@ -65,7 +65,6 @@ GITIGNORE = """__pycache__/
 output/
 web/node_modules/
 web/model/reference.bin
-web/profile.log
 # game ROMs are never published
 *.nes
 *.fds
@@ -101,6 +100,11 @@ prediction from clean real context, 58,000 steps ending in a learning-rate decay
 onnxruntime-web on WebGPU (Chrome or Edge; elsewhere a slow WebAssembly fallback), from the start of a
 level-0 game (one frame's layers). Arrows move and drop, X / Z rotate, Enter is Start; on a phone, the
 on-screen controller. The dream holds the playfield's camera, so it stays on the game screen.
+
+**Slow or broken?** The browser console (F12) says which GPU it runs on, how long each step takes and any
+GPU error, in lines starting `[world-model]`. Add `?profile` to the address for each graph's GPU time by
+operation after 120 frames, `?backend=wasm` to run on the CPU, `?verbose` for onnxruntime's own log. A
+laptop may give the browser its integrated GPU (Windows ignores the page's request for the fast one).
 
 ## The code
 
