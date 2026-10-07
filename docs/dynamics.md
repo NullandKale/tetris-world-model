@@ -766,70 +766,55 @@ then worse can go back to the step whose long dream was best.
 `web/` plays the model in the browser: every frame is generated from the
 frames before it and the keyboard (arrows, X / Z for A / B, Enter, Shift), on
 WebGPU through onnxruntime-web, falling back to WebAssembly without it.
+Published by GitHub Pages from `site/` (`scripts/ship.py`):
+https://nullandkale.github.io/tetris-world-model/.
 
 ```powershell
-python scripts/export_onnx.py [checkpoint.pt]     # -> web/model/ (needs pip install .[onnx]); the page
-                                                  # has stage B's step 20,000 (recipe_attempts.md)
+python scripts/export_onnx.py [checkpoint.pt]     # -> web/model/ (needs pip install .[onnx]); since 2026-10-07 the
+                                                  # page has the layered model's step 58,000 (layered_tokens.md)
 python -m http.server 8000 -d web                 # open http://localhost:8000 in Chrome or Edge
 ```
 
-The export (`models/onnx_export.py`) writes the averaged weights as three
-graphs, plus the page's start (`context.bin`: the start of a level-0 game;
-`context.json`: its buttons and the palette). The model is soft, so the
-context is kept as each frame's patch tokens (98 KB a frame) and a frame is
-shown as its expected colours (2026-10-03; the argmax version passed palette
-indices):
+The export (`models/onnx_export.py`) writes the layered model's averaged
+weights as three graphs, plus the page's start: `context.bin`, one level-0 game
+start as its layers (3 frames, 8 frames into the game, after the playfield's
+camera switch), and `context.json` (where each layer sits, the buttons, the
+palette). A frame is kept as its content (each token's soft pixels and the
+backdrop, [543, 96]):
 
-- `embed.onnx`: real frames [T, 256, 256] uint8 -> their patch tokens.
-- `prefill.onnx`: patch tokens [T, 256, dim] and their incoming actions -> the
-  key/value cache, positions 0..T-1 filled (2 <= T < 64).
-- `step.onnx`: the previous frame's tokens, actions, position and the cache ->
-  the new frame's expected colours [256, 256, 3] (the palette is in the
-  graph), its tokens, and the cache with it.
+- `embed.onnx`: the start's layers (cells, cell_known, sprite_layer, border,
+  backdrop; uint8) -> their content.
+- `prefill.onnx`: content [T, 543, dim] and incoming actions -> the key/value
+  cache, positions 0..T-1 filled (2 <= T < 64).
+- `step.onnx`: the previous frame's content, actions, position and the cache
+  -> the new frame composed (cells, the sprite picture over them, the border
+  bands; each pixel's most likely colour, through the palette in the graph),
+  its content, and the cache with it.
 
-The cache goes in and out whole, so the page keeps it in GPU buffers from step
-to step (`preferredOutputLocation: "gpu-buffer"`, as onnxruntime-web runs
-LLMs' caches); the picture (768 KB) and the tokens (98 KB) reach JavaScript.
-`web/dreamer.js` plays the graphs as `Dreamer` does (re-encoding the last 48
-frames' tokens when the window fills); `models/onnx_dreamer.py` is the same in
-Python. All graphs run the model's own forward against a cache passed in
-(`GraphCache`), so there is one model path; exporting needed `button_bits`
-without `>>` (ONNX shifts no int64) and the patch embedding in one chunk.
+A dream holds the start's camera, so every token keeps its identity and the
+routed temporal attention is attention per token (the cache is [8, 543, 4, 64,
+24] per keys and values). The model's camera head moves the camera at a game
+start (the menus and the playfield are different nametables), so the start is
+taken after that switch; the browser dream stays on the game screen (after a
+top-out it cannot change screens). A step is one pass over two frames, the
+previous one written into the cache (the Dreamer's commit pass) and the new
+one decided, as the pixel model's export did.
 
-Checks, all against PyTorch's `Dreamer` on the page's start with no buttons:
-the export script (onnxruntime, Python) and `web/test_dreamer.mjs`
-(`dreamer.js` on onnxruntime-node; `cd web && npm install && npm test`;
-`MODEL=folder` for another export). Soft (2026-10-03, a 320-step stage1
-checkpoint): expected colours within 0.0001 of PyTorch's over 24 frames, and
-`dreamer.js` within 2 of them as bytes. `tests/test_onnx.py` checks small
-models (plain and modern blocks) through a window slide. The argmax
-version dreamed 96 frames pixel-identical at step 98,000. `web/check_browser.mjs` opens
-the page in Chrome with `?check`, which does the same on WebGPU and reports
-the time per frame (`--profile` also lists the nodes onnxruntime-web runs on
-the CPU).
+Checks, against the model's own Dreamer at temperature 0 on the page's start
+with no buttons: the export script (onnxruntime, Python; 96 frames, 0 pixels
+differ, a window slide included), `web/test_dreamer.mjs` (`dreamer.js` on
+onnxruntime-node: as PyTorch), `tests/test_onnx.py` (small models with a fixed
+camera and with camera tokens, through a window slide), and
+`web/check_browser.mjs` (the page in Chrome with `?check`: as PyTorch, 32 ms a
+step on the RTX 3090, 184 ms with a re-encode).
 
-The timings below are the argmax version's; the soft step has not been
-timed in the browser yet. On the RTX 3090 in Chrome (step 101,000, after the cooldown), the dream
-matched PyTorch (from the black start, 2 pixels in 96 frames differ: blacks
-that are separate palette entries the model cannot tell apart, a logit gap of
-6e-6), and a step went from 122 ms to 18.6 ms (56 frames/s playing) by keeping every node of the step on the GPU: a node
-WebGPU cannot run goes to the CPU, and one in the middle of a step stops the
-GPU for a round trip. The exporter guards a boolean attention mask with
-IsNaN (now an additive mask); LogSoftmax over every pixel's 58 colours was a
-15 MB round trip (now max - logsumexp); ArgMax gives int64, which WebGPU
-cannot convert (now the first colour at the max, in float); uint8/int64
-frames, button bits and positions and the reveal scatter went to the CPU
-(int32 and float32 now; the last MaskGIT step reveals everything without
-sorting). A step is about 1,150 dispatches, 659 of them Transpose, Reshape,
-Slice and Squeeze. onnxruntime-web's graph capture replays a step in about
-20 ms, but up to 1.30 a captured graph fails to replay once another session
-(prefill) has run on the device, so the page does not use it. Instead a
-step is one pass over two frames: the previous one, written into the cache,
-and the new one (Dreamer does the same in two passes, decode then write);
-from step 90,607 the dream is identical to PyTorch's and a step takes 14.4
-ms (45 ms with a re-encode). On the CPU the whole cache rewritten each step costs most
-of a 200 ms step (4 frames/s against PyTorch's 13); on a GPU it is a copy of
-100 MB at hundreds of GB/s.
+What the pixel model's export learned about WebGPU still applies and is the
+next speed: every node of a step should run on the GPU, since one on the CPU in
+the middle of a step stops the GPU for a round trip. Boolean attention masks
+(guarded with IsNaN) are additive here; but ArgMax gives int64, which WebGPU
+cannot convert (the pixel export took the first colour at the max, in float),
+and the picture is composed with int64 indices and a Gather: the pixel model's
+step took 14.4 ms once all of it ran on the GPU.
 
 ## The training window and the run viewer
 
