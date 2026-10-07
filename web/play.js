@@ -16,7 +16,7 @@ const FRAME_MS = 1000 / 60;
 
 const $ = (id) => document.getElementById(id);
 const screen = $("screen"), ctx = screen.getContext("2d"), image = ctx.createImageData(256, 256);
-let held = 0, paused = false, pending = Promise.resolve(), dreamer, context, palette, backend;
+let held = 0, paused = false, pending = Promise.resolve(), dreamer, context, backend, gpu = "";
 let keyboard = 0;                                   // buttons held on the keyboard
 const touches = new Map();                          // on-screen button held by each pointer (finger, mouse)
 
@@ -42,10 +42,13 @@ function status(text, warn = false) {
 
 async function start() {
   try {
-    backend = "gpu" in navigator && (await navigator.gpu.requestAdapter()) ? "webgpu" : "wasm";
+    const adapter = "gpu" in navigator ? await navigator.gpu.requestAdapter() : null;
+    backend = adapter ? "webgpu" : "wasm";
+    // which GPU: on a laptop the browser may take the integrated one (Windows ignores powerPreference)
+    gpu = adapter?.info ? [adapter.info.vendor, adapter.info.architecture, adapter.info.description]
+      .filter(Boolean).join(" ") : "";
     status(`Loading the model (${backend})…`, backend !== "webgpu");
     const meta = JSON.parse(new TextDecoder().decode(await load("context.json")));
-    palette = Uint8Array.from(meta.palette.flat());
     context = { start: startLayers(meta, await load("context.bin")), actions: meta.actions };
     dreamer = await Dreamer.create(ort, load, context.start, context.actions,
                                    { executionProviders: [backend],
@@ -105,7 +108,7 @@ async function run() {
     const now = performance.now(), fps = 1000 / (now - last);
     last = now;
     if (frames % 10 === 0) {
-      status(`${backend === "webgpu" ? "WebGPU" : "WebAssembly (no WebGPU: slow)"}\n` +
+      status(`${backend === "webgpu" ? `WebGPU${gpu ? ` (${gpu})` : ""}` : "WebAssembly (no WebGPU: slow)"}\n` +
              `${average.toFixed(1)} ms per frame, ${Math.min(fps, 60).toFixed(0)} frames/s\n` +
              `frame ${frames}, window position ${dreamer.content.length}`, backend !== "webgpu");
     }

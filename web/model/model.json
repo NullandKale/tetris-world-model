@@ -12,6 +12,7 @@
   96
  ],
  "keep": 48,
+ "prefill": 47,
  "inputs": [
   "cells",
   "cell_known",

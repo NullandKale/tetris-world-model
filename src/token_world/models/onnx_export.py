@@ -5,8 +5,11 @@ backdrop colour), [n, dim] float32.
 
     embed.onnx    a real frame's layers, uint8: cells and cell_known [T, BANDS, VIEW, 16, 16], sprite_layer
                   [T, 240, 256], border [T, 32, 256], backdrop [T] -> content [T, n, dim]
-    prefill.onnx  content [T, n, dim], actions [T] int32 (incoming, -1 = none) -> keys, values [layers,
-                  tokens, heads, frames, head_dim]: positions 0..T-1, the rest zero (2 <= T < frames)
+    prefill.onnx  content [P, n, dim], actions [P] int32 (incoming, -1 = none) -> keys, values [layers,
+                  tokens, heads, frames, head_dim] at positions 0..P-1, the rest zero. P is fixed, keep - 1 (the
+                  frames a window slide encodes): a start with fewer frames is padded after them, which no real
+                  frame sees (causal) and the steps write over (a dynamic length put its shape arithmetic,
+                  about 190 nodes, on the CPU in onnxruntime-web)
     step.onnx     previous [n, dim] (the last frame's content), actions [2] int32 (the previous frame's, the
                   new one's), at [1] int32 (the new frame's position), keys, values (positions before at - 1)
                   -> rgb [256, 256, 3] float32 (the new model frame: its layers composed, each pixel's most
@@ -35,8 +38,8 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from token_world.data.nes_layers import BANDS, CELL, TRANSPARENT, VIEW
-from token_world.models.layered import BORDER_TOKENS, CELLS, rotary, unpatch
+from token_world.data.nes_layers import BANDS, CELL, LAYER_COLOURS, TRANSPARENT, VIEW
+from token_world.models.layered import BORDER_TOKENS, CELLS, rotary
 from token_world.models.layered_pixels import SPRITE_TOKENS, PixelLayers
 
 INPUTS = ("cells", "cell_known", "sprite_layer", "border", "backdrop")      # embed.onnx's, in this order
@@ -136,7 +139,9 @@ class PrefillGraph(Constants):
 class StepGraph(Constants):
     def __init__(self, model: PixelLayers, camera: dict, palette: torch.Tensor):
         super().__init__(model, camera)
-        self.register_buffer("palette", palette.float())
+        colours = torch.zeros(LAYER_COLOURS, 3)               # each layer colour's RGB; TRANSPARENT's is unused
+        colours[:TRANSPARENT] = palette.float()[:TRANSPARENT]
+        self.register_buffer("colours", colours)
 
     def forward(self, previous, actions, at, keys, values):
         model = self.model
@@ -164,27 +169,46 @@ class StepGraph(Constants):
         cells = model.pixel_logits(f[:CELLS]).float().softmax(-1)                       # [CELLS, 256, C]
         sprites = model.pixel_logits(f[model.sprite_at:model.camera_at], sprite=True).float().softmax(-1)
         border = model.pixel_logits(f[model.border_at:model.border_end]).float().softmax(-1)
-        backdrop = model.backdrop_head(f[model.frame_at]).argmax(-1)
+        backdrop = first_max(model.backdrop_head(f[model.frame_at]))                    # [C] one-hot
         # its content, as the Dreamer's commit pass keeps it: the pixels soft, the backdrop decided
         soft = lambda probs, n: model.embed_probs(probs).view(n, CELL, CELL, -1)
         conv, _ = model.sprite_kind()
         content = torch.cat((model._pixels(soft(cells, CELLS), model.cell_patch),
                              model._pixels(soft(sprites, SPRITE_TOKENS), conv),
                              f.new_zeros(model.frame_at - model.camera_at, f.shape[-1]),
-                             model.backdrop(backdrop)[None],
+                             (backdrop @ model.backdrop.weight)[None],
                              model._pixels(soft(border, BORDER_TOKENS), model.cell_patch)))
         # its picture: the background's cells (backdrop where transparent), the sprites over them, the border
-        # bands above and below NES lines 8-231 (data/nes_layers.py compose, model_frame)
-        strip = cells.argmax(-1).view(BANDS, VIEW, CELL, CELL).permute(0, 2, 1, 3).reshape(BANDS, CELL, VIEW * CELL)
-        picture = strip[:, :, :CELL * (VIEW - 1)].reshape(BANDS * CELL, CELL * (VIEW - 1))
-        picture = torch.where(picture != TRANSPARENT, picture, backdrop)
-        drawn = unpatch(sprites.argmax(-1).view(SPRITE_TOKENS, CELL, CELL))
-        picture = torch.where(drawn != TRANSPARENT, drawn, picture)
-        bands = unpatch(border.argmax(-1).view(BORDER_TOKENS, CELL, CELL))
+        # bands above and below NES lines 8-231 (data/nes_layers.py compose, model_frame; a transparent border
+        # pixel is colour 0), each pixel its most likely colour; all in float, so the step stays on the GPU
+        # (WebGPU runs no int64: ArgMax's indices sent the composition to the CPU, a round trip a frame)
+        def paint(probs):                                                                # -> RGB, transparent
+            pick = first_max(probs)
+            return pick @ self.colours, pick[..., TRANSPARENT:TRANSPARENT + 1]
+
+        rgb, clear = paint(cells)                                                       # [CELLS, 256, 3], [.., 1]
+        lay = lambda z: z.view(BANDS, VIEW, CELL, CELL, -1).permute(0, 2, 1, 3, 4).reshape(BANDS, CELL, VIEW * CELL, -1)
+        background = lay(rgb + clear * (backdrop @ self.colours))[:, :, :CELL * (VIEW - 1)].reshape(
+            BANDS * CELL, CELL * (VIEW - 1), 3)
+        rgb, clear = paint(sprites)
+        picture = pictures(rgb) + pictures(clear) * background
+        rgb, clear = paint(border)
+        bands = pictures(rgb + clear * self.colours[0])
         frame = torch.cat((bands[:CELL], picture[8:232], bands[CELL:]))
-        frame = torch.where(frame != TRANSPARENT, frame, torch.zeros_like(frame))
-        rgb = F.embedding(frame, self.palette)
-        return rgb, content, torch.stack(new_keys), torch.stack(new_values)
+        return frame, content, torch.stack(new_keys), torch.stack(new_values)
+
+
+def first_max(scores: torch.Tensor) -> torch.Tensor:
+    """[..., C] -> [..., C] float one-hot of the largest (the first at the maximum, as argmax), in float ops."""
+    hit = (scores >= scores.amax(-1, keepdim=True)).float()
+    ranked = hit * torch.arange(scores.shape[-1], 0, -1, dtype=hit.dtype)               # earlier colours higher
+    return (ranked >= ranked.amax(-1, keepdim=True)).float()
+
+
+def pictures(tokens: torch.Tensor) -> torch.Tensor:
+    """16 x 16 patches with channels [n, 256, k] (row-major, 16 across) -> the picture [n / 16 * 16, 256, k]."""
+    rows, k = tokens.shape[0] // 16, tokens.shape[-1]
+    return tokens.view(rows, 16, CELL, CELL, k).permute(0, 2, 1, 3, 4).reshape(rows * CELL, 16 * CELL, k)
 
 
 def cache_shape(model: PixelLayers) -> list[int]:
@@ -213,11 +237,11 @@ def export(model: PixelLayers, folder: Path, palette: torch.Tensor, start: dict)
                        pixels(2 * CELL, 256), pixels()), folder / "embed.onnx", input_names=list(INPUTS),
                       output_names=["content"], dynamic_shapes={k: {0: t} for k in INPUTS},
                       dynamo=True, external_data=False, verbose=False)
+    prefill = model.frames * 3 // 4 - 1                   # keep - 1
     torch.onnx.export(PrefillGraph(model, camera).eval(),
-                      (torch.zeros(example, n, dim), torch.zeros(example, dtype=torch.int32)),
+                      (torch.zeros(prefill, n, dim), torch.zeros(prefill, dtype=torch.int32)),
                       folder / "prefill.onnx", input_names=["content", "actions"], output_names=["keys", "values"],
-                      dynamic_shapes={"content": {0: t}, "actions": {0: t}}, dynamo=True, external_data=False,
-                      verbose=False)
+                      dynamo=True, external_data=False, verbose=False)
     cache = torch.zeros(shape)
     torch.onnx.export(StepGraph(model, camera, palette).eval(),
                       (torch.zeros(n, dim), torch.zeros(2, dtype=torch.int32), torch.tensor([example], dtype=torch.int32),
@@ -226,6 +250,7 @@ def export(model: PixelLayers, folder: Path, palette: torch.Tensor, start: dict)
                       output_names=["rgb", "content", "new_keys", "new_values"], dynamo=True, external_data=False,
                       verbose=False)
     (folder / "model.json").write_text(json.dumps({"cache": shape, "frames": model.frames, "content": [n, dim],
-                                                   "keep": model.frames * 3 // 4, "inputs": list(INPUTS),
+                                                   "keep": model.frames * 3 // 4, "prefill": prefill,
+                                                   "inputs": list(INPUTS),
                                                    "parameters": sum(p.numel() for p in model.parameters())},
                                                   indent=1))

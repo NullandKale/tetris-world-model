@@ -22,10 +22,10 @@ class OnnxDreamer:
         incoming button bytes (-1 = none)."""
         folder = Path(folder)
         meta = json.loads((folder / "model.json").read_text())
-        self.window = meta["frames"]
+        self.window, self.prefilled = meta["frames"], meta["prefill"]
         keep = meta["keep"] if keep is None else keep
-        if not 3 <= keep < self.window or len(actions) < 3:
-            raise ValueError("keep must be 3..frames - 1, from 3 or more frames (prefill takes 2 or more)")
+        if not 3 <= keep <= self.prefilled + 1 or not 3 <= len(actions) <= self.prefilled + 1:
+            raise ValueError(f"keep and the start: 3..{self.prefilled + 1} frames (prefill takes {self.prefilled})")
         options = ort.SessionOptions()
         options.intra_op_num_threads = threads
         providers = providers or ["CPUExecutionProvider"]
@@ -39,8 +39,10 @@ class OnnxDreamer:
 
     def _encode(self) -> None:
         self.content, self.actions = self.content[-self.keep:], self.actions[-self.keep:]
-        self.keys, self.values = self.prefill.run(None, {"content": np.stack(self.content[:-1]),
-                                                         "actions": np.array(self.actions[:-1], np.int32)})
+        t, pad = len(self.content) - 1, self.prefilled - (len(self.content) - 1)    # padded after the frames
+        content = np.concatenate([np.stack(self.content[:t]), np.zeros((pad, *self.content[0].shape), np.float32)])
+        actions = np.array(self.actions[:t] + [-1] * pad, np.int32)
+        self.keys, self.values = self.prefill.run(None, {"content": content, "actions": actions})
 
     def step(self, action: int) -> np.ndarray:
         """The frame that `action` (the controller byte, -1 for none) produces -> its colours [256, 256, 3]

@@ -34,7 +34,7 @@ class OnnxTests(unittest.TestCase):
     def dream_both(self, model):
         """3 real frames, then 7 dreamed (the 6-frame window fills and slides): each frame's colours from the
         graphs and from PyTorch's Dreamer (temperature 0: the camera its most likely move, which holds)."""
-        layers, acts = window(1, 10, 2), torch.randint(-1, 256, (1, 10))
+        layers, acts = window(1, 10, 2), torch.randint(-1, 256, (1, 10), generator=torch.Generator().manual_seed(5))
         start = {k: v[0, :3] for k, v in layers.items()}
         with tempfile.TemporaryDirectory() as folder:
             export(model, Path(folder), PALETTE, start)

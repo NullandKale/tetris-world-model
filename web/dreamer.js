@@ -19,7 +19,8 @@ export class Dreamer {
   static async create(ort, load, start, actions, { keep = null, executionProviders = ["webgpu"], sessionOptions = {} } = {}) {
     const meta = JSON.parse(new TextDecoder().decode(await load("model.json")));
     keep ??= meta.keep;
-    if (keep < 3 || keep >= meta.frames || actions.length < 3) throw new Error(`keep must be 3..${meta.frames - 1}, from 3 or more frames`);
+    if (keep < 3 || keep > meta.prefill + 1 || actions.length < 3 || actions.length > meta.prefill + 1)
+      throw new Error(`keep and the start: 3..${meta.prefill + 1} frames`);
     const onGpu = executionProviders.includes("webgpu");
     const session = async (name, gpuOutputs = []) => ort.InferenceSession.create(await load(name), {
       ...sessionOptions,
@@ -53,12 +54,16 @@ export class Dreamer {
   async encode() {
     this.content = this.content.slice(-this.keep);
     this.actions = this.actions.slice(-this.keep);
-    const t = this.content.length - 1;                 // the last frame goes in with the next step
-    const size = this.n * this.dim, all = new Float32Array(t * size);
+    // the last frame goes in with the next step; prefill takes a fixed meta.prefill frames, these padded after
+    // them (no real frame sees a later one, and the steps write over them)
+    const t = this.content.length - 1, p = this.meta.prefill;
+    const size = this.n * this.dim, all = new Float32Array(p * size);
     this.content.slice(0, t).forEach((x, i) => all.set(x, i * size));
+    const actions = new Int32Array(p).fill(-1);
+    actions.set(this.actions.slice(0, t));
     const out = await this.prefill.run({
-      content: new this.ort.Tensor("float32", all, [t, this.n, this.dim]),
-      actions: new this.ort.Tensor("int32", Int32Array.from(this.actions.slice(0, t)), [t]),
+      content: new this.ort.Tensor("float32", all, [p, this.n, this.dim]),
+      actions: new this.ort.Tensor("int32", actions, [p]),
     });
     this.replaceCache(out.keys, out.values);
   }
