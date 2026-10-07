@@ -16,6 +16,17 @@ scores 0 once the real one has fallen), ghost (pixels the dream fills where the 
 stuck or doubled pieces), and fall (how far the dream's piece has fallen against the real one). spawn
 asks whether the next piece appears when the real one does, after the dream's first piece has left the
 spawn area; timer_wrong scores the fall timer drawn in the border (the game's gravity clock).
+
+presence and activation watch for the stall a model trained toward fewer wrong pixels falls into: it
+erases the pieces it is unsure of (an empty well is mostly right), and once nothing is drawn where pieces
+fall it has no wrong piece to correct toward a right one. presence is the share of frames with a real
+piece in which the dream draws any piece at all (anywhere in the upper playfield, right or wrong);
+activation the dream's expected block pixels there over the real piece's, however faint (a soft model's
+haze counts, a committed model's pixels are 0 or 1). Both falling toward 0 is the warning.
+
+shape asks whether the piece stays the piece it is (an S does not turn into an O): in the frames where the
+real upper playfield holds one whole piece (4 cells), the share in which the dream's holds the same cells up to
+where they are (no buttons: no rotation).
 """
 from __future__ import annotations
 
@@ -43,6 +54,9 @@ LEVEL, PIECE_Y = 0x44, 0x41
 SPAWN = (slice(52, 68), slice(108, 156))         # the top two rows of cells, around where pieces spawn
 SPAWN_SLACK = 16                                 # frames a dreamed spawn may be early or late
 FALL_FRAMES = 64                                 # the fall is measured over at most this many frames
+CELL = 8                                         # the well's cells are 8 x 8 pixels at x = 96 + 8 col, y = 56 + 8 row
+CELL_FILLED = 24                                 # a cell holds a block with this many filled pixels (a block: 7 x 7)
+UPPER_CELLS = (slice(56, 144), slice(96, 176))   # the well's top 11 rows of cells, all 10 columns
 
 
 def _timer_pixels() -> np.ndarray:
@@ -64,14 +78,16 @@ class Trial:
     actions: np.ndarray           # [CONTEXT] the button byte that produced each
     future: np.ndarray            # [FUTURE, 256, 256] the real frames with no buttons
     level: int
+    layers: dict | None = None    # the context's layered frames, each key [CONTEXT, ...] (data/nes_layers.py)
 
 
-def trials(seed: int, per_band: int | None = None) -> Iterator[Trial]:
+def trials(seed: int, per_band: int | None = None, layered: bool = False) -> Iterator[Trial]:
     """Real games paused at a fresh piece, then FUTURE frames with no buttons. per_band: that many from
-    each level band in BANDS, then stop; None: endless, whatever levels the bot's games reach."""
+    each level band in BANDS, then stop; None: endless, whatever levels the bot's games reach. layered: the
+    context's layers too (Trial.layers)."""
     found = {band: 0 for band in BANDS}
     while per_band is None or any(n < per_band for n in found.values()):
-        real = RealTetris(seed)
+        real = RealTetris(seed, layered)
         seed += 1
         for played in range(20_000):
             real.step(None)
@@ -84,20 +100,21 @@ def trials(seed: int, per_band: int | None = None) -> Iterator[Trial]:
                 if band is not None:
                     found[band] += 1
                 context, actions = np.stack(real.frames), np.array(real.actions, np.int64)
+                layers = {k: np.stack([f[k] for f in real.layers]) for k in real.layers[0]} if layered else None
                 future = np.stack([real.step(0)[0] for _ in range(FUTURE)])
-                yield Trial(context, actions, future, level)
+                yield Trial(context, actions, future, level, layers)
                 break
 
 
 class TrialStream(IterableDataset):
     """Endless live trials, one console per DataLoader worker (training keeps one worker filling it)."""
 
-    def __init__(self, seed: int):
-        self.seed = seed
+    def __init__(self, seed: int, layered: bool = False):
+        self.seed, self.layered = seed, layered
 
     def __iter__(self):
         info = get_worker_info()
-        yield from trials(self.seed * 1000 + (info.id if info else 0))
+        yield from trials(self.seed * 1000 + (info.id if info else 0), layered=self.layered)
 
 
 @dataclass
@@ -161,7 +178,12 @@ def score(trial: Trial, dreamed: Dream) -> dict[str, float]:
       NaN if the real one moved under a row or either piece is gone);
     - spawn: 1.0 if, after the dream's first piece has left the spawn area, the next piece appears
       within SPAWN_SLACK frames of the real one's; 0 otherwise (NaN if the real game spawns none);
-      spawn_lag: its frames late (negative: early)."""
+      spawn_lag: its frames late (negative: early);
+    - presence: over the frames whose upper playfield holds a real piece, the share in which the dream's
+      holds a piece's worth of filled pixels, right or wrong; activation: the dream's expected block
+      pixels there (each pixel's probability, however faint) over the real piece's (NaN with no piece);
+    - shape: over the frames whose upper playfield holds one whole real piece (4 cells), the share in which
+      the dream's holds the same cells, wherever they are (an erased, garbled or swapped piece scores 0)."""
     out = {f"wrong_{h}": float(1 - dreamed.right[h][PLAYFIELD].mean()) for h in HORIZONS}
     out |= {f"timer_wrong_{h}": float(1 - dreamed.right[h][TIMER].mean()) for h in HORIZONS}
     empty = empty_colour(trial)
@@ -178,9 +200,45 @@ def score(trial: Trial, dreamed: Dream) -> dict[str, float]:
         out[f"piece_{h}"] = float(mine.sum()) / size if ok else float("nan")
         out[f"piece_hit_{h}"] = float((mine & real_piece).sum()) / size if ok else float("nan")
         out[f"piece_ghost_{h}"] = float((mine & ~real_piece).sum()) / size if ok else float("nan")
+    pieces = real_upper.reshape(len(real_upper), -1).sum(1)
+    with_piece = pieces > 50
+    if with_piece.any():
+        out["presence"] = float((dream_upper.reshape(len(dream_upper), -1).sum(1)[with_piece] > 50).mean())
+        haze = (dreamed.filled[:, UPPER[0], UPPER[1]].astype(np.float32) * ~static).reshape(len(pieces), -1).sum(1)
+        out["activation"] = float((haze[with_piece] / pieces[with_piece]).mean())
+    else:
+        out["presence"] = out["activation"] = float("nan")
+    still = np.all(np.concatenate([trial.context, trial.future])[:, UPPER_CELLS[0], UPPER_CELLS[1]] != empty, 0)
+    out["shape"] = _shape(cells(real_frames[:, UPPER_CELLS[0], UPPER_CELLS[1]] & ~still),
+                          cells(sure[:, UPPER_CELLS[0], UPPER_CELLS[1]] & ~still))
     out["fall"] = _fall(real_upper, dream_upper)
     out["spawn"], out["spawn_lag"] = _spawn(real_frames, sure, static, empty)
     return out
+
+
+def cells(pixels: np.ndarray) -> np.ndarray:
+    """Pixel masks [..., h, w] cut on the cell grid (UPPER_CELLS) -> cell masks [..., h // CELL, w // CELL]:
+    a block."""
+    h, w = pixels.shape[-2] // CELL, pixels.shape[-1] // CELL
+    blocks = pixels[..., :h * CELL, :w * CELL].reshape(*pixels.shape[:-2], h, CELL, w, CELL)
+    return blocks.sum((-3, -1)) >= CELL_FILLED
+
+
+def _trimmed(mask: np.ndarray) -> bytes | None:
+    """A cell mask's cells, cut to their bounding box (where they are does not matter), as a key."""
+    rows, cols = np.nonzero(mask)
+    if len(rows) == 0:
+        return None
+    box = mask[rows.min():rows.max() + 1, cols.min():cols.max() + 1]
+    return bytes([*box.shape]) + np.packbits(box).tobytes()
+
+
+def _shape(real: np.ndarray, mine: np.ndarray) -> float:
+    """shape (score), from the real and dreamed cells [FUTURE, rows, cols] that change."""
+    whole = [t for t in range(len(real)) if real[t].sum() == 4]
+    if not whole:
+        return float("nan")
+    return float(np.mean([_trimmed(real[t]) == _trimmed(mine[t]) for t in whole]))
 
 
 def _centre_row(pixels: np.ndarray) -> float:
@@ -258,3 +316,34 @@ def animation(trial: Trial, dreams: dict[str, Dream], palette: np.ndarray, every
         draw.text((2, h * 2 + 20), f"level {trial.level}, frame +{f + 1}, no buttons", fill="#a8a8b8")
         frames.append(image)
     return frames
+
+
+def dream_world(world, trial: Trial, palette: np.ndarray, keep: int | None = None, seed: int = 0) -> Dream:
+    """Any model's (diagnostics/worlds.py World) FUTURE frames from the trial's context, nobody pressing
+    anything: the pixel model's dream (dream), or a layered model's (dream_layered: the trial needs layers)."""
+    if world.layered:
+        return dream_layered(world.model, trial, palette, seed=seed, steps=world.saved["args"].get("dream_steps", 1))
+    return dream(world.model, trial, palette, keep)
+
+
+@torch.no_grad()
+def dream_layered(model, trial: Trial, palette: np.ndarray, temperature: float = 1.0, seed: int = 0,
+                  steps: int = 1) -> Dream:
+    """A layered model's (models/layered.py) FUTURE frames from the trial's layered context, nobody pressing
+    anything, composed into model frames (data/nes_layers.py) and scored as committed frames (Dream.of_frames).
+    steps: the passes a model with sprite decisions decides them over (models/layered_slots.py)."""
+    from token_world.data.nes_layers import TRANSPARENT, compose, model_frame
+    device = next(model.parameters()).device
+    layers = {k: torch.from_numpy(np.asarray(v)).to(device)[None] for k, v in trial.layers.items()}
+    generator = torch.Generator(device=device).manual_seed(seed)
+    with torch.autocast(device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
+        dreamer = model.Dreamer(model, layers, torch.from_numpy(trial.actions).to(device)[None],
+                                temperature=temperature, generator=generator, steps=steps)
+        frames = []
+        for _ in range(FUTURE):
+            none = torch.zeros(1, dtype=torch.long, device=device)
+            f = {k: v[0].cpu().numpy() for k, v in dreamer.step(none).items() if k != "probs"}
+            frames.append(model_frame(compose(f), f["border"]))
+    frames = np.stack(frames)
+    return Dream.of_frames(trial, np.where(frames == TRANSPARENT, 0, frames), palette)
+

@@ -1,22 +1,21 @@
 // dreamer.js against PyTorch, on the CPU (onnxruntime-node): the page's start, dreamed with no buttons,
-// must give the expected colours scripts/export_onnx.py recorded from PyTorch's Dreamer (model/reference.bin,
-// rounded to bytes), within TOLERANCE per colour value. A broken cache or position changes thousands.
+// must give the colours scripts/export_onnx.py recorded from PyTorch's Dreamer (model/reference.bin), within
+// TOLERANCE per colour value. A broken cache or position changes thousands.
 //
 //     cd web && npm install && node test_dreamer.mjs      (MODEL=folder: another export than model/)
 import { readFile } from "node:fs/promises";
 import * as ort from "onnxruntime-node";
-import { Dreamer } from "./dreamer.js";
+import { Dreamer, startLayers } from "./dreamer.js";
 
 const SIZE = 256 * 256 * 3, TOLERANCE = 2;
 const folder = process.env.MODEL ?? "model";
 const load = async (name) => new Uint8Array(await readFile(new URL(`${folder}/${name}`, import.meta.url)));
 const meta = JSON.parse(new TextDecoder().decode(await load("context.json")));
-const pixels = await load("context.bin");
-const frames = Array.from({ length: meta.actions.length }, (_, i) => pixels.subarray(i * 65536, (i + 1) * 65536));
+const start = startLayers(meta, await load("context.bin"));
 const reference = await load("reference.bin");
 const count = reference.length / SIZE;
 
-const dreamer = await Dreamer.create(ort, load, frames, meta.actions, { executionProviders: ["cpu"] });
+const dreamer = await Dreamer.create(ort, load, start, meta.actions, { executionProviders: ["cpu"] });
 const began = performance.now();
 let first = -1, wrong = 0, worst = 0;
 for (let i = 0; i < count; i++) {

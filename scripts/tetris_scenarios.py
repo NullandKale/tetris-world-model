@@ -1,6 +1,11 @@
 """Score world-model checkpoints on Tetris scenarios found live (diagnostics/tetris_scenarios.py).
 
-    python scripts/tetris_scenarios.py output/world_model_tetris_self output/world_model_tetris_8m
+    python scripts/tetris_scenarios.py output/world_model_tetris_layered_px output/world_model_tetris_base
+    python scripts/tetris_scenarios.py D:/token_world_checkpoints/world_model_tetris_layered_px/model_step20000.pt
+
+Any model: run folders (their model_latest.pt) or checkpoint files, pixel or layered (diagnostics/worlds.py).
+Each run's summary (per scenario: instances, games, levels, the means) is appended to its run folder's
+scenarios.csv with the checkpoint's step, which the run window's Scenarios tab shows (ui/run_viewer.py).
 
 Every run is scored on the same instances: fresh live streams (same --seed,
 same instances), spread over the whole collection time (per stream, one
@@ -29,15 +34,10 @@ sys.path.insert(0, str(ROOT / "src"))
 from token_world.data.nes_palette import tetris_palette
 from token_world.diagnostics.tetris_scenarios import (CONTEXT, HORIZONS, LEAD, SCENARIOS, evaluate, live_instances,
                                                       spread)
-from token_world.models.dynamics import Dynamics, load_run
+from token_world.diagnostics.worlds import load, run_folder
 
 SHEET_HORIZONS = (1, LEAD, 4, 8, 16)
 BATCH = 16
-
-
-def load(run: Path) -> tuple[Dynamics, int]:
-    model, saved = load_run(run)
-    return model, int(saved["step"])
 
 
 def sheet(path: Path, frames: np.ndarray, rollouts: dict[str, tuple[np.ndarray, np.ndarray]], palette: np.ndarray,
@@ -79,9 +79,39 @@ def game_interval(values: np.ndarray, games: np.ndarray, rng: np.random.Generato
     return float(values.mean()), float(np.percentile(means, 2.5)), float(np.percentile(means, 97.5))
 
 
+SUMMARY = ("step", "scenario", "instances", "games", "level_min", "level_max", *(f"event_wrong_{h}" for h in HORIZONS),
+           *(f"false_change_{h}" for h in HORIZONS), "exact")
+
+
+def summarize(rows: list[dict], models: dict, folders: dict) -> None:
+    """Each model's means per scenario -> appended to its run folder's scenarios.csv (the window's Scenarios
+    tab), with the checkpoint's step (run_folder)."""
+    for name in models:
+        folder, step = folders[name]
+        out = []
+        for scenario in SCENARIOS:
+            mine = [r for r in rows if r["scenario"] == scenario and r["model"] == name]
+            if not mine:
+                continue
+            mean = lambda key: float(np.nanmean([r[key] for r in mine])) if any(
+                not np.isnan(r[key]) for r in mine) else float("nan")
+            levels = [r["level"] for r in mine]
+            out.append({"step": step, "scenario": scenario, "instances": len(mine),
+                        "games": len({r["game"] for r in mine}), "level_min": min(levels), "level_max": max(levels),
+                        **{key: mean(key) for key in SUMMARY[6:]}})
+        path = folder / "scenarios.csv"
+        new = not path.exists()
+        with path.open("a", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=SUMMARY)
+            if new:
+                writer.writeheader()
+            writer.writerows(out)
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("runs", type=Path, nargs="+", help="run folders holding model_latest.pt")
+    p.add_argument("runs", type=Path, nargs="+", help="run folders holding model_latest.pt, or checkpoint files")
+    p.add_argument("--device", default="cuda", help="cuda, or cpu while a training run holds the GPU")
     p.add_argument("--per", type=int, default=100, help="instances per scenario")
     p.add_argument("--minutes", type=float, default=15, help="collection time limit")
     p.add_argument("--seed", type=int, default=0, help="stream seed (same seed, same instances)")
@@ -90,18 +120,19 @@ def main():
     args = p.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
 
-    models = {}
+    models, folders = {}, {}
     for run in args.runs:
-        model, step = load(run)
-        models[f"{run.name}@{step}"] = model
+        world = load(run, args.device)
+        models[f"{world.name}@{world.step}"] = world
+        folders[f"{world.name}@{world.step}"] = (run_folder(run), world.step)
     palette = tetris_palette().cpu().numpy()
     rows, first, pending = [], {}, defaultdict(list)
     counts = defaultdict(int)
 
     def flush(scenario: str) -> None:
         batch = pending.pop(scenario)
-        for name, model in models.items():
-            scores, rgb, wrong = evaluate(model, batch, palette)
+        for name, world in models.items():
+            scores, rgb, wrong = evaluate(world, batch)
             rows.extend({"model": name, "scenario": scenario, "stream": i.stream, "game": f"{i.stream}:{i.game}",
                          "level": i.level, **s} for i, s in zip(batch, scores))
             if scenario not in first or name not in first[scenario][1]:
@@ -145,6 +176,7 @@ def main():
                 m, lo, hi = game_interval(np.array([r[key] for r in sub], float), g, rng)
                 cells.append(f"{m:6.1%} [{lo:5.1%}-{hi:5.1%}]")
             print(f"    {name:32s} " + "   ".join(cells))
+    summarize(rows, models, folders)
     print(f"\nwrote {args.out}")
 
 

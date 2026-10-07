@@ -38,7 +38,6 @@ docs/guides/dynamics.md.
 from __future__ import annotations
 
 import argparse
-import csv
 import gc
 import json
 import logging
@@ -51,21 +50,23 @@ import time
 from pathlib import Path
 
 import numpy as np
-from PIL import Image, ImageDraw
 import torch
 from torch.utils.data import DataLoader
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from token_world.data.model_frames import BAND, BORDER_VERSION, GAME_ROWS
+from token_world.data.model_frames import BAND, BORDER_VERSION
 from token_world.data.nes_palette import tetris_palette
 from token_world.data.world_nes_tetris import WorldNesTetrisStreams
+from token_world.diagnostics import bias
 from token_world.diagnostics.coherence import PatchBank
 from token_world.diagnostics.coherence import score as coherence
 from token_world.diagnostics.long_dream import TrialStream, animation, dream, score
 from token_world.diagnostics.long_dream import sheet as dream_sheet
-from token_world.models.dynamics import (FREE_NATS, SIZE, Dynamics, build, choice_kl, deepen, incoming_actions,
+from token_world.diagnostics.run_outputs import (HORIZONS, append_long_dream, horizon_fields, horizon_outputs,
+                                               open_metrics, replace, save_gif, write_horizon_curve)
+from token_world.models.dynamics import (SIZE, Dynamics, build, choice_kl, deepen, incoming_actions,
                                          masked_loss, own_share, patch_pixels, rollout, sample_choice,
                                          training_mask)
 from token_world.data.live_batches import LiveBatches
@@ -83,22 +84,20 @@ MODELS = {# HorizonDrive's two stages at the small model's size (~2.0M parameter
           # the base with a sampled choice per frame (4 categoricals of 8, models/dynamics.py latent), grown from
           # the base (--grow-from): random outcomes are chosen, not averaged
           "latent": {"dim": 96, "layers": 8, "heads": 4, "recompute": False, "latent": [4, 8]}}
-HORIZONS = (1, 2, 4, 8, 16)
 WINDOW_STRIDE = 16                                # a window every 16 frames: each frame in four windows
+BANK_EVERY = 16                                   # steps between additions to the coherence bank
 STOP_FILE = ROOT / "output" / "stop_training"      # create it to stop cleanly, like Stop Training
 EMA_DECAY = 0.999                                 # averaged weights: about the last 1,000 steps
-KINDS = ("wrong", "changed", "wrong_changed", "wrong_static", "border_wrong", "border_copy")
 LONG_DREAM_EVERY = 2000                           # steps between long-dream tests
 LONG_DREAM_TRIALS = 32                            # trials per test: the same games at every test and in every
                                                   # run with the same --seed, so tests compare like with like
 LONG_DREAM_VARIANT = "1 pass"                     # long_dream.csv's variant column (earlier runs had two)
-PREVIEW_GIFS = 4                                  # preview windows saved as animated GIFs
 FIELDS = ["step", "seconds", "lr", "train_loss", "train_loss_game", "train_loss_border",
           "train_loss_changed", "masked_fraction", "rollout_depth", "blend_frames", "latent_kl",
           "rollout_frames", "rollout_wrong", "rollout_ghost_px",
           "data_wait_ms_mean", "data_wait_ms_max",
           "stream_tick_min", "stream_tick_max", "in_game_restarts",
-          *(f"{g}_h{h}_{kind}" for g in GAMES for h in HORIZONS for kind in KINDS)]
+          *horizon_fields(GAMES)]
 
 
 def background_priority(_worker_id: int) -> None:
@@ -163,7 +162,7 @@ def border_pixels(model: Dynamics, device) -> torch.Tensor:
 
 
 def train_step(model, forward, index, actions, depth: int = 0, blend: int = 0,
-               generator: torch.Generator | None = None, drawer: Dynamics | None = None):
+               generator: torch.Generator | None = None, drawer: Dynamics | None = None, read_choice=None):
     """One MaskGIT step on windows index [B, T, 256, 256] -> losses (total has the graph).
 
     depth 0, the base model (HorizonDrive's first stage): teacher forcing. Every window is real and clean;
@@ -178,9 +177,12 @@ def train_step(model, forward, index, actions, depth: int = 0, blend: int = 0,
     real frames. drawer: the model that draws the rollouts (HorizonDrive's cached rollouts: a frozen copy
     refreshed every --refresh steps; default the model itself).
     With a latent (models/dynamics.py), every frame after the first gets the choice its posterior reads from
-    the real frame and the one before (sampled, straight-through), and the prior learns to predict it from
-    the previous frame's features: DreamerV3's KL balancing (0.5 dynamics, 0.1 representation, FREE_NATS
-    free), in nats per pixel as the reconstruction.
+    the real frame and the one before (sampled, straight-through; a rollout's dreamed history keeps the
+    choices it was drawn with, and its frames are left out of the KL), and the prior learns to predict it from
+    the previous frame's features and the frame's incoming buttons: DreamerV3's KL balancing (0.5 dynamics, 0.1 representation), in nats
+    per pixel as the reconstruction. No free nats (DreamerV3 has 1 per step): Tetris averages well under
+    0.1 nats of randomness a frame (a new piece about 2, most frames none), and with a free nat the choice
+    took over gravity and Start, which the frames and buttons decide (docs/guides/recipe_attempts.md).
     """
     drawer = model if drawer is None else drawer
     b, t = index.shape[:2]
@@ -196,7 +198,7 @@ def train_step(model, forward, index, actions, depth: int = 0, blend: int = 0,
         s = int(torch.randint(1, t - k, (), generator=generator))           # s >= 1, the boundary s + k <= t - 1
         w = int(torch.randint(0, blend + 1, (), generator=generator))
         boundary = s + k
-        tokens, unsure, wrong = rollout(drawer, index[:, :boundary], incoming[:, :boundary], s, compiled=True)
+        tokens, unsure, wrong, drawn = rollout(drawer, index[:, :boundary], incoming[:, :boundary], s, compiled=True)
         lo = max(s, boundary - w)                                           # the first frame with a real part
         if lo < boundary:
             real = model._patches(index[:, lo:boundary]).to(tokens.dtype)
@@ -211,17 +213,22 @@ def train_step(model, forward, index, actions, depth: int = 0, blend: int = 0,
     mask = training_mask(b, t, n, device, generator, cut=cut)
     z = posterior = None
     if model.latent:
-        posterior = model.posterior(model._patches(index))                 # [B, T, groups, classes]
+        posterior = (read_choice or model.read_choice)(index)              # [B, T, groups, classes]
         z = sample_choice(posterior, straight_through=True)
         z = z * (torch.arange(t, device=device) > 0)[None, :, None]       # frame 0 has no choice
+        if depth:                                    # the dreamed history goes with the choices that drew it
+            z = torch.cat((z[:, :s], drawn.to(z.dtype), z[:, boundary:]), 1)
     features = forward(index, incoming, mask, soft=soft, z=z)
     total, per_pixel, where = masked_loss(model, features, target, mask)
     kl = torch.tensor(float("nan"))
     if model.latent:
-        dynamics_kl, representation_kl = choice_kl(posterior[:, 1:], model.prior(features[:, :-1]))
-        total = total + (0.5 * dynamics_kl.clamp_min(FREE_NATS) + 0.1 * representation_kl.clamp_min(FREE_NATS)
-                         ).mean() / SIZE ** 2
-        kl = dynamics_kl.detach().mean()
+        dynamics_kl, representation_kl = choice_kl(posterior[:, 1:], model.prior(features[:, :-1], incoming[:, 1:]))
+        read = torch.ones(t - 1, device=device)      # frames 1..T-1 whose choice the posterior read: not the
+        if depth:                                    # dreamed history's (its choices are the drawer's)
+            read[s - 1:boundary - 1] = 0
+        balanced = 0.5 * dynamics_kl + 0.1 * representation_kl                    # [B, T - 1]
+        total = total + (balanced * read).sum() / (read.sum() * b) / SIZE ** 2
+        kl = (dynamics_kl.detach() * read).sum() / (read.sum() * b)
     per_pixel = per_pixel.detach()
     border = border_pixels(model, index.device)[where[2]]
     changed = (target[:, 1:] != target[:, :-1])[where[0], where[1] - 1, where[2]]   # frame 0 is never masked
@@ -260,112 +267,10 @@ def preview(model, index, actions, palettes, out: Path, args) -> dict[str, float
     m = {}
     for g, game in enumerate(GAMES):
         rows = slice(g * per, (g + 1) * per)
-        for h in HORIZONS:
-            miss, ref, before = wrong[rows, h - 1], real[rows, h - 1], last_context[rows]
-            changed = (ref != before)[:, GAME_ROWS]
-            mg = miss[:, GAME_ROWS]
-            rate = lambda m_, c: (m_ * c).sum().item() / max(c.sum().item(), 1)
-            m.update({f"{game}_h{h}_wrong": mg.mean().item(),
-                      f"{game}_h{h}_changed": changed.float().mean().item(),
-                      f"{game}_h{h}_wrong_changed": rate(mg, changed),
-                      f"{game}_h{h}_wrong_static": rate(mg, ~changed),
-                      f"{game}_h{h}_border_wrong": torch.cat((miss[:, :BAND], miss[:, -BAND:]), 1).mean().item(),
-                      f"{game}_h{h}_border_copy": torch.cat(((ref != before)[:, :BAND], (ref != before)[:, -BAND:]),
-                                                            1).float().mean().item()})   # copying frame 47
-        save_sheet(real[rows], rgb[rows], wrong[rows], last_context[rows], palettes[game], out / f"rollout_{game}.png")
-        save_previews(real[rows], rgb[rows], wrong[rows], last_context[rows], palettes[game], out / "previews", game)
-    temporary = out / "horizon_curve.csv.tmp"
-    with temporary.open("w", newline="") as file:
-        writer = csv.writer(file)
-        writer.writerow(["game", "horizon", *KINDS])
-        for game in GAMES:
-            for h in HORIZONS:
-                writer.writerow([game, h, *(m[f"{game}_h{h}_{kind}"] for kind in KINDS)])
-    replace(temporary, out / "horizon_curve.csv")
+        m.update(horizon_outputs(real[rows], rgb[rows], wrong[rows], last_context[rows], palettes[game], out,
+                                 game))
+    write_horizon_curve(m, GAMES, out)
     return m
-
-
-def replace(temporary: Path, path: Path) -> None:
-    """temporary -> path, retried for a few seconds: on Windows a viewer reading `path` blocks it briefly."""
-    for _ in range(50):
-        try:
-            temporary.replace(path)
-            return
-        except PermissionError:
-            time.sleep(0.1)
-    temporary.replace(path)
-
-
-def save_gif(frames: list, path: Path, ms: int) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(path.stem + ".tmp.gif")
-    frames[0].save(temporary, save_all=True, append_images=frames[1:], duration=ms, loop=0)
-    replace(temporary, path)
-
-
-def wrong_panel(reference: np.ndarray, wrong: np.ndarray) -> np.ndarray:
-    """The real frame dimmed, magenta in proportion to each pixel's expected wrongness."""
-    w = wrong.astype(np.float32)[..., None]
-    return (reference * 0.35 * (1 - w) + np.array([255, 0, 200]) * w).astype(np.uint8)
-
-
-def save_previews(real, rgb, wrong, last_context, palette, folder: Path, game: str) -> None:
-    """PREVIEW_GIFS windows, from the most changing to the quieter ones, as animated GIFs: the last
-    context frame, then each generated frame, as REAL | GENERATED (expected colours) | WRONG (magenta)."""
-    change = (real[:, -1] != last_context).float().mean((1, 2))
-    order = change.argsort(descending=True).tolist()
-    picks = list(dict.fromkeys(order[i * len(order) // PREVIEW_GIFS] for i in range(PREVIEW_GIFS)))
-    palette = palette.cpu()
-    colour = lambda frame: palette[frame.long().cpu()].numpy()
-    for slot, w in enumerate(picks):
-        frames = []
-        for t in range(-1, real.shape[1]):
-            ref = colour(last_context[w] if t < 0 else real[w, t])
-            gen = ref if t < 0 else rgb[w, t].cpu().numpy()
-            miss = wrong_panel(ref, np.zeros(ref.shape[:2]) if t < 0 else wrong[w, t].float().cpu().numpy())
-            image = Image.new("RGB", (3 * SIZE + 16, SIZE + 18), "#181820")
-            draw = ImageDraw.Draw(image)
-            for c, (title, panel) in enumerate((("REAL", ref), ("GENERATED", gen), ("WRONG", miss))):
-                image.paste(Image.fromarray(panel, "RGB"), (c * (SIZE + 8), 18))
-                draw.text((c * (SIZE + 8) + 2, 3), f"{title} {'context' if t < 0 else f'+{t + 1}'}", fill="white")
-            frames.append(image)
-        save_gif(frames, folder / f"{game}_{slot}.gif", 160)
-
-
-def save_sheet(real, rgb, wrong, last_context, palette, path: Path) -> None:
-    """Columns: last context frame, then each horizon. Rows: real, generated, wrong pixels."""
-    show = int((real[:, -1] != last_context).float().mean((1, 2)).argmax())   # the most-changing history
-    palette = palette.cpu()
-    colour = lambda frame: palette[frame.long().cpu()].numpy()
-    context = colour(last_context[show])
-    columns = [("context t", context, context, np.zeros(context.shape[:2]))]
-    columns += [(f"+{h}", colour(real[show, h - 1]), rgb[show, h - 1].cpu().numpy(),
-                 wrong[show, h - 1].float().cpu().numpy()) for h in HORIZONS]
-    label = 20
-    sheet = Image.new("RGB", (len(columns) * SIZE, 3 * (SIZE + label)), "#181820")
-    draw = ImageDraw.Draw(sheet)
-    for c, (name, ref, gen, miss) in enumerate(columns):
-        for r, (title, image) in enumerate((("REAL", ref), ("GENERATED", gen), ("WRONG", wrong_panel(ref, miss)))):
-            y = r * (SIZE + label)
-            draw.text((c * SIZE + 4, y + 4), f"{title} {name}", fill="white")
-            sheet.paste(Image.fromarray(image, "RGB"), (c * SIZE, y + label))
-    temporary = path.with_name(path.stem + ".tmp.png")
-    sheet.save(temporary)
-    replace(temporary, path)
-
-
-def open_metrics(path: Path):
-    if path.exists():
-        with path.open(newline="") as f:
-            header = next(csv.reader(f), [])
-        if header != FIELDS:                            # renamed after closing it: Windows refuses an open file
-            path.rename(path.with_name(f"metrics_schema_{int(time.time())}.csv"))
-    append = path.exists()
-    f = path.open("a" if append else "w", newline="")
-    writer = csv.DictWriter(f, fieldnames=FIELDS)
-    if not append:
-        writer.writeheader()
-    return f, writer
 
 
 class Member:
@@ -384,6 +289,7 @@ class Member:
             deepen(self.model, source["ema"])
             print(f"{name}: grown from {args.grow_from} (step {source['step']})", flush=True)
         self.forward = torch.compile(self.model)          # one compiled graph per model (about a minute each)
+        self.read_choice = torch.compile(self.model.read_choice) if self.model.latent else None
         trained = [(n, p) for n, p in self.model.named_parameters() if p.requires_grad]
         decay = [p for n, p in trained if p.ndim >= 2 and "pos" not in n and "colour" not in n]
         rest = [p for n, p in trained if not any(p is q for q in decay)]
@@ -428,26 +334,18 @@ class Member:
         to the dream) -> {LONG_DREAM_VARIANT: mean scores}. Scored against the real game (long_dream.py)
         and, generically, against real play's patches and changes (bank, diagnostics/coherence.py)."""
         model = self.averaged_model()
-        rows, first = [], {}
+        rows, first, likely = [], {}, []
         for i, trial in enumerate(trials):
             dreamed = dream(model, trial, palette)
             rows.append({"step": self.step, "variant": LONG_DREAM_VARIANT, "level": trial.level,
                          **score(trial, dreamed),
                          **coherence(bank, trial.context[-1], dreamed.likely, dreamed.sure)})
+            likely.append(dreamed.likely)
             if i == 0:
                 first[LONG_DREAM_VARIANT] = dreamed
-        path = self.out / "long_dream.csv"
-        if path.exists():                                 # other columns (an older score): archive it
-            with path.open(newline="") as file:
-                header = next(csv.reader(file), [])
-            if header != list(rows[0]):
-                replace(path, path.with_name(f"long_dream_schema_{int(time.time())}.csv"))
-        new = not path.exists()
-        with path.open("a", newline="") as file:
-            writer = csv.DictWriter(file, fieldnames=list(rows[0]))
-            if new:
-                writer.writeheader()
-            writer.writerows(rows)
+        bias.write(self.out, self.step, LONG_DREAM_VARIANT, [np.asarray(t.future) for t in trials], likely,
+                   [np.asarray(t.context) for t in trials])
+        append_long_dream(self.out, rows)
         save_gif(animation(trials[0], first, palette), self.out / "long_dream.gif", 60)
         temporary = self.out / "long_dream.tmp.png"
         dream_sheet(trials[0], first, palette).save(temporary)
@@ -466,7 +364,7 @@ class Member:
         self.optimizer.zero_grad(set_to_none=True)
         with torch.autocast("cuda", dtype=torch.bfloat16):
             self.losses = train_step(self.model, self.forward, index, actions, depth, args.blend or 0,
-                                     drawer=self.drawer)
+                                     drawer=self.drawer, read_choice=self.read_choice)
         self.losses["total"].backward()
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
         self.optimizer.step()
@@ -576,14 +474,15 @@ def train(args, events: queue.Queue, stop: threading.Event) -> None:
         print("World models: " + ", ".join(f"{m.name} {m.parameters:,} params (resume {m.step})" for m in members)
               + f"; {histories} histories ({args.workers_per_game} per game: {', '.join(GAMES)}) x "
               f"{args.frames}-frame windows, shared", flush=True)
-        files = {m.name: open_metrics(m.out / "metrics.csv") for m in members}
+        files = {m.name: open_metrics(m.out / "metrics.csv", FIELDS) for m in members}
         # the trials depend on --seed alone (the stream seed of a launch at step 0), so a run's tests stay the
         # same games after a relaunch, and runs with the same --seed are tested on the same games
         trial_seed = int(np.random.SeedSequence([args.seed, *[0] * len(members)]).generate_state(1)[0])
         long_dreams = LongDreams(trial_seed % 100_000)
         palette = batches.palettes["tetris"].cpu().numpy().astype(np.uint8)
-        # real play's patches and changes for the coherence scores: one window of every batch, hashed on the
-        # GPU (it holds most of real play's vocabulary within a few hundred steps); kept with the run
+        # real play's patches and changes for the coherence scores: every history's window every BANK_EVERY
+        # steps (windows 256 frames apart, about 128k frames by the first test), hashed on the GPU; one wait
+        # for the GPU per BANK_EVERY steps, not one a step; kept with the run
         bank_path = members[0].out / "patch_bank.npz"
         bank = PatchBank.load(bank_path) if bank_path.is_file() else PatchBank()
         started = time.monotonic()
@@ -601,7 +500,9 @@ def train(args, events: queue.Queue, stop: threading.Event) -> None:
                     print(f"{STOP_FILE} found: stopping", flush=True)
                     break
                 index, actions = batches.next()
-                bank.add(index[0])
+                if members[0].step % BANK_EVERY == 0:
+                    for window in index:
+                        bank.add(window)
                 for member in members:
                     member.train_step(index, actions, args)
                 due = [m for m in members if m.step == m.start_step + 1 or m.step % args.preview_every == 0]
@@ -625,7 +526,8 @@ def train(args, events: queue.Queue, stop: threading.Event) -> None:
                         events.put(("longdream", member.name, member.step, summary))
                         print(f"{member.name} step={member.step} long dream: " + "; ".join(
                             f"wrong +16/+128 {r['wrong_16']:.2%}/{r['wrong_128']:.2%} mass {r['mass']:.2f} "
-                            f"piece +32 {r['piece_32']:.2f} hit {r['piece_hit_32']:.2f} ghost "
+                            f"piece +32 {r['piece_32']:.2f} presence {r['presence']:.2f} activation "
+                            f"{r['activation']:.2f} hit {r['piece_hit_32']:.2f} ghost "
                             f"{r['piece_ghost_32']:.2f} fall {r['fall']:.2f} spawn {r['spawn']:.2f} "
                             f"timer wrong +16/+128 {r['timer_wrong_16']:.2%}/{r['timer_wrong_128']:.2%} "
                             f"unseen patch/change {r['unseen_patch']:.2%}/{r['unseen_change']:.2%} "

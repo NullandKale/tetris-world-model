@@ -144,11 +144,13 @@ class WorldNesTetrisStreams(IterableDataset):
     [frames, 256, 256] uint8 model indices; action [frames]
     long, where action[t] took frame t to t + 1 and the last entry repeats the
     one before it as padding; ram [frames, 2048] uint8, each frame's console RAM
-    (for event detection, not training); tick = the last frame's counter.
+    (for event detection, not training); tick = the last frame's counter. layered: the frames' layers
+    (data/nes_layers.py) under "layers" instead of x.
     """
 
-    def __init__(self, frames: int = 64, seed: int = 17, repo: str | None = None, stride: int | None = None):
-        self.frames, self.seed, self.repo = int(frames), int(seed), repo
+    def __init__(self, frames: int = 64, seed: int = 17, repo: str | None = None, stride: int | None = None,
+                 layered: bool = False):
+        self.frames, self.seed, self.repo, self.layered = int(frames), int(seed), repo, layered
         self.new_frames = window_stride(self.frames, stride)
 
     def __iter__(self):
@@ -157,4 +159,4 @@ class WorldNesTetrisStreams(IterableDataset):
         rom = tetris_rom(self.repo)
         session = TetrisSession(seed)
         yield from world_nes_windows(rom, session, border_slots(tetris_palette()), BORDER_STATE,
-                                     self.frames, self.new_frames, worker_id)
+                                     self.frames, self.new_frames, worker_id, layered=self.layered)

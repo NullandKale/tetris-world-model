@@ -50,6 +50,46 @@ class TimelineTests(unittest.TestCase):
         self.assertTrue(np.array_equal(window.actions[:-1], actions[first:first + S.FRAMES - 1]))
         self.assertEqual((window.level, window.frame), (3, shown))
 
+    def test_layered_windows_carry_their_layers_and_any_model_scores_them(self):
+        """A layered stream's windows keep each frame's layers aligned with its picture, and a layered World
+        (diagnostics/worlds.py) is scored on them like any model."""
+        import tempfile
+        import torch
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from test_layered import window as layered_window
+        from token_world.data.nes_palette import tetris_palette
+        from token_world.diagnostics.worlds import load
+        from token_world.models.layered import build
+        total = 64 + 63 * 5
+        ram = ram_run(total)
+        ram[:150, E.LEVEL], ram[150:, E.LEVEL] = 2, 3
+        index = np.arange(total)
+        frames = np.zeros((total, 256, 256), np.uint8)
+        frames[155:, 100, 20] = 7
+        layers = {k: np.repeat(v[0, :1].numpy(), total, 0) for k, v in layered_window(1, 1, 4).items()}
+        layers["backdrop"] = (index % 50).astype(np.uint8)                 # each frame's own backdrop
+        actions = np.zeros(total, np.int64)
+        timeline, found = S.Timeline(), []
+        for w in range(6):
+            lo = 63 * w
+            timeline.add(frames[lo:lo + 64], np.append(actions[lo:lo + 63], 0), ram[lo:lo + 64],
+                         layers={k: v[lo:lo + 64] for k, v in layers.items()})
+            found += timeline.instances()
+        level = next(f for f in found if f.scenario == "level up")
+        first = level.frame - S.LEAD - (S.CONTEXT - 1)
+        self.assertTrue(np.array_equal(level.layers["backdrop"], index[first:first + S.FRAMES] % 50))
+        args = {"dim": 32, "layers": 2, "heads": 2, "frames": 64, "colour_dim": 8, "kind": "layered", "model": "pixels"}
+        torch.manual_seed(0)
+        with tempfile.TemporaryDirectory() as d:
+            model = build(args)
+            torch.save({"step": 7, "ema": model.state_dict(), "args": args, "palettes": {"tetris": tetris_palette()}},
+                       Path(d) / "model_latest.pt")
+            world = load(d, device="cpu")
+        scores, rgb, wrong = S.evaluate(world, [level])
+        self.assertIn(f"event_wrong_{S.LEAD}", scores[0])
+        self.assertEqual(rgb.shape, (1, S.FRAMES - S.CONTEXT, 256, 256, 3))
+        self.assertTrue(set(np.unique(wrong)) <= {0, 1})                   # committed: right or not
+
     def test_spread_spaces_instances_per_stream_in_time(self):
         now = [0.0]
         make = lambda name, stream: S.Instance(name, None, None, stream, 0, 0, 0)

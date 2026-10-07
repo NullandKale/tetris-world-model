@@ -37,7 +37,7 @@ class LiveBatches:
                 raise RuntimeError(f"worker {worker} frame stream jumped: tick {tick} after "
                                    f"{self.last_tick[worker]}, not whole {self.new_frames}-frame chunks later")
             self.last_tick[worker] = tick
-            chunks[worker], action_chunks[worker] = part["x"], part["action"]
+            chunks[worker], action_chunks[worker] = part["layers"] if "layers" in part else part["x"], part["action"]
             meta[worker] = (tick, int(part["in_game_restarts"]))
         wait_ms = (time.monotonic() - start) * 1000
         self.wait_sum_ms += wait_ms
@@ -50,7 +50,10 @@ class LiveBatches:
         # asynchronous and the batch is stacked on the GPU. Stacking on the CPU first made an
         # unpinned tensor whose copy blocked the main thread until the GPU queue drained.
         order = range(self.workers)
-        x = torch.stack([chunks[i].cuda(non_blocking=True) for i in order])
+        if isinstance(chunks[0], dict):            # layered windows (data/nes_layers.py): each key stacked
+            x = {k: torch.stack([chunks[i][k].cuda(non_blocking=True) for i in order]) for k in chunks[0]}
+        else:
+            x = torch.stack([chunks[i].cuda(non_blocking=True) for i in order])
         actions = torch.stack([action_chunks[i].cuda(non_blocking=True) for i in order])
         return x, actions
 

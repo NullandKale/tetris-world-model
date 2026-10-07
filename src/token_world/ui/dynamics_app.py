@@ -1,4 +1,4 @@
-"""The training window for the world models (scripts/train_dynamics_ui.py).
+"""The training window for the world models (scripts/train_dynamics_ui.py, scripts/train_layered.py).
 
 A status line and Stop Training over the run viewer (ui/run_viewer.py), which reads everything back
 from the run folders; the trainer's events only update the status and ask the viewer to refresh.
@@ -12,6 +12,23 @@ from tkinter import ttk
 
 from token_world.ui.run_viewer import RunViewer
 from token_world.ui.theme import setup_dark_theme
+
+
+STALLED = 0.25                                # presence under this: next to no piece is drawn any more
+
+
+def stalling(before: dict | None, now: dict) -> str:
+    """A warning for the status line when a model is erasing its pieces (diagnostics/long_dream.py presence):
+    the stall it may not get out of, an empty well with nothing wrong left to correct toward a right piece."""
+    p = now.get("presence", float("nan"))
+    if p != p:
+        return ""
+    if p < STALLED:
+        return f"  !! STALLING: a piece is drawn in only {p:.0%} of frames"
+    if before is not None and before.get("presence", p) - p > 0.15:
+        drop = f"  !! presence falling ({before['presence']:.2f} -> {p:.2f})"
+        return drop + (", while wrong pixels improve: erasing pieces" if now["wrong_128"] < before["wrong_128"] else "")
+    return ""
 
 
 def launch(args, train_fn) -> None:
@@ -33,6 +50,7 @@ def launch(args, train_fn) -> None:
     worker.start()
     poll_id = None
     latest: dict[str, str] = {}
+    presence: dict[tuple, dict] = {}          # each model's previous long-dream scores (stalling)
 
     def close() -> None:
         stop.set()
@@ -56,10 +74,17 @@ def launch(args, train_fn) -> None:
                     f"{m[f'tetris_h{h}_wrong_changed']:.0%}" for h in (1, 4, 16)))
                 status.set("   |   ".join(latest.values()))
                 viewer.refresh()
+            elif event[0] == "progress":                             # a trainer's own status line
+                name, step, text = event[1:]
+                latest[name] = f"{name} @ {step:,}: {text}"
+                status.set("   |   ".join(latest.values()))
+                viewer.refresh()
             elif event[0] == "longdream":
                 name, step, summary = event[1:]
                 latest[name + " dream"] = f"{name} long dream @ {step:,}: " + "; ".join(
-                    f"{v} +128 {r['wrong_128']:.1%} mass {r['mass']:.2f}" for v, r in summary.items())
+                    f"{v} +128 {r['wrong_128']:.1%} mass {r['mass']:.2f} presence {r['presence']:.2f}"
+                    + stalling(presence.get((name, v)), r) for v, r in summary.items())
+                presence.update({(name, v): r for v, r in summary.items()})
                 status.set("   |   ".join(latest.values()))
                 viewer.refresh()
             elif event[0] == "done":

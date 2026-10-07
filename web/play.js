@@ -1,6 +1,6 @@
 // The page: keyboard -> NES controller byte -> Dreamer (dreamer.js) -> canvas, at most 60 frames a second.
 import * as ort from "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.30.0/dist/ort.webgpu.min.mjs";
-import { Dreamer } from "./dreamer.js";
+import { Dreamer, startLayers } from "./dreamer.js";
 
 ort.env.wasm.wasmPaths = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.30.0/dist/";
 // ?profile: onnxruntime-web logs each WebGPU kernel's time and where every node runs (check_browser.mjs reads it)
@@ -26,17 +26,7 @@ const load = async (name) => {
   return new Uint8Array(await response.arrayBuffer());
 };
 
-// A real frame (Uint8Array(65536) palette indices), through the palette.
-function drawReal(frame) {
-  const px = image.data;
-  for (let i = 0; i < frame.length; i++) {
-    const c = frame[i] * 3, o = i * 4;
-    px[o] = palette[c]; px[o + 1] = palette[c + 1]; px[o + 2] = palette[c + 2]; px[o + 3] = 255;
-  }
-  ctx.putImageData(image, 0, 0);
-}
-
-// A dreamed frame: each pixel's expected colour (Float32Array(65536 * 3)).
+// A dreamed frame: each pixel's colour (Float32Array(65536 * 3)).
 function draw(rgb) {
   const px = image.data;
   for (let i = 0, o = 0; i < rgb.length; i += 3, o += 4) {
@@ -56,11 +46,8 @@ async function start() {
     status(`Loading the model (${backend})…`, backend !== "webgpu");
     const meta = JSON.parse(new TextDecoder().decode(await load("context.json")));
     palette = Uint8Array.from(meta.palette.flat());
-    const pixels = await load("context.bin");
-    context = { frames: Array.from({ length: meta.actions.length }, (_, i) => pixels.subarray(i * 65536, (i + 1) * 65536)),
-                actions: meta.actions };
-    drawReal(context.frames.at(-1));
-    dreamer = await Dreamer.create(ort, load, context.frames, context.actions,
+    context = { start: startLayers(meta, await load("context.bin")), actions: meta.actions };
+    dreamer = await Dreamer.create(ort, load, context.start, context.actions,
                                    { executionProviders: [backend],
                                      sessionOptions: PROFILE ? { logSeverityLevel: 0, logVerbosityLevel: 0 } : {} });
     screen.focus();
@@ -79,7 +66,7 @@ async function check() {
   let first = -1, wrong = 0, worst = 0, ms = 0;
   const plain = [], slides = [];
   for (let i = 0; i < count; i++) {
-    const slide = dreamer.tokens.length === dreamer.meta.frames;     // this step re-encodes the window first
+    const slide = dreamer.content.length === dreamer.meta.frames;    // this step re-encodes the window first
     const began = performance.now();
     const frame = await dreamer.next(0);
     const took = performance.now() - began;
@@ -99,7 +86,7 @@ async function check() {
     `${median(slides).toFixed(1)} ms with a re-encode, ${slides.length} of them)`;
   document.body.dataset.check = result;
   console.log(result);
-  await dreamer.reset(context.frames, context.actions);
+  await dreamer.reset(context.start, context.actions);
 }
 
 const TOLERANCE = 2;                             // colour values: PyTorch's are rounded to bytes
@@ -120,7 +107,7 @@ async function run() {
     if (frames % 10 === 0) {
       status(`${backend === "webgpu" ? "WebGPU" : "WebAssembly (no WebGPU: slow)"}\n` +
              `${average.toFixed(1)} ms per frame, ${Math.min(fps, 60).toFixed(0)} frames/s\n` +
-             `frame ${frames}, window position ${dreamer.tokens.length}`, backend !== "webgpu");
+             `frame ${frames}, window position ${dreamer.content.length}`, backend !== "webgpu");
     }
   }
 }
@@ -160,8 +147,7 @@ addEventListener("blur", () => { keyboard = 0; touches.clear(); update(); });
 $("restart").addEventListener("click", async () => {
   paused = true;
   await pending;
-  await dreamer.reset(context.frames, context.actions);
-  drawReal(context.frames.at(-1));
+  await dreamer.reset(context.start, context.actions);
   paused = false;
   $("pause").textContent = "Pause";
   screen.focus();

@@ -21,7 +21,7 @@ script runs, nvidia-smi logs power, temperature, clocks and utilisation once
 a second to output\gpu_telemetry.csv.
 #>
 param(
-    [ValidateSet("dynamics")][string]$Run = "dynamics",
+    [ValidateSet("dynamics", "layered")][string]$Run = "dynamics",
     [string]$Until = "",
     [string]$Python = "C:\Python314\python.exe",
     [int]$MaxRestarts = 20,
@@ -33,7 +33,7 @@ $ErrorActionPreference = "Stop"
 $root = Split-Path $PSScriptRoot -Parent
 Set-Location $root
 $log = Join-Path $root "output\${Run}_overnight.log"
-$trainer = @{ "dynamics" = "scripts\train_dynamics_ui.py" }[$Run]
+$trainer = @{ "dynamics" = "scripts\train_dynamics_ui.py"; "layered" = "scripts\train_layered.py" }[$Run]
 
 $deadline = $null
 if ($Until) {

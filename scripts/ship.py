@@ -18,13 +18,14 @@ import shutil
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-ENTRIES = ["scripts/train_dynamics_ui.py", "scripts/export_onnx.py", "scripts/ship.py", "scripts/play_world_model.py",
-           "scripts/long_dream_check.py", "scripts/view_runs.py", "scripts/tetris_scenarios.py",
-           "tests/test_dynamics.py", "tests/test_onnx.py", "tests/test_world_nes_tetris.py",
-           "tests/test_tetris_events.py", "tests/test_tetris_bot.py", "tests/test_tetris_scenarios.py",
-           "tests/test_long_dream.py", "tests/test_coherence.py"]
+ENTRIES = ["scripts/train_layered.py", "scripts/export_onnx.py", "scripts/ship.py", "scripts/play_world_model.py",
+           "scripts/long_dream_check.py", "scripts/event_checks.py", "scripts/view_runs.py", "scripts/tetris_scenarios.py",
+           "tests/test_layered.py", "tests/test_nes_layers.py", "tests/test_onnx.py", "tests/test_worlds.py",
+           "tests/test_world_nes_tetris.py", "tests/test_tetris_events.py", "tests/test_tetris_bot.py",
+           "tests/test_tetris_scenarios.py", "tests/test_long_dream.py", "tests/test_coherence.py", "tests/test_bias.py",
+           "tests/test_restart.py", "tests/test_run_outputs.py", "tests/test_dynamics.py"]
 EXTRA = ["scripts/run_until_stopped.ps1"]
-SKIP = ("contra",)                               # module names: the Contra port is not shipped
+SKIP = ("contra", "smb")                        # module names: the Contra port and SMB work are not shipped
 PAGE = ["index.html", "play.js", "dreamer.js", "check_browser.mjs", "test_dreamer.mjs", "package.json",
         "package-lock.json"]
 MODEL = ["embed.onnx", "prefill.onnx", "step.onnx", "model.json", "context.bin", "context.json"]
@@ -90,30 +91,30 @@ where = ["src"]
 
 README = """# Tetris world model
 
-A {params} world model of NES Tetris: a spatiotemporal MaskGIT transformer over exact palette pixels
-(64-frame windows, 16 x 16 tokens). Every frame is generated from the frames before it and the
-controller; no emulator runs while it plays. Trained in two stages (HorizonDrive's recipe): next-frame
-prediction from clean real context, then rollouts, where the model learns to predict real frames from
-its own dreamed history.
+A {params}-parameter world model of NES Tetris over the NES's own layers: the background as cells fixed to
+the world, the sprites as their own picture, and the border, 543 tokens a frame of exact palette pixels in
+16 x 16 patches. A spatiotemporal MaskGIT transformer (64-frame windows, rotary time) generates every frame
+from the frames before it and the controller; no emulator runs while it plays. Trained by next-frame
+prediction from clean real context, 58,000 steps ending in a learning-rate decay.
 
 **Play it:** the page in `web/` (published by GitHub Pages) runs the step-{step:,} checkpoint with
-onnxruntime-web on WebGPU (Chrome or Edge; elsewhere a slow WebAssembly fallback), from the very
-beginning of a level-0 game. Arrows move and drop, X / Z rotate, Enter is Start; on a phone, the
-on-screen controller.
+onnxruntime-web on WebGPU (Chrome or Edge; elsewhere a slow WebAssembly fallback), from the start of a
+level-0 game (one frame's layers). Arrows move and drop, X / Z rotate, Enter is Start; on a phone, the
+on-screen controller. The dream holds the playfield's camera, so it stays on the game screen.
 
 ## The code
 
-- `src/token_world/models/dynamics.py`: the model, its training mask and loss, soft decoding, the
-  cached `Dreamer`, the rollout stage's history blend (`own_share`), and an optional sampled choice per
-  frame (a DreamerV3-style latent, not in the browser version yet).
-- `scripts/train_dynamics_ui.py`: training on live emulator histories (a RAM-reading bot plays), with
-  a run viewer; `scripts/run_until_stopped.ps1` runs it unattended.
-- `src/token_world/diagnostics/long_dream.py`, `scripts/long_dream_check.py`: 128-frame no-button dreams
-  against the real game; `src/token_world/diagnostics/coherence.py`: game-agnostic coherence scores
-  (the share of a dream's patches and patch changes that never occur in real play).
+- `src/token_world/models/layered.py`, `layered_pixels.py`: the model, its training mask and loss, the
+  cached `Dreamer`; `src/token_world/data/nes_layers.py`: the layers, composed back into the screen exactly.
+- `scripts/train_layered.py`: training on live emulator histories (a RAM-reading bot plays), with a run
+  viewer; `scripts/run_until_stopped.ps1` runs it unattended.
+- `src/token_world/diagnostics/`: 128-frame no-button dreams against the real game (`long_dream.py`), game
+  events (`tetris_scenarios.py`), line clears and restarts followed to their end (`line_clears.py`,
+  `restart.py`), the next piece's choices (`bias.py`) and game-agnostic coherence scores (`coherence.py`),
+  for any model through `worlds.py`.
 - `scripts/export_onnx.py`, `src/token_world/models/onnx_export.py`, `web/`: the browser version, checked
   frame for frame against PyTorch (`web/test_dreamer.mjs`, `web/check_browser.mjs`).
-- `docs/dynamics.md`: the design, the measurements and the decisions behind them.
+- `docs/`: the design, the measurements and the decisions behind them.
 
 Training needs **World NES** (the emulator, a separate package, not included) and **your own Tetris
 ROM**: set `TETRIS_ROM` to your copy of `Tetris (USA).nes`. No ROM is included in this repository.
@@ -121,10 +122,8 @@ ROM**: set `TETRIS_ROM` to your copy of `Tetris (USA).nes`. No ROM is included i
 ```
 pip install -e .[onnx]
 python -m pytest tests            # tests that need World NES or the ROM skip without them
-python scripts/train_dynamics_ui.py
-python scripts/train_dynamics_ui.py --models srr --grow-from output/world_model_tetris_base/model_latest.pt \
-    --rollouts 62 16 8000 --blend 8 --refresh 2000 --lr 3e-5 --weight-decay 1e-5 --warmup 500
-python scripts/export_onnx.py output/world_model_tetris_srr/model_latest.pt
+python scripts/train_layered.py --cooldown 46000 12000
+python scripts/export_onnx.py output/world_model_tetris_layered_px/model_latest.pt
 ```
 """
 
@@ -183,13 +182,14 @@ def main():
     for name in MODEL:
         shutil.copy2(model / name, out / "web" / "model" / name)
     (out / "docs").mkdir()
-    shutil.copy2(ROOT / "docs/guides/dynamics.md", out / "docs/dynamics.md")
+    for guide in ("dynamics.md", "layered_tokens.md", "recipe_attempts.md"):
+        shutil.copy2(ROOT / "docs/guides" / guide, out / "docs" / guide)
     (out / ".github" / "workflows").mkdir(parents=True)
     (out / ".github" / "workflows" / "pages.yml").write_text(WORKFLOW, encoding="utf-8")
     (out / ".gitignore").write_text(GITIGNORE, encoding="utf-8")
     (out / "pyproject.toml").write_text(PYPROJECT, encoding="utf-8")
     meta = json.loads((model / "context.json").read_text())
-    params = "3.2M-parameter" if json.loads((model / "model.json").read_text())["cache"][0] > 8 else "2M-parameter"
+    params = f"{json.loads((model / 'model.json').read_text())['parameters'] / 1e6:.1f}M"
     (out / "README.md").write_text(README.format(step=meta["step"], params=params), encoding="utf-8")
     shipped = [f for f in out.rglob("*") if f.is_file() and ".git" not in f.relative_to(out).parts[:1]]
     roms = [f for f in shipped if f.suffix.lower() in ROMS or f.read_bytes()[:4] == b"NES\x1a"]

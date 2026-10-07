@@ -1,6 +1,9 @@
 """Long dreams with no buttons: does each model keep a falling piece intact and let it fall, over 128 frames?
 
-    python scripts/long_dream_check.py [run ...] [--keeps 48 63 ...]
+    python scripts/long_dream_check.py [run or checkpoint ...] [--keeps 48 63 ...] [--device cpu]
+
+Any model, pixel or layered (diagnostics/worlds.py); every model dreams the same trials (layered trials, so
+the layered models have their layers; the pixel model reads the same frames).
 
 Runs default to the long-trained ones (see play_world_model.py). Each keep is
 how many frames a dream keeps when its window slides (models/dynamics.py
@@ -29,9 +32,10 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT / "src"), str(ROOT / "scripts")]
 
-from play_world_model import load_model, runs_with_checkpoints
+from play_world_model import runs_with_checkpoints
 from token_world.data.nes_palette import tetris_palette
-from token_world.diagnostics.long_dream import HORIZONS, dream, score, sheet, trials
+from token_world.diagnostics.long_dream import HORIZONS, dream_world, score, sheet, trials
+from token_world.diagnostics.worlds import load
 
 
 def main():
@@ -40,16 +44,18 @@ def main():
     p.add_argument("--per-band", type=int, default=2)
     p.add_argument("--keeps", type=int, nargs="+", default=[None], help="frames kept when a dream slides")
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--device", default="cuda", help="cuda, or cpu while a training run holds the GPU")
     p.add_argument("--out", type=Path, default=ROOT / "output" / "long_dream" / time.strftime("%Y%m%d_%H%M%S"))
     args = p.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
     runs = args.runs or runs_with_checkpoints()
-    models = [(model, f"{name.split(' @')[0]} [keep {keep or 'default'}]", keep)
-              for model, name in (load_model(r) for r in runs) for keep in args.keeps]
+    worlds = [load(r, args.device) for r in runs]
+    models = [(world, f"{world.name}@{world.step} [keep {keep or 'default'}]", keep)
+              for world in worlds for keep in args.keeps]
     palette = tetris_palette().cpu().numpy().astype(np.uint8)
     scores = {name: [] for _, name, _ in models}
-    for n, trial in enumerate(trials(args.seed, args.per_band)):
-        dreams = {name: dream(model, trial, palette, keep) for model, name, keep in models}
+    for n, trial in enumerate(trials(args.seed, args.per_band, layered=True)):
+        dreams = {name: dream_world(world, trial, palette, keep, seed=n) for world, name, keep in models}
         for name, dreamed in dreams.items():
             scores[name].append(score(trial, dreamed))
         sheet(trial, dreams, palette).save(args.out / f"trial{n}_level{trial.level}.png")

@@ -4,7 +4,9 @@ Events are found live in console RAM (no stored eval set): the bot plays in
 World NES streams, and each detected event yields a 64-frame window whose
 first 48 frames are context and whose first visible change after the event
 appears at generated frame +LEAD. Several models are scored on the same
-instances. (Aligning on the screen, not the RAM frame, matters: the top-out
+instances, any model (diagnostics/worlds.py): the streams are layered
+(data/nes_layers.py) and their frames composed from the layers, exactly, so the
+pixel model and the layered models see the same windows. (Aligning on the screen, not the RAM frame, matters: the top-out
 curtain starts well over 16 frames after the play state says game over, and
 the line-clear animation steps every few frames.)
 
@@ -16,7 +18,7 @@ y 128-143, x 196-219. The events and their RAM come from
 data/tetris_events.py.
 
 Scores per instance and horizon h (generated frame +h against the real one), as expectations over the
-model's soft frames:
+pixel model's soft frames, and counts of the layered models' committed ones:
 - event wrong: of the pixels that really changed since the last context frame
   (tick border and NEXT box excluded), the share the model expects wrong;
 - false change: of the playfield pixels that really stayed the same, the
@@ -35,6 +37,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from token_world.data.model_frames import BAND
+from token_world.data.nes_layers import TRANSPARENT, compose, model_frame
 from token_world.data.tetris_events import CLEAR_NAMES, LEVEL, LOOKAHEAD, events_at
 from token_world.data.world_nes_tetris import WorldNesTetrisStreams
 from token_world.models.dynamics import incoming_actions
@@ -57,6 +60,7 @@ class Instance:
     game: int                     # that stream's game number (its in-game restarts so far)
     level: int                    # the game level at the event
     frame: int                    # the stream's frame index of the event's first visible change
+    layers: dict | None = None    # the window's layered frames, each key [64, ...] (data/nes_layers.py)
 
 
 class Timeline:
@@ -73,22 +77,26 @@ class Timeline:
         self.frames: list[np.ndarray] = []
         self.actions: list[int] = []       # actions[i] took frames[i] to frames[i + 1]
         self.ram: list[np.ndarray] = []
+        self.layers: list[dict] = []       # each frame's layers (layered streams)
         self.start = 0                     # absolute index of frames[0]
         self.scanned = 1                   # next absolute RAM index to scan
         self.game = 0
 
-    def add(self, x: np.ndarray, action: np.ndarray, ram: np.ndarray, game: int = 0) -> None:
-        """One window: x [64, ...], action [64] (last is padding), ram [64, 2048], and the
-        stream's game number. Consecutive windows share a frame: this window's frame 0 is the
-        previous window's last frame."""
+    def add(self, x: np.ndarray, action: np.ndarray, ram: np.ndarray, game: int = 0,
+            layers: dict | None = None) -> None:
+        """One window: x [64, ...], action [64] (last is padding), ram [64, 2048], the stream's
+        game number, and its layered frames (each key [64, ...]) or None. Consecutive windows share
+        a frame: this window's frame 0 is the previous window's last frame."""
         first = 0 if not self.frames else 1
         self.frames += list(x[first:])
         self.ram += list(ram[first:])
+        if layers is not None:
+            self.layers += [{k: v[t] for k, v in layers.items()} for t in range(first, len(x))]
         self.actions += [int(a) for a in action[:-1]]
         self.game = game
         drop = len(self.frames) - self.KEEP
         if drop > 0:
-            del self.frames[:drop], self.ram[:drop], self.actions[:drop]
+            del self.frames[:drop], self.ram[:drop], self.actions[:drop], self.layers[:drop]
             self.start += drop
 
     @property
@@ -131,21 +139,29 @@ class Timeline:
             window_actions = np.array(self.actions[i:i + FRAMES - 1] + [self.actions[i + FRAMES - 2]])
             frames = np.stack(self.frames[i:i + FRAMES])
             level = int(ram[e - self.start, LEVEL])
-            found += [Instance(name, frames, window_actions, self.stream, self.game, level, f) for name in names]
+            layers = ({k: np.stack([self.layers[j][k] for j in range(i, i + FRAMES)]) for k in self.layers[i]}
+                      if self.layers else None)
+            found += [Instance(name, frames, window_actions, self.stream, self.game, level, f, layers)
+                      for name in names]
         self.scanned = max(self.scanned, last + 1)
         return found
 
 
 def live_instances(seed: int, workers: int = 8, repo: str | None = None):
-    """Endless scenario instances from fresh live streams, one per DataLoader worker."""
-    loader = DataLoader(WorldNesTetrisStreams(FRAMES, seed, repo), batch_size=None, num_workers=workers,
-                        persistent_workers=False, prefetch_factor=2)
+    """Endless scenario instances from fresh live layered streams, one per DataLoader worker: each window's
+    model frames composed from its layers (exact), so every model sees the same frames."""
+    loader = DataLoader(WorldNesTetrisStreams(FRAMES, seed, repo, layered=True), batch_size=None,
+                        num_workers=workers, persistent_workers=False, prefetch_factor=2)
     timelines: dict[int, Timeline] = {}
     for window in loader:
         stream = int(window["worker_id"])
+        layers = {k: np.asarray(v) for k, v in window["layers"].items()}
+        x = np.stack([model_frame(compose({k: v[t] for k, v in layers.items()}), layers["border"][t])
+                      for t in range(len(layers["camera"]))])
+        x = np.where(x == TRANSPARENT, 0, x).astype(np.uint8)
         timeline = timelines.setdefault(stream, Timeline(stream))
-        timeline.add(window["x"].numpy(), window["action"].numpy(), window["ram"].numpy(),
-                     int(window["in_game_restarts"]))
+        timeline.add(x, np.asarray(window["action"]), np.asarray(window["ram"]), int(window["in_game_restarts"]),
+                     layers)
         yield from timeline.instances()
 
 
@@ -172,7 +188,7 @@ def spread(instances, per_scenario: int, seconds: float, streams: int, clock=tim
 def score(real: np.ndarray, right: np.ndarray, same: np.ndarray) -> dict[str, float]:
     """real [64, 256, 256] window; for the generated frames CONTEXT..63, right [16, 256, 256] each pixel's
     probability of the real colour and same [16, 256, 256] its probability of the last context frame's colour
-    (the model is soft: models/dynamics.py) -> metrics, as expectations."""
+    (diagnostics/worlds.py rollout: a soft model's own, 0 or 1 for committed ones) -> metrics."""
     last = real[CONTEXT - 1]
     keep = np.ones((256, 256), bool)
     keep[:BAND], keep[256 - BAND:] = False, False
@@ -190,29 +206,13 @@ def score(real: np.ndarray, right: np.ndarray, same: np.ndarray) -> dict[str, fl
     return out
 
 
-@torch.no_grad()
-def evaluate(model, instances: list[Instance], palette: np.ndarray, batch: int = 16) -> tuple[list[dict], np.ndarray, np.ndarray]:
-    """Roll the model out on each instance -> (per-instance scores, its frames' expected colours [n, 16, 256,
-    256, 3] uint8, their pixels' probability of being wrong [n, 16, 256, 256] float16)."""
-    model.eval()
-    colours = torch.as_tensor(palette, dtype=torch.float32, device="cuda")
-    scores, rgb, wrong = [], [], []
-    for i in range(0, len(instances), batch):
-        group = instances[i:i + batch]
-        x = torch.from_numpy(np.stack([g.frames for g in group])).cuda()
-        a = incoming_actions(torch.from_numpy(np.stack([g.actions for g in group])).cuda())
-        right, same, shown = [], [], []
-        with torch.autocast("cuda", dtype=torch.bfloat16):
-            decoder = model.decoder(len(group), x.device)
-            decoder.prefill(x[:, :CONTEXT], a[:, :CONTEXT])
-            for at in range(CONTEXT, FRAMES):
-                probs = decoder.next(a[:, at:at + 1], at)["probs"].float()
-                right.append(probs.gather(-1, x[:, at, ..., None].long())[..., 0])
-                same.append(probs.gather(-1, x[:, CONTEXT - 1, ..., None].long())[..., 0])
-                shown.append((probs @ colours).round().clamp(0, 255).byte())
-        right, same = torch.stack(right, 1).cpu().numpy(), torch.stack(same, 1).cpu().numpy()
-        scores += [score(g.frames, r, s) for g, r, s in zip(group, right, same)]
-        rgb.append(torch.stack(shown, 1).cpu().numpy())
-        wrong.append((1 - right).astype(np.float16))
-    empty = (np.zeros((0, FRAMES - CONTEXT, 256, 256, 3), np.uint8), np.zeros((0, FRAMES - CONTEXT, 256, 256), np.float16))
-    return (scores, np.concatenate(rgb) if rgb else empty[0], np.concatenate(wrong) if wrong else empty[1])
+def evaluate(world, instances: list[Instance], batch: int = 16) -> tuple[list[dict], np.ndarray, np.ndarray]:
+    """Roll a World (diagnostics/worlds.py) out on each instance -> (per-instance scores, its frames' colours [n,
+    16, 256, 256, 3] uint8, their pixels' probability of being wrong [n, 16, 256, 256] float16)."""
+    frames = np.stack([g.frames for g in instances])
+    actions = incoming_actions(torch.from_numpy(np.stack([g.actions for g in instances]))).numpy()
+    layers = ({k: np.stack([g.layers[k] for g in instances]) for k in instances[0].layers}
+              if world.layered else None)
+    made, right, same = world.rollout(frames, actions, CONTEXT, layers, batch=batch)
+    scores = [score(g.frames, r.astype(np.float32), s.astype(np.float32)) for g, r, s in zip(instances, right, same)]
+    return scores, world.palette[made], (1 - right.astype(np.float32)).astype(np.float16)

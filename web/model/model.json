@@ -1,15 +1,23 @@
 {
  "cache": [
   8,
-  256,
+  543,
   4,
   64,
   24
  ],
  "frames": 64,
- "tokens": [
-  256,
+ "content": [
+  543,
   96
  ],
- "keep": 48
+ "keep": 48,
+ "inputs": [
+  "cells",
+  "cell_known",
+  "sprite_layer",
+  "border",
+  "backdrop"
+ ],
+ "parameters": 3029914
 }

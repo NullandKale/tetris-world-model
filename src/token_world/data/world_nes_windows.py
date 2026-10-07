@@ -17,6 +17,7 @@ import torch
 from torch.utils.data import get_worker_info
 
 from token_world.data.model_frames import model_index_frames
+from token_world.data.nes_layers import REGIONS, LayerCanvas
 
 
 class Session(Protocol):
@@ -45,7 +46,7 @@ def worker_seed(seed: int) -> tuple[int, int]:
 
 
 def world_nes_windows(rom: Path, session: Session, slots: np.ndarray, state: tuple[int, ...] | None,
-                      frames: int, new_frames: int, worker_id: int, toss=None) -> Iterator[dict]:
+                      frames: int, new_frames: int, worker_id: int, toss=None, layered: bool = False) -> Iterator[dict]:
     """Endless windows of `frames` consecutive observations, `new_frames` new ones each.
 
     slots: the game's three border shades (model_frames.border_slots); state:
@@ -56,10 +57,14 @@ def world_nes_windows(rom: Path, session: Session, slots: np.ndarray, state: tup
     where action[t] took frame t to t + 1 and the last entry repeats the one
     before it as padding; ram [frames, 2048] uint8, each frame's console RAM
     (for event detection, not training); tick = the last frame's counter.
+    layered: the window is the frames' layers instead (data/nes_layers.py, each key stacked [frames, ...])
+    under "layers", and no x (compose them for the picture).
     """
     from world_nes import Capture, RolloutPool, StreamSpec
     pool = RolloutPool([StreamSpec(rom)], workers=1, transitions=new_frames, mode="external",
-                       prefetch_batches=0, capture=Capture(frames="palette", ram=True))
+                       prefetch_batches=0, capture=Capture(frames="palette", ram=True,
+                                                           regions=REGIONS if layered else ()))
+    canvas = LayerCanvas() if layered else None
     buffer = pool.allocate_batch()
     addresses = list(state) if state else None
 
@@ -79,20 +84,29 @@ def world_nes_windows(rom: Path, session: Session, slots: np.ndarray, state: tup
                 raise RuntimeError("World NES segment changed inside a stream")
             if (np.diff(new_ids) != 1).any() or (ids is not None and new_ids[0] != ids[-1]):
                 raise RuntimeError("World NES frame IDs are not consecutive")
-            new_x = model_index_frames(record.frames[0], record.emphasis[0], new_ids, slots,
-                                       None if addresses is None else record.ram[0][:, addresses])
+            states = None if addresses is None else record.ram[0][:, addresses]
+            if layered:                             # the boundary observation was pushed with the last batch
+                start = 0 if ids is None else 1
+                new_x = [canvas.push({k: record.regions[k][0][i] for k in REGIONS}, int(new_ids[i]), slots,
+                                     None if states is None else states[i]) for i in range(start, len(new_ids))]
+                if ids is not None:
+                    new_x.insert(0, None)           # the held boundary's place
+            else:
+                new_x = model_index_frames(record.frames[0], record.emphasis[0], new_ids, slots, states)
             new_actions = record.actions[0, :, 0].astype(np.int64)
             new_ram = record.ram[0].copy()
             if ids is None:                         # the first observation is also the boundary
                 x, ram, ids, actions = new_x, new_ram, new_ids, new_actions
             else:                                   # the boundary observation is already held
-                x = np.concatenate([x, new_x[1:]])[-frames:]
+                x = (x + new_x[1:])[-frames:] if layered else np.concatenate([x, new_x[1:]])[-frames:]
                 ram = np.concatenate([ram, new_ram[1:]])[-frames:]
                 ids = np.concatenate([ids, new_ids[1:]])[-frames:]
                 actions = np.concatenate([actions, new_actions])[-(frames - 1):]
             if len(ids) < frames:
                 continue
-            window = {"x": torch.from_numpy(x), "action": torch.from_numpy(np.append(actions, actions[-1])),
+            pictures = ({"layers": {k: torch.from_numpy(np.stack([f[k] for f in x])) for k in x[0]}} if layered
+                        else {"x": torch.from_numpy(x)})
+            window = {**pictures, "action": torch.from_numpy(np.append(actions, actions[-1])),
                       "ram": torch.from_numpy(ram), "tick": int(ids[-1]),
                       "in_game_restarts": session.in_game_restarts, "worker_id": worker_id}
             if toss is not None:

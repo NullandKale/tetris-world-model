@@ -242,10 +242,11 @@ class SoftDecodingTests(unittest.TestCase):
     def test_cached_rollout_matches_the_full_window(self):
         model = tiny().eval()
         x, acts = window(2, 6, 6), torch.randint(0, 256, (2, 6))
-        tokens, unsure, wrong = rollout(model, x, acts, start=3)
+        tokens, unsure, wrong, drawn = rollout(model, x, acts, start=3)
         self.assertEqual(tokens.shape, (2, 3, 256, 32))
         self.assertEqual((unsure.shape, wrong.shape), ((2, 3), (2, 3)))
         self.assertTrue(((wrong > 0) & (wrong <= 1)).all())
+        self.assertIsNone(drawn)                                                   # no latent, no choices
         reference = soft_window(model, x)
         with torch.no_grad():
             for at in range(3, 6):                        # each frame from the real start and the soft frames
@@ -427,8 +428,6 @@ class LatentTests(unittest.TestCase):
     def test_the_latent_step_trains_its_choice_and_both_reads(self):
         import train_dynamics_ui as D
         model = tiny_latent()
-        with torch.no_grad():                                   # a sure posterior: KL above the free nats
-            model.posterior_out.weight.normal_(0, 3.0)
         optimizer = torch.optim.SGD(model.parameters(), lr=1.0)
         for step in range(2):                                   # the choice starts at zero: step 1 opens it
             x = window(2, 6, 41 + step)
@@ -441,6 +440,33 @@ class LatentTests(unittest.TestCase):
             optimizer.step()
         self.assertGreater(model.posterior_out.weight.grad.abs().sum().item(), 0)
         self.assertGreater(model.prior_out[0].weight.grad.abs().sum().item(), 0)
+        self.assertGreater(model.prior_query.grad.abs().sum().item(), 0)
+
+    def test_a_rollout_keeps_the_choices_it_drew(self):
+        model = tiny_latent().eval()
+        x, acts = window(2, 6, 44), torch.randint(0, 256, (2, 6))
+        drawn = rollout(model, x, acts, start=3)[3]
+        self.assertEqual(drawn.shape, (2, 3, 8))
+        self.assertTrue(torch.equal(drawn.view(2, 3, 2, 4).sum(-1), torch.ones(2, 3, 2)))   # one per group
+
+    def test_the_latent_trains_with_rollouts(self):
+        import train_dynamics_ui as D
+        model, drawer = tiny_latent(), tiny_latent().eval()
+        x = window(4, 6, 45)
+        losses = D.train_step(model, model, x, torch.randint(0, 256, (4, 6)), depth=3, blend=2,
+                              generator=torch.Generator().manual_seed(1), drawer=drawer)
+        for key in ("total", "latent_kl", "rollout_wrong"):
+            self.assertTrue(torch.isfinite(losses[key]), key)
+        losses["total"].backward()
+        self.assertGreater(model.prior_query.grad.abs().sum().item(), 0)
+
+    def test_the_prior_sees_the_incoming_buttons(self):
+        model = tiny_latent().eval()
+        features = torch.randn(1, model.grid ** 2, 32)
+        with torch.no_grad():
+            idle, start = model.prior(features, torch.tensor([0])), model.prior(features, torch.tensor([8]))
+        self.assertEqual(idle.shape, (1, 2, 4))
+        self.assertFalse(torch.allclose(idle, start))
 
     def test_a_dream_samples_its_choices(self):
         model = tiny_latent().eval()

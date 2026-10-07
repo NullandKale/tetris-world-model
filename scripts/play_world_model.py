@@ -3,21 +3,24 @@
     python scripts/play_world_model.py [--run output/world_model_tetris_base]
 
 The real game runs in World NES. Every frame one controller byte (your keys,
-or the bot) goes to both the console and the model (models/dynamics.py
-Dreamer). The dream starts from the last 48 real frames; after that it sees
-only the buttons. One model generates at a time; pick it in the toolbar.
+or the bot) goes to both the console and the model, any model: the pixel model
+or a layered one (diagnostics/worlds.py). The dream starts from the last 48
+real frames (and their layers); after that it sees only the buttons. One model
+generates at a time; pick it in the toolbar.
 
 A worker thread owns the console, the bot and the model, and composes real,
 dream and their difference into one image per frame; the UI copies that
 image to its canvas once per frame. Frames advance at up to the speed cap
 (60 = the NES), or as fast as the model generates.
 
-The dream is soft (models/dynamics.py): each pixel is a colour distribution,
-shown as its expected colour, and the difference panel shows how likely each
-pixel is to be wrong. The toolbar sets how many frames are kept when the
-window slides (a change starts a new dream) and the change weight, at once:
-the odds of every pixel change times it (models/dynamics.py weigh_changes),
-so an unsure piece is drawn with too many cells instead of thin ones.
+The pixel model's dream is soft (models/dynamics.py): each pixel is a colour
+distribution, shown as its expected colour, and the difference panel shows how
+likely each pixel is to be wrong. A layered model's dream is committed: its
+layers composed, and the difference panel shows the wrong pixels. The toolbar
+sets how many frames are kept when the window slides (a change starts a new
+dream) and the pixel model's change weight, at once: the odds of every pixel
+change times it (models/dynamics.py weigh_changes), so an unsure piece is drawn
+with too many cells instead of thin ones.
 
 Keys: arrows move and soft-drop, X / Z rotate, Enter is Start, Right Shift is
 Select. R restarts the dream from the real game, Space pauses, Esc quits.
@@ -46,7 +49,7 @@ from token_world.data.model_frames import BORDER_VERSION, GAME_ROWS
 from token_world.data.tetris_bot import A, B, DOWN, LEFT, RIGHT, SELECT, START, UP
 from token_world.data.nes_palette import tetris_palette
 from token_world.data.real_tetris import RealTetris
-from token_world.models.dynamics import Dreamer, Dynamics, load_run
+from token_world.diagnostics.worlds import World, load
 
 KEYS = {"Left": LEFT, "Right": RIGHT, "Down": DOWN, "Up": UP, "x": A, "X": A, "z": B, "Z": B,
         "Return": START, "Shift_R": SELECT}
@@ -55,12 +58,13 @@ BUTTON_NAMES = (("A", A), ("B", B), ("Select", SELECT), ("Start", START), ("Up",
 BG = "#15151c"
 
 
-MIN_STEPS = 40_000                              # long-trained runs only
+MIN_STEPS = 20_000                              # long-trained runs only
 
 
 def runs_with_checkpoints() -> list[Path]:
-    """Long-trained Tetris world-model runs (train_dynamics_ui.py) on the current frame layout: a
-    checkpoint, a run config naming the game and BORDER_VERSION, and at least MIN_STEPS steps."""
+    """Long-trained Tetris world-model runs (train_dynamics_ui.py, train_layered.py) on the current frame
+    layout: a checkpoint, a run config naming the game and BORDER_VERSION (or a layered model's), and at
+    least MIN_STEPS steps."""
     runs = []
     for checkpoint in (ROOT / "output").glob("*/model_latest.pt"):
         run = checkpoint.parent
@@ -68,7 +72,7 @@ def runs_with_checkpoints() -> list[Path]:
         if not (config.is_file() and metrics.is_file()):
             continue
         c = json.loads(config.read_text())
-        if c.get("border") != BORDER_VERSION or "tetris" not in c.get("games", []):
+        if (c.get("border") != BORDER_VERSION and c.get("kind") != "layered") or "tetris" not in c.get("games", []):
             continue
         last = metrics.read_text().strip().splitlines()[-1].split(",")[0]
         if last.isdigit() and int(last) >= MIN_STEPS:
@@ -76,10 +80,11 @@ def runs_with_checkpoints() -> list[Path]:
     return sorted(runs)
 
 
-def load_model(run: Path) -> tuple[Dynamics, str]:
-    model, saved = load_run(run)
-    params = sum(p.numel() for p in model.parameters()) / 1e6
-    return model, f"{run.name} @ step {saved['step']:,} ({params:.1f}M, EMA)"
+def load_model(run: Path) -> tuple[World, str]:
+    world = load(run)
+    params = sum(p.numel() for p in world.model.parameters()) / 1e6
+    kind = "layered, committed" if world.layered else "soft"
+    return world, f"{run.name} @ step {world.step:,} ({params:.1f}M, EMA, {kind})"
 
 
 class Composer:
@@ -115,6 +120,7 @@ class Engine(threading.Thread):
     def __init__(self, run: Path, keep: int, palette: np.ndarray, scale: int, seed: int):
         super().__init__(daemon=True)
         self.run_path, self.keep, self.seed = run, keep, seed
+        self.palette = palette
         self.colours = torch.as_tensor(palette, dtype=torch.float32, device="cuda")
         self.composer = Composer(palette, scale)
         self.commands: queue.Queue = queue.Queue()
@@ -124,7 +130,7 @@ class Engine(threading.Thread):
         self.version, self.image, self.stats = 0, None, {"status": "starting"}
         self.controller, self.paused, self.fps_cap, self.stopping = "you", False, 60, False
         self.change_weight = 1.0
-        self.model = self.dreamer = None
+        self.world = self.dreamer = None
         self.model_name = ""
 
     # -- called from the UI thread ------------------------------------------------------------
@@ -152,20 +158,21 @@ class Engine(threading.Thread):
         """Swap in another model; on failure keep the current one and say why."""
         self.publish(None, status=f"loading {run.name} ...")
         try:
-            model, name = load_model(run)
+            world, name = load_model(run)
         except Exception as exc:
             self.publish(None, status=f"could not load {run.name}: {exc}")
             return
-        self.model = self.dreamer = None
+        self.world = self.dreamer = None
         torch.cuda.empty_cache()
-        self.model, self.model_name, self.run_path = model, name, run
+        self.world, self.model_name, self.run_path = world, name, run
         self.restart()
 
     def restart(self) -> None:
-        """A new dream from the last CONTEXT real frames."""
-        frames, actions = self.real.context()
-        with torch.autocast("cuda", dtype=torch.bfloat16):
-            self.dreamer = Dreamer(self.model, frames, actions, self.keep, self.change_weight)
+        """A new dream from the last CONTEXT real frames (and their layers)."""
+        frames, actions = np.stack(self.real.frames), np.array(self.real.actions, np.int64)
+        layers = ({k: np.stack([f[k] for f in self.real.layers]) for k in self.real.layers[0]}
+                  if self.world.layered else None)
+        self.dreamer = self.world.dreaming(frames, actions, layers, self.keep, change_weight=self.change_weight)
         self.dreamed, self.wrong_sum = 0, 0.0
         self.publish(None, status="dreaming", model=self.model_name)
 
@@ -195,7 +202,7 @@ class Engine(threading.Thread):
     def run(self) -> None:
         try:
             self.publish(None, status="booting the game (the bot plays until a piece is falling) ...")
-            self.real = RealTetris(self.seed)
+            self.real = RealTetris(self.seed, layered=True)
             played = 0
             while not (played > 600 and self.real.playing()):
                 self.real.step(None)
@@ -210,11 +217,14 @@ class Engine(threading.Thread):
                     continue
                 started = time.monotonic()
                 frame, action = self.real.step(None if self.controller == "bot" else self.buttons())
-                with torch.autocast("cuda", dtype=torch.bfloat16):
-                    probs = self.dreamer.step(action).float()
-                real = torch.from_numpy(frame).cuda().long()
-                miss = (1 - probs.gather(-1, real[..., None])[..., 0]).cpu().numpy()
-                dream = (probs @ self.colours).round().clamp(0, 255).byte().cpu().numpy()
+                likely, probs = self.dreamer.step(action)
+                if probs is None:                                  # committed: wrong or not
+                    miss = (likely != frame).astype(np.float32)
+                    dream = self.palette[likely]
+                else:
+                    real = torch.from_numpy(frame).cuda().long()
+                    miss = (1 - probs.gather(-1, real[..., None])[..., 0]).cpu().numpy()
+                    dream = (probs @ self.colours).round().clamp(0, 255).byte().cpu().numpy()
                 image = self.composer.compose(frame, dream, miss)
                 wrong = float(miss[GAME_ROWS].mean())
                 self.dreamed += 1

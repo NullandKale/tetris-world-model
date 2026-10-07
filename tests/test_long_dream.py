@@ -29,6 +29,19 @@ def trial_with_piece(rows_per_frame: float = 0.25, respawn: int | None = None) -
     return Trial(frames[:48], np.zeros(48, np.int64), frames[48:], level=0)
 
 
+def trial_with_tetromino(cells=((0, 0), (1, 0), (2, 0), (2, 1))) -> Trial:
+    """An L of 7 x 7 blocks on the well's cell grid (x = 96 + 8 col, y = 56 + 8 row), falling a row every 8
+    frames from row 0."""
+    frames = np.zeros((48 + FUTURE, 256, 256), np.uint8)
+    for i in range(48, 48 + FUTURE):
+        drop = (i - 48) // 8
+        for r, c in cells:
+            if r + drop < 20:
+                y, x = 56 + 8 * (r + drop), 96 + 8 * (4 + c)
+                frames[i, y:y + 7, x:x + 7] = 9
+    return Trial(frames[:48], np.zeros(48, np.int64), frames[48:], level=0)
+
+
 def frozen(trial: Trial) -> np.ndarray:
     """A dream that holds the first future frame: the piece never moves."""
     return np.repeat(trial.future[:1], FUTURE, 0)
@@ -52,6 +65,18 @@ class LongDreamScoreTests(unittest.TestCase):
         out = score(trial, Dream.of_frames(trial, erased, PALETTE))
         self.assertEqual(out["piece_32"], 0.0)
         self.assertLess(out["wrong_32"], 0.02)                          # the wrong-pixel score hardly sees it
+        self.assertEqual((out["presence"], out["activation"]), (0.0, 0.0))     # the stall: nothing drawn
+
+    def test_a_wrong_piece_is_present_and_a_faint_one_active(self):
+        trial = trial_with_piece()
+        out = score(trial, Dream.of_frames(trial, frozen(trial), PALETTE))
+        self.assertEqual(out["presence"], 1.0)                          # wrong, but a piece to correct
+        self.assertAlmostEqual(out["activation"], 1.0, places=2)
+        dreamed = Dream.of_frames(trial, trial.future, PALETTE)
+        dreamed.filled = np.where(trial.future == 9, 0.2, dreamed.filled).astype(np.float16)  # a faint piece
+        out = score(trial, dreamed)
+        self.assertEqual(out["presence"], 0.0)
+        self.assertAlmostEqual(out["activation"], 0.2, places=2)
 
     def test_no_piece_score_once_the_real_piece_has_left_the_upper_playfield(self):
         trial = trial_with_piece(rows_per_frame=4)
@@ -66,6 +91,17 @@ class LongDreamScoreTests(unittest.TestCase):
         self.assertEqual(score(trial, dreamed)["piece_32"], 0.0)
         dreamed.filled = sure
         self.assertEqual(score(trial, dreamed)["piece_32"], 1.0)
+
+    def test_a_piece_keeps_its_shape_wherever_it_is_but_not_when_it_changes(self):
+        trial = trial_with_tetromino()
+        self.assertEqual(score(trial, Dream.of_frames(trial, trial.future, PALETTE))["shape"], 1.0)
+        self.assertEqual(score(trial, Dream.of_frames(trial, frozen(trial), PALETTE))["shape"], 1.0)   # misplaced
+        square = trial_with_tetromino(((0, 0), (0, 1), (1, 0), (1, 1)))                 # an O where an L falls
+        self.assertEqual(score(trial, Dream.of_frames(trial, square.future, PALETTE))["shape"], 0.0)
+        erased = np.zeros_like(trial.future)
+        self.assertEqual(score(trial, Dream.of_frames(trial, erased, PALETTE))["shape"], 0.0)
+        three = trial_with_tetromino(((0, 0), (1, 0), (2, 0)))                           # never a whole piece
+        self.assertTrue(np.isnan(score(three, Dream.of_frames(three, three.future, PALETTE))["shape"]))
 
     def test_a_frozen_piece_is_kept_but_neither_hits_nor_falls(self):
         trial = trial_with_piece()

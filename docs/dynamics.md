@@ -91,8 +91,10 @@ original small model, are in `recipe_attempts.md`. It replaces the exact-token m
   one-hot categoricals (DreamerV3), added to the frame's tokens like the action through a
   zero-initialised layer (`choice`), so a model grown from one without it starts identical. Training
   reads the choice from the real frame and the one before (`posterior`, straight-through samples) and
-  teaches `prior` to predict it from the previous frame's features (KL balancing 0.5 / 0.1, 1 free
-  nat); dreams sample it from the prior. Not in the ONNX export yet.
+  teaches `prior` to predict it from the previous frame's features, attention-pooled (a learned query
+  per group), and the frame's incoming buttons (KL balancing 0.5 / 0.1, no
+  free nats: with DreamerV3's 1 per frame the choice took over gravity and Start); dreams sample it
+  from the prior. Not in the ONNX export yet.
 - **Memory:** the 64-frame window is the only memory. It covers Tetris's
   slowest timer (48 frames per drop at level 0). Scrolling needs nothing
   special: attention reaches the shifted position in the previous frame, and a
@@ -568,6 +570,18 @@ Flash attention is not in the Windows PyTorch build; the memory-efficient
 kernel is used. That, and quadratic spatial attention, is why 8 px tokens cost
 4-5x more per frame.
 
+## Every model, every check
+
+Every check and app below takes any model, the pixel model or a layered one (`docs/guides/layered_tokens.md`),
+through one interface, `diagnostics/worlds.py`: `load(run or checkpoint)` gives a World that rolls batches of
+windows out from real context (`rollout`) or dreams one game live (`dreaming`). Its frames are model frames
+either way: the pixel model's soft (scores are expectations), a layered model's committed and composed from its
+layers (scores count pixels). The checks' streams are layered and their frames composed from the layers, exactly,
+so all models see the same frames. Each script takes run folders or checkpoint files and `--device cpu` while a
+run holds the GPU, and appends its summary with the checkpoint's step to the run folder (`scenarios.csv`,
+`event_checks.csv`; an archived checkpoint's to `output/<run>`), which the window's **Scenarios** tab shows, runs side
+by side.
+
 ## Scenario checks
 
 `scripts/tetris_scenarios.py <run> [<run> ...]` scores checkpoints on specific
@@ -594,7 +608,24 @@ Scores at +2, +8 and +16: event pixels wrong (of the pixels that really
 changed since the last context frame, the tick border and the random NEXT box
 excluded), playfield false changes (static playfield pixels the model
 changed), and exact (no wrong event pixel at +2). It writes `scenarios.csv`
-and one contact sheet per scenario to `output/scenarios/<time>/`.
+and one contact sheet per scenario to `output/scenarios/<time>/`, and each run's
+means to its run folder's `scenarios.csv`.
+
+## Event checks: restarts and line clears, followed to the end
+
+`scripts/event_checks.py <run> [<run> ...] [--checks restart line_clears]`: long events found live, each model
+dreaming them from real context fed the bot's real buttons (`World.follow`); sheets go to
+`output/event_checks/<time>/`.
+
+- `restart` (`diagnostics/restart.py`): a top-out, then the curtain, the menus and a new game, 320 frames from
+  the last 48 before the top-out. Whole-screen pixels wrong at milestones: `curtain` (4 frames before the level
+  menu), `menu` (16 into it), `play` and `play64` (8 and 63 frames into the new game), with copying the top-out
+  frame as the floor (`copy_menu`, `copy_play`).
+- `line_clears` (`diagnostics/line_clears.py`): from 10 frames before a clear starts, 60 frames: the animation,
+  the rows gone, the stack dropped. Scored on the well's cells (20 x 10, at x = 96 + 8 col, y = 56 + 8 row) at
+  the last frame: `full_rows` the dream keeps (0 in the real game), `cells_wrong`, and `mass` (filled cells over
+  the real game's: above 1, rows kept). Averaged over all clears and per size (single .. tetris). The scenario
+  checks score only a clear's first 16 frames.
 
 Events come from `data/tetris_events.py` (shared with window tossing).
 Measured while building it: the picture shows the RAM of the frame before
@@ -609,11 +640,10 @@ top-out; the level byte (0x44) steps at every 10 lines.
 model's dream side by side (real | dream | difference, drawn into one image
 and copied to the canvas once per frame), in lockstep, one generation at a
 time. You or the bot play; the model dreams from the last 48 real frames with
-the same buttons. It lists only long-trained runs (40,000+ steps, 10,000+
-with own guesses) and loads their averaged weights when the checkpoint has
-them.
+the same buttons. It lists only long-trained runs (20,000+ steps), pixel or
+layered, and loads their averaged weights.
 
-`scripts/long_dream_check.py [run ...]` checks that pieces fall and keep their
+`scripts/long_dream_check.py [run or checkpoint ...]` checks that pieces fall and keep their
 shape: at a fresh piece, nobody presses anything for 128 frames, and each
 model dreams the same 128 frames; 2 trials per start-level band (0-4, 5-9,
 10-14, 15-19). It prints playfield pixels wrong at +16/+32/+64/+128 and block
@@ -649,11 +679,20 @@ pixel count while its piece sat frozen at the spawn point.
 | `unseen_patch` | changed tokens whose exact 16 x 16 patch never occurs in real play (`diagnostics/coherence.py`) |
 | `unseen_change` | token changes (a patch, then the next frame's there) never seen in real play |
 | `change_px`, `unsure_px` | pixels changing per frame (frozen or flickering dreams), most likely colour under 0.9 |
+| `presence` | of the frames with a real piece in the upper playfield, the share in which the dream draws any piece (right or wrong) |
+| `activation` | the dream's expected block pixels there (however faint) over the real piece's |
+| `shape` | of the frames with one whole real piece (4 cells) in the well's top 11 rows, the share in which the dream holds the same cells, wherever they are (a swapped, garbled or erased piece scores 0) |
+
+`presence` and `activation` watch for the stall: trained toward fewer wrong pixels, a model can erase the pieces
+it is unsure of (an empty well is mostly right), and with nothing drawn where pieces fall it has no wrong piece
+left to correct toward a right one; it has to draw wrong pieces before right ones. The training window's status
+line warns when presence is under 0.25 or falls by more than 0.15 between tests (and says so when wrong pixels
+improve at the same time); the run viewer plots it with the piece scores and shows it in the Compare tab.
 
 The last four are generic: no game knowledge, and a different legal outcome (another piece, another
 place) scores as well as the real one, while blends, ghosts, half pieces and morphs do not. Training
-keeps the bank of real patches and changes from one window of every batch, hashed on the GPU, in the
-run folder (`patch_bank.npz`); the real future scores 0.5% / 0.1% against a 160k-frame bank.
+adds every history's window to the bank of real patches and changes every 16 steps, hashed on the
+GPU, and keeps it in the run folder (`patch_bank.npz`); the real future scores 0.5% / 0.1% against a 160k-frame bank.
 
 The play app's **change weight** multiplies the odds of every pixel change by w as it decodes
 (`weigh_changes`): an unsure piece is drawn with too many cells instead of four spread thin. It takes
