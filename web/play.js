@@ -5,7 +5,7 @@
 //   ?verbose              onnxruntime's own log, everything (node placements, ...)
 //   ?check                first dream the start with no buttons against PyTorch's frames (model/reference.bin)
 import * as ort from "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.30.0/dist/ort.webgpu.min.mjs";
-import { Dreamer, startFrames } from "./dreamer.js";
+import { Dreamer, GpuScreen, startFrames } from "./dreamer.js";
 import { setupEditor } from "./shot_editor.js";
 import { Timings, catchProfiles, findBackend, log, logged, profile, warn, watchDevice } from "./diagnostics.js";
 
@@ -24,8 +24,8 @@ const NAMES = [["A", A], ["B", B], ["Select", SELECT], ["Start", START], ["Up", 
 const FRAME_MS = 1000 / 60;
 
 const $ = (id) => document.getElementById(id);
-const screen = $("screen"), ctx = screen.getContext("2d"), image = ctx.createImageData(256, 256);
-let held = 0, paused = false, pending = Promise.resolve(), dreamer, context, backend, gpu = "";
+const screen = $("screen");
+let held = 0, paused = false, pending = Promise.resolve(), dreamer, context, backend, gpu = "", painter;
 let keyboard = 0;                                   // buttons held on the keyboard
 const touches = new Map();                          // on-screen button held by each pointer (finger, mouse)
 
@@ -35,13 +35,20 @@ const load = logged(async (name) => {
   return new Uint8Array(await response.arrayBuffer());
 });
 
-// A dreamed frame: each pixel's colour (Float32Array(65536 * 3)).
+// A dreamed frame (dreamer.next's colours, an ort.Tensor [256, 256, 3]) on the screen: on WebGPU drawn from the
+// GPU (GpuScreen; nothing read back), elsewhere through a 2D canvas. The caller disposes the tensor.
 function draw(rgb) {
-  const px = image.data;
-  for (let i = 0, o = 0; i < rgb.length; i += 3, o += 4) {
-    px[o] = rgb[i]; px[o + 1] = rgb[i + 1]; px[o + 2] = rgb[i + 2]; px[o + 3] = 255;
+  if (dreamer.device) {
+    painter ??= new GpuScreen(dreamer.device, screen);
+    painter.draw(rgb);
+    return;
   }
-  ctx.putImageData(image, 0, 0);
+  painter ??= { ctx: screen.getContext("2d") };
+  const image = painter.ctx.createImageData(256, 256), px = image.data, data = rgb.data;
+  for (let i = 0, o = 0; i < data.length; i += 3, o += 4) {
+    px[o] = data[i]; px[o + 1] = data[i + 1]; px[o + 2] = data[i + 2]; px[o + 3] = 255;
+  }
+  painter.ctx.putImageData(image, 0, 0);
 }
 
 function status(text, warn = false) {
@@ -85,12 +92,14 @@ async function check() {
     const slide = dreamer.content.length === dreamer.meta.frames;    // this step re-encodes the window first
     const began = performance.now();
     const frame = await dreamer.next(0);
+    draw(frame);
+    const colours = await frame.getData();                // read back: the check's only
+    frame.dispose();
     const took = performance.now() - began;
     ms += took;
     (slide ? slides : plain).push(took);
-    draw(frame);
     let differ = 0;
-    for (let j = 0; j < 65536 * 3; j++) differ += Math.abs(frame[j] - reference[i * 65536 * 3 + j]) > TOLERANCE;
+    for (let j = 0; j < 65536 * 3; j++) differ += Math.abs(colours[j] - reference[i * 65536 * 3 + j]) > TOLERANCE;
     if (differ && first < 0) first = i;
     wrong += differ;
     worst = Math.max(worst, differ);
@@ -117,6 +126,7 @@ async function run() {
     pending = dreamer.next(held);              // restart waits for it: never two runs on one cache
     const frame = await pending, drawing = performance.now();
     draw(frame);
+    frame.dispose();
     timings.add(dreamer.timing, performance.now() - drawing);
     if (PROFILE && frames + 1 === PROFILE_FRAMES) document.body.dataset.profile = profile(dreamer.sessions, dreamer.runs);
     const took = performance.now() - began;

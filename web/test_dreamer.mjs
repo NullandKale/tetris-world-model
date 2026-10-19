@@ -19,7 +19,7 @@ const dreamer = await Dreamer.create(ort, load, start, meta.actions, { execution
 const began = performance.now();
 let first = -1, wrong = 0, worst = 0;
 for (let i = 0; i < count; i++) {
-  const rgb = await dreamer.next(0);
+  const rgb = await (await dreamer.next(0)).getData();
   let differ = 0;
   for (let j = 0; j < SIZE; j++) differ += Math.abs(rgb[j] - reference[i * SIZE + j]) > TOLERANCE;
   if (differ && first < 0) first = i;
