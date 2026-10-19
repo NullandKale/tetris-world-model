@@ -894,9 +894,17 @@ the export script (onnxruntime, Python; 96 frames, 0 pixels differ, a window
 slide included), `web/test_dreamer.mjs` (`dreamer.js` on onnxruntime-node: as
 PyTorch), `tests/test_onnx.py` (small motion-first models, pixels and drawn
 motion, through a window slide), and `web/check_browser.mjs` (the page in
-Chrome with `?check`, or `--firefox`: as PyTorch; 2026-10-18 on the 3090: 41
-ms a step in the check, about 76 ms while playing, 13 frames/s; a step is
-about 2,400 kernels, onnxruntime-web's dispatch the limit).
+Chrome with `?check`, or `--firefox`: as PyTorch). Speed on the 3090
+(2026-10-18): the first export took 41 ms a step in the check (about 2,400
+kernels, 30 ms of GPU time); written out for the browser (`onnx_export.Graph`:
+queries and keys normalised and rotated together, each rotation one product
+with a fixed pairing matrix, the local bias gathered once for both passes from
+one offsets table) 32 ms (1,540 kernels, 25 ms of GPU time), and 25 MB of
+graphs instead of 35. While playing, the frames come in bursts and the driver
+drops the 3090 to 780 MHz after a few seconds, so a step settles near 76 ms
+(about 13 frames/s): GPU time, not dispatch, is the limit there. The temporal
+attention against each token's 64-frame cache (four small products a layer and
+pass) and the spatial attention are most of it.
 
 The page can also start from a picture ("Start from an image", `web/
 screenshot.js`): a screenshot, framed by its four corners and snapped to the

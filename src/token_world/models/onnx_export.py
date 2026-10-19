@@ -57,27 +57,25 @@ def first_max(scores: torch.Tensor) -> torch.Tensor:
     return (ranked >= ranked.amax(-1, keepdim=True)).float()
 
 
+def pairing(head_dim: int, pairs: int) -> torch.Tensor:
+    """[head_dim, head_dim]: z @ it holds, for each rotated pair of channels (i, pairs + i), -z[pairs + i] at i and
+    z[i] at pairs + i, and 0 on the channels not rotated, so a rotation by an angle is z * cos + (z @ it) * sin
+    (cos 1 and sin 0 where not rotated): one product and three element-wise kernels for queries and keys together,
+    where slicing the halves apart took about twenty a layer."""
+    out = torch.zeros(head_dim, head_dim)
+    i = torch.arange(pairs)
+    out[pairs + i, i] = -1.0
+    out[i, pairs + i] = 1.0
+    return out
+
+
 def rotation(times: torch.Tensor, head_dim: int) -> tuple[torch.Tensor, torch.Tensor]:
-    """Frames `times` [T] -> the cos and sin [T, 1, 1, head_dim / 2] that rotate their queries and keys
-    (dynamics.rotary's), made once for every layer of a pass."""
+    """Frames `times` [T] -> the cos and sin [T, 1, 1, 1, head_dim] that rotate their queries and keys
+    (dynamics.rotary's: channel pairs (i, head_dim / 2 + i)) with `pairing`, made once for every layer of a pass."""
     half = head_dim // 2
     angle = times.float()[:, None] * ROPE_BASE ** -(torch.arange(half, dtype=torch.float32) / half)
-    return angle.cos()[:, None, None], angle.sin()[:, None, None]
-
-
-def heads(layer, h: torch.Tensor, turn: tuple[torch.Tensor, torch.Tensor]):
-    """A temporal layer's queries, keys and values for h [T, n, d], rotated by `turn` (rotation) -> each [n,
-    heads, T, head_dim]."""
-    t, n, d = h.shape
-    q, k, v = layer.qkv(h).view(t, n, 3, layer.heads, d // layer.heads).unbind(2)
-    if layer.q_norm is not None:
-        q, k = layer.q_norm(q), layer.k_norm(k)
-    cos, sin = turn
-    half = q.shape[-1] // 2
-    rotate = lambda z: torch.cat((z[..., :half] * cos - z[..., half:] * sin,
-                                  z[..., :half] * sin + z[..., half:] * cos), -1)
-    each = lambda z: z.permute(1, 2, 0, 3)
-    return each(rotate(q)), each(rotate(k)), each(v)
+    angle = torch.cat((angle, angle), -1)[:, None, None, None]
+    return angle.cos(), angle.sin()
 
 
 def merge(layer, y: torch.Tensor) -> torch.Tensor:
@@ -86,8 +84,17 @@ def merge(layer, y: torch.Tensor) -> torch.Tensor:
     return layer.out(y.permute(2, 0, 1, 3).reshape(t, n, h * hd))
 
 
+def norm_eps(norm) -> float:
+    return norm.eps if norm.eps is not None else torch.finfo(torch.float32).eps
+
+
 class Graph(nn.Module):
-    """What the three graphs share: a frame's tokens from its content, motion and buttons, and the blocks."""
+    """What the three graphs share: a frame's tokens from its content, motion and buttons, and the blocks.
+
+    The attentions are the model's, written out for the browser's kernel count (each kernel costs a dispatch in
+    onnxruntime-web, which bounded a step at about 2,800 of them): queries and keys normalised together (QK-norm)
+    and rotated together (pairing: by frame in the temporal attention, by place in the spatial one, RoPE-Mixed's
+    angles fixed for the graph), and each layer's local bias gathered once for both of a step's passes."""
 
     def __init__(self, model: Dynamics):
         super().__init__()
@@ -97,6 +104,61 @@ class Graph(nn.Module):
         self.register_buffer("border", border.flatten()[:, None, None])                 # [N, 1, 1] the border rows
         self.register_buffer("codes", torch.arange(MOTION_CODES).float())
         self.register_buffer("still", F.one_hot(torch.tensor(MOTION_STILL), MOTION_CODES).float())
+        first = model.blocks[0]
+        self.heads_, self.head_dim = first.temporal.heads, first.temporal.qkv.in_features // first.temporal.heads
+        self.register_buffer("temporal_pairs", pairing(self.head_dim, self.head_dim // 2))
+        self.locals = first.spatial.local
+        if self.locals:                                   # one offsets table for every layer
+            self.register_buffer("offsets", first.spatial.offsets.clone())
+        for i, block in enumerate(model.blocks):
+            for kind, attn in (("s", block.spatial), ("t", block.temporal)):
+                if attn.q_norm is not None:               # [2, 1, head_dim]: the queries' and the keys' weights
+                    self.register_buffer(f"qk_{kind}{i}", torch.stack((attn.q_norm.weight, attn.k_norm.weight))[:, None])
+            spatial = block.spatial
+            if spatial.rope:                              # RoPE-Mixed at each token's place, [N, 1, heads, hd]
+                angle = torch.einsum("nc,hpc->nhp", model.place[0].float(), spatial.rope_freq.float())
+                pairs = angle.shape[-1]
+                cos, sin = torch.ones(angle.shape[0], self.heads_, self.head_dim), torch.zeros(angle.shape[0],
+                                                                                              self.heads_, self.head_dim)
+                cos[..., :pairs] = cos[..., pairs:2 * pairs] = angle.cos()
+                sin[..., :pairs] = sin[..., pairs:2 * pairs] = angle.sin()
+                self.register_buffer(f"space_cos{i}", cos[:, None])
+                self.register_buffer(f"space_sin{i}", sin[:, None])
+                self.register_buffer("space_pairs", pairing(self.head_dim, pairs))
+
+    def biases(self) -> list:
+        """Each layer's local bias [heads, N, N] (SpatialAttention), gathered once a graph; None without."""
+        return [block.spatial.local_bias[:, self.offsets] if self.locals else None for block in self.model.blocks]
+
+    def qk(self, i: int, kind: str, attn, x: torch.Tensor):
+        """An attention's queries and keys together [T, N, 2, heads, hd], normalised (QK-norm), and its values
+        [T, N, heads, hd], for x [T, N, d]."""
+        t, n, d = x.shape
+        qk, v = attn.qkv(x).view(t, n, 3, self.heads_, self.head_dim).split([2, 1], 2)
+        if attn.q_norm is not None:
+            qk = qk * torch.rsqrt(qk.pow(2).mean(-1, keepdim=True) + norm_eps(attn.q_norm)) * getattr(self, f"qk_{kind}{i}")
+        return qk, v.squeeze(2)
+
+    def heads(self, i: int, layer, h: torch.Tensor, turn: tuple[torch.Tensor, torch.Tensor]):
+        """A temporal layer's queries, keys and values for h [T, n, d], rotated by `turn` (rotation) -> each [n,
+        heads, T, head_dim]."""
+        qk, v = self.qk(i, "t", layer, h)
+        cos, sin = turn
+        qk = (qk * cos + (qk @ self.temporal_pairs) * sin).permute(2, 1, 3, 0, 4)       # [2, n, heads, T, hd]
+        return qk[0], qk[1], v.permute(1, 2, 0, 3)
+
+    def spatial(self, i: int, attn, x: torch.Tensor, bias) -> torch.Tensor:
+        """A block's spatial attention within each frame (SpatialAttention) for x [T, N, d]."""
+        t, n, d = x.shape
+        qk, v = self.qk(i, "s", attn, x)
+        if attn.rope:
+            qk = qk * getattr(self, f"space_cos{i}") + (qk @ self.space_pairs) * getattr(self, f"space_sin{i}")
+        qk = qk.permute(2, 0, 3, 1, 4)                                                    # [2, T, heads, N, hd]
+        scores = qk[0] @ qk[1].transpose(-1, -2) * self.head_dim ** -0.5
+        if bias is not None:
+            scores = scores + bias
+        y = scores.softmax(-1) @ v.transpose(1, 2)                                        # [T, heads, N, hd]
+        return attn.out(y.transpose(1, 2).reshape(t, n, d))
 
     def motion(self, picks: torch.Tensor) -> torch.Tensor:
         """Motion one-hots [..., N, cells, CODES] (all zero: not known) -> what they add to each token [..., N, dim]
@@ -113,10 +175,10 @@ class Graph(nn.Module):
         model = self.model
         return content + added + model.space_pos + (action[:, None] if model.action_blocks is None else 0)
 
-    def run(self, x: torch.Tensor, action: torch.Tensor, temporal) -> torch.Tensor:
-        """x [T, N, d] -> the model's features: each block's spatial attention within each frame, `temporal(i,
-        layer, normed)` (per token over frames), its MLP, the norms set by the buttons (action_norm); the final
-        norm (Block.forward)."""
+    def run(self, x: torch.Tensor, action: torch.Tensor, temporal, biases: list) -> torch.Tensor:
+        """x [T, N, d] -> the model's features: each block's spatial attention within each frame (its local bias
+        from `biases`), `temporal(i, layer, normed)` (per token over frames), its MLP, the norms set by the
+        buttons (action_norm); the final norm (Block.forward)."""
         model = self.model
         for i, block in enumerate(model.blocks):
             norms = (block.norm_s, block.norm_t, block.norm_m)
@@ -124,7 +186,7 @@ class Graph(nn.Module):
                 mods = block.modulation(action)[:, None].chunk(6, -1)                   # each [T, 1, d]
                 norms = tuple((lambda z, norm=norm, scale=mods[2 * j], shift=mods[2 * j + 1]:
                                norm(z) * (1 + scale) + shift) for j, norm in enumerate(norms))
-            x = x + block.spatial(norms[0](x), model.place)
+            x = x + self.spatial(i, block.spatial, norms[0](x), biases[i])
             x = x + temporal(i, block.temporal, norms[1](x))
             x = x + block.mlp(norms[2](x))
         return model.norm(x)
@@ -147,19 +209,19 @@ class PrefillGraph(Graph):
         action = model.action(button_bits(actions))
         x = self.tokens(content, self.motion(self.known(motion)), action)
         times = torch.arange(t)
-        turn = rotation(times, model.blocks[0].temporal.qkv.in_features // model.blocks[0].temporal.heads)
+        turn = rotation(times, self.head_dim)
         later = times[None, :] > times[:, None]
         causal = torch.zeros(t, t).masked_fill(later, float("-inf"))
         keys, values = [], []
 
         def temporal(i, layer, h):
-            q, k, v = heads(layer, h, turn)
+            q, k, v = self.heads(i, layer, h, turn)
             pad = (0, 0, 0, model.frames - t)
             keys.append(F.pad(k, pad).transpose(-1, -2))
             values.append(F.pad(v, pad))
             return merge(layer, F.scaled_dot_product_attention(q, k, v, attn_mask=causal))
 
-        self.run(x, action, temporal)
+        self.run(x, action, temporal, self.biases())
         return (*keys, *values)
 
 
@@ -174,7 +236,7 @@ class StepGraph(Graph):
         hidden = model.mask_token.expand_as(previous)
         positions = torch.arange(model.frames, dtype=at.dtype)
         earlier = torch.zeros(model.frames).masked_fill(positions >= at.view(()) - 1, float("-inf"))   # the cache's
-        head_dim = model.blocks[0].temporal.qkv.in_features // model.blocks[0].temporal.heads
+        head_dim, biases = self.head_dim, self.biases()
         scale = head_dim ** -0.5
         new_keys, new_values = [], []
 
@@ -186,13 +248,13 @@ class StepGraph(Graph):
         own = torch.tensor([[0.0, float("-inf")], [0.0, 0.0]])                          # the pair: causal
 
         def first(i, layer, h):
-            q, k, v = heads(layer, h, (cos, sin))                                         # [n, heads, 2, hd]
+            q, k, v = self.heads(i, layer, h, (cos, sin))                                       # [n, heads, 2, hd]
             new_keys.append(k[:, :, 0])                         # the previous frame's, for the cache at at - 1
             new_values.append(v[:, :, 0])
             weights = torch.cat((q @ keys[i] * scale + earlier, q @ k.transpose(-1, -2) * scale + own), -1).softmax(-1)
             return merge(layer, weights[..., :model.frames] @ values[i] + weights[..., model.frames:] @ v)
 
-        f = self.run(x, action, first)[1]
+        f = self.run(x, action, first, biases)[1]
         picks = first_max(model.motion_logits(f))                                         # [N, cells, CODES]
         picks = picks * (1 - self.border) + self.still * self.border                     # the border rows STILL
 
@@ -201,7 +263,7 @@ class StepGraph(Graph):
         now = (cos[1:], sin[1:])                                                          # the new frame's, at
 
         def second(i, layer, h):
-            q, k, v = heads(layer, h, now)                                                # [n, heads, 1, hd]
+            q, k, v = self.heads(i, layer, h, now)                                              # [n, heads, 1, hd]
             before_k, before_v = new_keys[i][:, :, None], new_values[i][:, :, None]       # [n, heads, 1, hd]
             weights = torch.cat((q @ keys[i] * scale + earlier, q @ before_k.transpose(-1, -2) * scale,
                                  q @ k.transpose(-1, -2) * scale), -1).softmax(-1)
@@ -209,7 +271,7 @@ class StepGraph(Graph):
             return merge(layer, weights[..., :f] @ values[i] + weights[..., f:f + 1] @ before_v
                          + weights[..., f + 1:] @ v)
 
-        f = self.run(x, action[1:], second)[0]
+        f = self.run(x, action[1:], second, biases)[0]
         probs = model.logits(f).float().softmax(-1)                                       # [N, P*P, COLOURS]
         g, p = model.grid, model.patch
         rgb = (first_max(probs) @ self.colours).view(g, g, p, p, 3).permute(0, 2, 1, 3, 4).reshape(SIZE, SIZE, 3)
