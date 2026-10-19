@@ -18,8 +18,9 @@
 // are stacked by GPU copies for a re-encode, and next() returns the frame's colours as a GPU tensor, which
 // GpuScreen draws: nothing comes back to the CPU. Reading the picture back each frame left the GPU idle while
 // the page waited, and the driver then lowered its clocks (an RTX 3090 fell to its 810 MHz memory clock after
-// about 150 steps: 70 ms a step instead of 24, 2026-10-18). At most one step is in flight ahead of the GPU, so
-// the buttons stay a frame from the screen. Elsewhere (WebAssembly, onnxruntime-node) every tensor is on the CPU.
+// about 150 steps: 70 ms a step instead of 24, 2026-10-18). At most IN_FLIGHT steps are queued ahead of the GPU,
+// so the buttons stay that many frames from the screen at most. Elsewhere (WebAssembly, onnxruntime-node) every
+// tensor is on the CPU.
 //
 // `ort` is passed in, so the same class runs on onnxruntime-web (browser) and onnxruntime-node (tests):
 // Dreamer.create(ort, load, start, actions, options), where load(name) resolves a model file's bytes and
@@ -29,6 +30,11 @@
 // WebGPU), write (the cache write) and encode (a window slide's re-encode, 0 when none); dreamer.runs counts each
 // graph's runs and dreamer.sessions holds them (diagnostics.js profile). options.log(text) hears each graph's
 // setup time.
+
+// Steps queued on the GPU before the next one waits: Firefox tells a step's work is done only on a coarse timer
+// (waiting for each one: 103 ms a step on a 3090 against 42 with two in flight), Chrome at once (25 against 23);
+// a third gained nothing in either (2026-10-18).
+const IN_FLIGHT = 2;
 
 export class Dreamer {
   static async create(ort, load, start, actions, { keep = null, executionProviders = ["webgpu"], sessionOptions = {},
@@ -59,7 +65,7 @@ export class Dreamer {
   }
 
   constructor(ort, meta, embed, prefill, step, keep, writer, device) {
-    Object.assign(this, { ort, meta, embed, prefill, step, keep, writer, device, cache: null, ahead: null });
+    Object.assign(this, { ort, meta, embed, prefill, step, keep, writer, device, cache: null, flight: [] });
     [this.n, this.dim] = meta.content;
     this.cells = meta.motion[1];
     this.sessions = { embed, prefill, step };
@@ -76,7 +82,7 @@ export class Dreamer {
 
   // Start again from the start's real frames and their incoming controller bytes (their motion not known).
   async reset(start, actions) {
-    await this.ahead;
+    await Promise.all(this.flight.splice(0));
     const { content } = await this.embed.run({ frames: new this.ort.Tensor("uint8", start.data, start.shape) });
     this.runs.embed++;
     const size = this.n * this.dim, cells = this.n * this.cells;
@@ -142,7 +148,7 @@ export class Dreamer {
       this.timing.encode = performance.now() - began;
       began = performance.now();
     }
-    await this.ahead;                                      // one step ahead of the GPU at most
+    if (this.flight.length >= IN_FLIGHT) await this.flight.shift();     // IN_FLIGHT steps ahead of the GPU at most
     const at = this.content.length;
     const int32 = (values) => new this.ort.Tensor("int32", Int32Array.from(values), [values.length]);
     const out = await this.step.run({
@@ -156,7 +162,7 @@ export class Dreamer {
     this.content.push(out.content);
     this.motion.push(out.motion);
     this.actions.push(action);
-    if (this.device) this.ahead = this.device.queue.onSubmittedWorkDone();
+    if (this.device) this.flight.push(this.device.queue.onSubmittedWorkDone());
     this.timing.run = ran - began;
     this.timing.write = performance.now() - ran;
     return out.rgb;

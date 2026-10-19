@@ -906,8 +906,12 @@ idle while the page waited, and the driver lowered its power state (P3 to P5:
 the 3090's memory clock from 5,001 to 810 MHz). So on WebGPU the dream stays on
 the GPU (`web/dreamer.js`): each frame's content and motion go to the next step
 as GPU buffers and are stacked by GPU copies for a re-encode, the picture is
-drawn from its GPU buffer (`GpuScreen`), and one step at most runs ahead of the
-GPU. Played for 30 s: 29-33 frames/s, the GPU held in P3 at 57-91% busy. Half
+drawn from its GPU buffer (`GpuScreen`), and two steps at most run ahead of the
+GPU (Firefox tells a step's work is done only on a coarse timer, about 100 ms:
+waiting for each step held it to 10 frames/s; two in flight, 21 frames/s in
+Firefox, headed: headless Firefox has no WebGPU on Windows; a third gained
+nothing). Chrome, played for 30 s with one in flight: 29-33 frames/s, the GPU
+held in P3 at 57-91% busy; with two, 38 frames/s. Half
 precision (onnxconverter-common, float32 inputs and outputs) changed nothing
 on the 3090 (63 against 61 ms a step in the slowed state; 3 colour values in
 96 frames differ from PyTorch), so the graphs stay float32.
