@@ -14,7 +14,7 @@ import torch
 import torch.nn as nn
 
 from token_world.data.nes_layers import BANDS, CELL
-from token_world.models.dynamics import HeadCrossEntropy
+from token_world.models.dynamics import HeadCrossEntropy, even_share
 from token_world.models.layered import (BORDER_TOKENS, CELLS, COLUMNS, FRAME_TOKENS, LayeredBase, LayeredDreamer,
                                         patches, unpatch)
 
@@ -78,5 +78,6 @@ class PixelLayers(LayeredBase):
         target = patches(layers["sprite_layer"].long()).flatten(-2)                    # [B, T, 240, 256]
         head = self.sprite_head()
         loss, _ = HeadCrossEntropy.apply(s[s_mask], head.weight, head.bias,
-                                         self.colour_table(), self.colour_bias, target[s_mask], chunk)
+                                         self.colour_table(), self.colour_bias, target[s_mask],
+                                         even_share(target[s_mask]), chunk)
         return {"sprites": loss}

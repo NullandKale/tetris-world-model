@@ -1,11 +1,11 @@
 """Dreaming from the exported ONNX graphs (models/onnx_export.py): numpy and onnxruntime, no PyTorch.
 
-OnnxDreamer does what the layered model's Dreamer (models/layered.py) does, as web/dreamer.js does in the
-browser: a start's real layered frames are embedded as their content and fill the cache, each step decodes the
-next frame for an action and returns its picture (rgb), its content and the previous frame's keys and values,
-which go into the cache in place; when the window is full the last `keep` frames' content is encoded again at
-positions 0..keep-1. The cache holds every frame but the last, which the next step reads as `previous` (one
-pass a frame, models/onnx_export.py).
+OnnxDreamer does what the pixel model's Dreamer (models/dynamics.py, one motion step) does, as web/dreamer.js does
+in the browser: a start's real frames are embedded as their content, their motion not known, and fill the cache;
+each step decodes the next frame for an action and returns its picture (rgb), its content, its motion and the
+previous frame's keys and values, which go into the cache in place; when the window is full the last `keep`
+frames (content, motion, actions) are encoded again at positions 0..keep-1. The cache holds every frame but the
+last, which the next step reads as `previous` (models/onnx_export.py).
 """
 from __future__ import annotations
 
@@ -17,10 +17,10 @@ import onnxruntime as ort
 
 
 class OnnxDreamer:
-    def __init__(self, folder: Path, layers: dict, actions: np.ndarray, keep: int | None = None,
+    def __init__(self, folder: Path, frames: np.ndarray, actions: np.ndarray, keep: int | None = None,
                  threads: int = 0, providers: list[str] | None = None):
-        """layers: the start's layered frames, each of model.json's inputs [T0, ...] uint8; actions [T0] the
-        incoming button bytes (-1 = none)."""
+        """frames: the start's real frames [T0, 256, 256] uint8 (palette indices); actions [T0] the incoming
+        button bytes (-1 = none)."""
         folder = Path(folder)
         meta = json.loads((folder / "model.json").read_text())
         self.window, self.prefilled, self.names = meta["frames"], meta["prefill"], meta["cache"]["names"]
@@ -33,17 +33,17 @@ class OnnxDreamer:
         session = lambda name: ort.InferenceSession(str(folder / name), options, providers=providers)
         self.embed, self.prefill, self.decode = session("embed.onnx"), session("prefill.onnx"), session("step.onnx")
         self.keep = keep
-        feeds = {name: np.asarray(layers[name]).astype(np.uint8) for name in meta["inputs"]}
-        self.content = list(self.embed.run(None, feeds)[0])
+        self.content = list(self.embed.run(None, {"frames": np.asarray(frames).astype(np.uint8)})[0])
+        self.motion = [np.full(meta["motion"], meta["unknown"], np.float32) for _ in self.content]
         self.actions = [int(a) for a in actions]
         self._encode()
 
     def _encode(self) -> None:
-        self.content, self.actions = self.content[-self.keep:], self.actions[-self.keep:]
+        self.content, self.motion, self.actions = (x[-self.keep:] for x in (self.content, self.motion, self.actions))
         t, pad = len(self.content) - 1, self.prefilled - (len(self.content) - 1)    # padded after the frames
-        content = np.concatenate([np.stack(self.content[:t]), np.zeros((pad, *self.content[0].shape), np.float32)])
-        actions = np.array(self.actions[:t] + [-1] * pad, np.int32)
-        cache = self.prefill.run(None, {"content": content, "actions": actions})
+        stacked = lambda xs: np.concatenate([np.stack(xs[:t]), np.zeros((pad, *xs[0].shape), np.float32)])
+        cache = self.prefill.run(None, {"content": stacked(self.content), "motion": stacked(self.motion),
+                                        "actions": np.array(self.actions[:t] + [-1] * pad, np.int32)})
         half = len(cache) // 2
         self.keys, self.values = cache[:half], cache[half:]               # each layer's [n, h, hd, F], [n, h, F, hd]
 
@@ -53,13 +53,15 @@ class OnnxDreamer:
         if len(self.content) == self.window:
             self._encode()
         at = len(self.content)
-        rgb, content, keys, values = self.decode.run(None, {
-            "previous": self.content[-1], "actions": np.array([self.actions[-1], action], np.int32),
-            "at": np.array([at], np.int32), **dict(zip(self.names, self.keys + self.values))})
+        rgb, content, motion, keys, values = self.decode.run(None, {
+            "previous": self.content[-1], "previous_motion": self.motion[-1],
+            "actions": np.array([self.actions[-1], action], np.int32), "at": np.array([at], np.int32),
+            **dict(zip(self.names, self.keys + self.values))})
         for cached, new in zip(self.keys, keys):                         # the previous frame, at at - 1
             cached[..., at - 1] = new
         for cached, new in zip(self.values, values):
             cached[..., at - 1, :] = new
         self.content.append(content)
+        self.motion.append(motion)
         self.actions.append(action)
         return rgb

@@ -8,8 +8,8 @@ Every step: one window from each of --workers live histories (World NES with the
 RAM-reading bot, scripts/train_dynamics_ui.py's window stride), MaskGIT masking over the layered tokens
 (the camera never hidden), the layered losses (background and border pixels, sprite-picture pixels,
 backdrop, the next frame's camera). Averaged weights (EMA) as the old trainer. Every --checkpoint-every steps
-metrics.csv and model_latest.pt; every --long-dream-every steps the 32 long-dream trials (layered
-contexts) dreamed and composed into model frames, scored as every run before (long_dream.csv: the Tetris
+metrics.csv and model_latest.pt; every --long-dream-every steps the long-dream trials (layered
+contexts; 32 with no buttons, 32 with the bot's buttons) dreamed and composed into model frames, scored as every run before (long_dream.csv: the Tetris
 scores and the generic coherence scores), and the checkpoint archived. output/stop_training stops it
 cleanly. This is the base stage (masked training); rollouts come next (docs/guides/layered_tokens.md).
 """
@@ -30,17 +30,19 @@ from torch.utils.data import DataLoader
 ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT / "src"), str(ROOT / "scripts")]
 
-from token_world.data.live_batches import LiveBatches
+from token_world.data.live_batches import LiveBatches, data_fields
 from token_world.data.nes_layers import TRANSPARENT, compose, model_frame
 from token_world.data.nes_palette import tetris_palette
-from token_world.data.world_nes_tetris import WorldNesTetrisStreams
+from token_world.data.world_nes_tetris import DATA_NAMES, KEEP_ALL, WORLD_MODEL, WorldNesTetrisStreams, spawn_boards
+from token_world.diagnostics.novelty import Novelty
 from token_world.diagnostics import bias
 from token_world.diagnostics.coherence import PatchBank
 from token_world.diagnostics.coherence import score as coherence
-from token_world.diagnostics.long_dream import TrialStream, animation, dream_layered, score
+from token_world.diagnostics.long_dream import animation, dreams_layered, score, stacked
 from token_world.diagnostics.long_dream import sheet as dream_sheet
 from token_world.diagnostics.run_outputs import (HORIZONS, append_long_dream, horizon_fields, horizon_outputs,
-                                               open_metrics, replace, save_gif, write_horizon_curve)
+                                               load_optimizer, open_metrics, optimizer_state, replace, save_gif,
+                                               write_horizon_curve)
 from token_world.models.dynamics import incoming_actions, own_share
 from token_world.models.layered import OPTIONS, build, rollout
 from train_dynamics_ui import (BANK_EVERY, EMA_DECAY, LONG_DREAM_EVERY, LONG_DREAM_TRIALS, STOP_FILE, WINDOW_STRIDE,
@@ -51,19 +53,8 @@ PARTS = ("cells", "sprites", "sprite_flags", "sprite_move", "sprite_place", "spr
 FIELDS = ["step", "seconds", "lr", "train_loss", *(f"train_loss_{p}" for p in PARTS), "masked_fraction",
           "rollout_depth", "rollout_frames", "blend_frames",
           "data_wait_ms_mean", "data_wait_ms_max", "stream_tick_min", "stream_tick_max", "in_game_restarts",
+          *data_fields(DATA_NAMES),
           *horizon_fields(("tetris",))]
-
-
-class LayeredLongDreams(LongDreams):
-    """LongDreams with layered contexts (the same games for the same seed)."""
-
-    def __init__(self, seed: int):
-        import queue
-        import threading
-        self.ready = queue.Queue(maxsize=2 * LONG_DREAM_TRIALS)
-        loader = DataLoader(TrialStream(seed, layered=True), batch_size=None, num_workers=1, persistent_workers=True,
-                            worker_init_fn=background_priority, prefetch_factor=2)
-        threading.Thread(target=self._fill, args=(iter(loader),), daemon=True, name="long-dream-trials").start()
 
 
 def window_frames(layers: dict, i: int = 0) -> np.ndarray:
@@ -107,24 +98,37 @@ def preview(model, layers: dict, incoming: torch.Tensor, out: Path, temperature:
     return m
 
 
-def long_dream_test(model, trials, palette, bank, out: Path, step: int, temperature: float, steps: int = 1) -> dict:
-    rows, first, likely = [], None, []
-    variant = f"layered t={temperature:g}" + (f", {steps} passes" if steps > 1 else "")
-    for i, trial in enumerate(trials):
-        dreamed = dream_layered(model, trial, palette, temperature, seed=i, steps=steps)
-        rows.append({"step": step, "variant": variant, "level": trial.level,
-                     **score(trial, dreamed), **coherence(bank, trial.context[-1], dreamed.likely, dreamed.sure)})
-        likely.append(dreamed.likely)
-        first = first or dreamed
-    picks = bias.write(out, step, variant, [np.asarray(t.future) for t in trials], likely,
-                       [np.asarray(t.context) for t in trials])
-    append_long_dream(out, rows)
-    save_gif(animation(trials[0], {"layered": first}, palette), out / "long_dream.gif", 60)
+def variants(temperature: float) -> tuple[str, str]:
+    """long_dream.csv's variant names: no buttons, the bot's buttons."""
+    return f"layered t={temperature:g}", f"buttons t={temperature:g}"
+
+
+def long_dream_test(model, sets: dict[str, list], palette, bank, out: Path, step: int, temperature: float,
+                    steps: int = 1) -> dict:
+    """Dream each variant's trials (variants: no buttons, the bot's buttons) -> {variant: mean scores}; writes
+    long_dream.csv, bias.csv and long_dream.gif/.png (each variant's first trial, one above the other)."""
+    means, gifs, sheets = {}, [], []
+    for variant, trials in sets.items():
+        rows, likely = [], []
+        for i, (trial, dreamed) in enumerate(zip(trials, dreams_layered(model, trials, palette, temperature,
+                                                                        steps=steps))):
+            rows.append({"step": step, "variant": variant, "level": trial.level,
+                         **score(trial, dreamed), **coherence(bank, trial.context[-1], dreamed.likely, dreamed.sure)})
+            likely.append(dreamed.likely)
+            if i == 0:
+                gifs.append(animation(trial, {"layered": dreamed}, palette))
+                sheets.append(dream_sheet(trial, {"layered": dreamed}, palette))
+        picks = bias.write(out, step, variant, [np.asarray(t.future) for t in trials], likely,
+                           [np.asarray(t.context) for t in trials])
+        append_long_dream(out, rows)
+        means[variant] = {**{k: float(np.nanmean([r[k] for r in rows]))
+                             for k in rows[0] if k not in ("step", "variant", "level")},
+                          **{f"bias_{k}": v for k, v in picks.items() if k not in ("step", "variant")}}
+    save_gif(stacked(*gifs), out / "long_dream.gif", 60)
     temporary = out / "long_dream.tmp.png"
-    dream_sheet(trials[0], {"layered": first}, palette).save(temporary)
+    stacked(*sheets).save(temporary)
     replace(temporary, out / "long_dream.png")
-    return {**{k: float(np.nanmean([r[k] for r in rows])) for k in rows[0] if k not in ("step", "variant", "level")},
-            **{f"bias_{k}": v for k, v in picks.items() if k not in ("step", "variant")}}
+    return means
 
 
 def train_step(model, forward, layers: dict, incoming: torch.Tensor, depth: int = 0, blend: int = 0,
@@ -180,34 +184,6 @@ def train_step(model, forward, layers: dict, incoming: torch.Tensor, depth: int 
     return losses
 
 
-def optimizer_state(optimizer, names: list[str]) -> dict:
-    """The optimizer's state with each parameter's name (its order in the optimizer's groups): a resume matches
-    the state to parameters by name, so the model's code may register them in another order."""
-    return {**optimizer.state_dict(), "names": names}
-
-
-def load_optimizer(optimizer, saved: dict, names: list[str]) -> None:
-    """optimizer_state's dict -> the optimizer, each parameter's state by name (the groups' settings, as the
-    learning rate, as saved). A state saved without names is matched by position (it must have the same
-    order: a mismatch is an error, not a silent swap)."""
-    if "names" in saved:
-        where = {n: i for i, n in enumerate(saved["names"])}
-        missing = [n for n in names if n not in where]
-        if missing:
-            raise ValueError(f"the saved optimizer has no state for {missing[:5]}")
-        groups = optimizer.state_dict()["param_groups"]
-        for group, old in zip(groups, saved["param_groups"]):
-            group.update({k: v for k, v in old.items() if k != "params"})
-        saved = {"state": {i: saved["state"][where[n]] for i, n in enumerate(names) if where[n] in saved["state"]},
-                 "param_groups": groups}
-    params = [q for g in optimizer.param_groups for q in g["params"]]
-    for i, state in saved["state"].items():
-        if state["exp_avg"].shape != params[i].shape:
-            raise ValueError(f"optimizer state {i} is {tuple(state['exp_avg'].shape)}, its parameter "
-                             f"{names[i]} {tuple(params[i].shape)}: saved in another parameter order")
-    optimizer.load_state_dict(saved)
-
-
 def train(args, events: queue.Queue, stop: threading.Event) -> None:
     """The training loop, on the window's worker thread (ui/dynamics_app.py): Stop Training or
     output/stop_training stops it; events update the window's status line and refresh its tabs."""
@@ -250,12 +226,14 @@ def train(args, events: queue.Queue, stop: threading.Event) -> None:
         parameters = sum(q.numel() for q in model.parameters())
 
         stream_seed = args.seed + step
-        stream = WorldNesTetrisStreams(args.frames, stream_seed, stride=WINDOW_STRIDE, layered=True)
+        stream = WorldNesTetrisStreams(args.frames, stream_seed, stride=WINDOW_STRIDE, layered=True,
+                                       screens=WORLD_MODEL, toss=KEEP_ALL)
         batches = LiveBatches(DataLoader(stream, batch_size=None, num_workers=args.workers, pin_memory=True,
                                          persistent_workers=True, worker_init_fn=background_priority, prefetch_factor=2),
-                              args.workers, stream.new_frames)
+                              args.workers, stream.new_frames, novelty=Novelty(spawn_boards))
         trial_seed = int(np.random.SeedSequence([args.seed, 0]).generate_state(1)[0])
-        trials = LayeredLongDreams(trial_seed % 100_000)
+        trials = {v: LongDreams(trial_seed % 100_000, layered=True, pressed=pressed)   # the same games: pressed
+                  for v, pressed in zip(variants(args.temperature), (False, True))}   # ones play on
         palette = tetris_palette().numpy().astype(np.uint8)
         bank_path = args.out / "patch_bank.npz"
         bank = PatchBank.load(bank_path if bank_path.is_file() else args.bank) if (bank_path.is_file() or args.bank) \
@@ -332,8 +310,8 @@ def train(args, events: queue.Queue, stop: threading.Event) -> None:
                     averaged.load_state_dict(dict(zip(model.state_dict(), ema)))
                     bank.save(bank_path)
                     dream_started = time.monotonic()
-                    r = long_dream_test(averaged, trials.take(LONG_DREAM_TRIALS), palette, bank, args.out, step,
-                                        args.temperature, args.dream_steps)
+                    summary = long_dream_test(averaged, {v: d.take(LONG_DREAM_TRIALS) for v, d in trials.items()},
+                                              palette, bank, args.out, step, args.temperature, args.dream_steps)
                     target = args.archive / args.out.name / f"model_step{step}.pt"
                     try:
                         target.parent.mkdir(parents=True, exist_ok=True)
@@ -341,18 +319,19 @@ def train(args, events: queue.Queue, stop: threading.Event) -> None:
                     except OSError as exc:
                         print(f"could not archive step {step}: {exc}", flush=True)
                     torch.cuda.empty_cache()
-                    print(f"layered step={step} long dream: wrong +16/+128 {r['wrong_16']:.2%}/{r['wrong_128']:.2%} "
-                          f"mass {r['mass']:.2f} presence {r['presence']:.2f} activation {r['activation']:.2f} "
-                          f"hit {r['piece_hit_32']:.2f} ghost {r['piece_ghost_32']:.2f} "
-                          f"fall {r['fall']:.2f} spawn {r['spawn']:.2f} timer wrong +16/+128 "
-                          f"{r['timer_wrong_16']:.2%}/{r['timer_wrong_128']:.2%} unseen patch/change "
-                          f"{r['unseen_patch']:.2%}/{r['unseen_change']:.2%} next pieces chosen "
-                          f"{r['bias_choices_dream']:.0f} ({r['bias_types_dream']:.0f} types, top share "
-                          f"{r['bias_top_share_dream']:.2f}; real {r['bias_choices_real']:.0f}, "
-                          f"{r['bias_types_real']:.0f} types) mix distance {r['bias_type_distance']:.2f} "
-                          f"garbled {r['bias_garbled']:.0%} ({time.monotonic() - dream_started:.0f} s)",
-                          flush=True)
-                    events.put(("longdream", "layered", step, {f"t={args.temperature:g}": r}))
+                    for v, r in summary.items():
+                        print(f"layered step={step} long dream, {v}: wrong +16/+128 {r['wrong_16']:.2%}/{r['wrong_128']:.2%} "
+                              f"mass {r['mass']:.2f} presence {r['presence']:.2f} activation {r['activation']:.2f} "
+                              f"hit {r['piece_hit_32']:.2f} ghost {r['piece_ghost_32']:.2f} "
+                              f"fall {r['fall']:.2f} spawn {r['spawn']:.2f} timer wrong +16/+128 "
+                              f"{r['timer_wrong_16']:.2%}/{r['timer_wrong_128']:.2%} unseen patch/change "
+                              f"{r['unseen_patch']:.2%}/{r['unseen_change']:.2%} next pieces chosen "
+                              f"{r['bias_choices_dream']:.0f} ({r['bias_types_dream']:.0f} types, top share "
+                              f"{r['bias_top_share_dream']:.2f}; real {r['bias_choices_real']:.0f}, "
+                              f"{r['bias_types_real']:.0f} types) mix distance {r['bias_type_distance']:.2f} "
+                              f"garbled {r['bias_garbled']:.0%} ({time.monotonic() - dream_started:.0f} s)",
+                              flush=True)
+                    events.put(("longdream", "layered", step, summary))
                 if args.seconds > 0 and time.monotonic() - started >= args.seconds:
                     break
         finally:
@@ -374,6 +353,11 @@ def main() -> None:
     p.add_argument("--model", choices=("pixels", "slots"), default="pixels",
                    help="the sprites as a picture (models/layered_pixels.py) or as the 64 OAM slots "
                         "(models/layered_slots.py); a resumed run keeps the model it was started with")
+    p.add_argument("--dream-steps", type=int, default=1,
+                   help="slots: the passes over which a dream decides the sprites, the surest first (previews, "
+                        "long dreams and rollouts)")
+    p.add_argument("--action-norm", action="store_true",
+                   help="the buttons condition every block's norms, adaptive LayerNorm (models/layered.py LayeredBlock)")
     p.add_argument("--registers", type=int, default=0,
                    help="learned tokens per frame with no target (models/layered.py; a resumed run keeps its own)")
     p.add_argument("--space-rope", action="store_true",
@@ -382,11 +366,8 @@ def main() -> None:
                    help="a game whose camera never moves (Tetris): no camera tokens or camera head (models/layered.py)")
     p.add_argument("--share-pixels", action="store_true",
                    help="pixels: the sprite picture shares the cells' patch and pixel head (models/layered_pixels.py)")
-    p.add_argument("--dream-steps", type=int, default=1,
-                   help="slots: the passes over which a dream decides the sprites, the surest first (previews, "
-                        "long dreams and rollouts)")
     p.add_argument("--out", type=Path, default=None,
-                   help="the run folder (default output/world_model_tetris_layered_px, or _slots for --model slots)")
+                   help="the run folder (default output/world_model_tetris_layered_px)")
     p.add_argument("--archive", type=Path, default=Path("D:/token_world_checkpoints"))
     p.add_argument("--bank", type=Path, default=None, help="a patch_bank.npz to start the coherence bank from")
     p.add_argument("--dim", type=int, default=96)
@@ -422,10 +403,10 @@ def main() -> None:
     p.add_argument("--close-when-done", action="store_true",
                    help="close the window after training finishes or fails (unattended runs)")
     args = p.parse_args()
-    if args.blend and not args.rollouts:
-        p.error("--blend blends rollouts: it needs --rollouts")
     if args.share_pixels and args.model != "pixels":
         p.error("--share-pixels shares the sprite picture's head: it needs --model pixels")
+    if args.blend and not args.rollouts:
+        p.error("--blend blends rollouts: it needs --rollouts")
     if args.cooldown and not args.steps:
         args.steps = sum(args.cooldown)
     if args.out is None:

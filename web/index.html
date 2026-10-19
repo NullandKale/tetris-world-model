@@ -46,6 +46,14 @@
   .ab { display: flex; gap: 12px; align-items: flex-end; }
   .ab button { width: 64px; height: 64px; border-radius: 50%; font-size: 20px; }
   .ab [data-bit="1"] { margin-bottom: 24px; }
+  /* start from an image: the picture with its corners, and what the model will see */
+  #shot[hidden] { display: none; }
+  #shot { display: flex; flex-direction: column; gap: 10px; }
+  .shots { display: flex; gap: 12px; flex-wrap: wrap; align-items: flex-start; }
+  .shots canvas { aspect-ratio: auto; border-radius: 4px; }
+  #shot-src { max-width: 100%; touch-action: none; cursor: crosshair; image-rendering: auto; }
+  #shot-out { width: min(100%, 384px); cursor: pointer; }
+  .hint { color: var(--muted); margin: 0; }
   @media (max-width: 420px) {                         /* phones: the whole controller fits the width */
     .dpad { grid-template-columns: repeat(3, 44px); grid-template-rows: repeat(3, 44px); }
     .menu button { width: 56px; }
@@ -77,6 +85,7 @@
       <div class="card row">
         <button id="restart">Restart</button>
         <button id="pause">Pause</button>
+        <button id="from-image">Start from an image</button>
       </div>
       <div class="card">
         <div class="keys">
@@ -86,6 +95,25 @@
         </div>
         <div id="held"></div>
       </div>
+    </div>
+  </div>
+  <div class="card" id="shot" hidden>
+    <p class="hint">Choose, drop or paste a picture: a Tetris screenshot (any size, even a photo of a screen) or any
+      image at all. Drag the four corners onto the game screen. On the right is what the model will see.</p>
+    <div class="row">
+      <input type="file" id="shot-file" accept="image/*">
+      <label><input type="checkbox" id="shot-overscan"> picture includes the overscan (240 lines)</label>
+      <label><input type="checkbox" id="shot-levels" checked> auto levels</label>
+    </div>
+    <div class="shots">
+      <canvas id="shot-src" width="512" height="384" aria-label="The picture and its corners"></canvas>
+      <canvas id="shot-out" width="256" height="240" aria-label="The picture as the model will see it"></canvas>
+    </div>
+    <div class="row">
+      <button id="shot-play" disabled>Play from this</button>
+      <button id="shot-normal">Back to the normal start</button>
+      <button id="shot-close">Close</button>
+      <span id="shot-status" class="hint"></span>
     </div>
   </div>
 </main>

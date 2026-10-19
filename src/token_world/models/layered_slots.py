@@ -5,8 +5,12 @@ A sprite slot's token holds its 8 x 8 pixels, its screen x and y and its flags (
 Masked slots predict their flags, their movement since the last frame in x and y (MOVE_CLASSES: -MOVE..MOVE
 pixels, or JUMP, then the absolute position from the place heads) and their pixels. Movement and presence
 are categories, so a dream commits to one value of each (snapping): the sprites are decided over `steps`
-passes, the surest first, so a piece's cells can agree on one movement. The idea of 2026-10-06, first run
-without a working clock (its time was one learned embedding per window slot) and retried with rotary time
+passes, the surest first, so a piece's cells can agree on one movement; with `objects` (motion compensation
+per object, 2026-10-09) the sprites that touched in the last frame are one object, and the object draws one
+presence and one movement from its sprites' summed log-probabilities, so it cannot come apart. The idea of 2026-10-06, run once
+without a working clock (its time was one learned embedding per window slot), retried with rotary time and
+dropped at 14k (2026-10-07: ghosts grew, the clock never came), and brought back on 2026-10-09 with the buttons
+conditioning every block (action_norm), which took the pixel model's ghosts from 0.62 to 0
 (docs/guides/recipe_attempts.md).
 """
 from __future__ import annotations
@@ -18,12 +22,33 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from token_world.data.nes_layers import BANDS, LAYER_COLOURS, LINES, SPRITE, SPRITES, TRANSPARENT, WIDTH
-from token_world.models.dynamics import HeadCrossEntropy
+from token_world.models.dynamics import HeadCrossEntropy, even_share
 from token_world.models.layered import (BORDER_TOKENS, CELLS, FRAME_TOKENS, JUMP, MOVE, MOVE_CLASSES, LayeredBase,
                                         LayeredDreamer, choose, mean_ce, move_class)
 
 TOKENS = CELLS + SPRITES + BANDS + FRAME_TOKENS + BORDER_TOKENS          # 367
 FLAG_CLASSES = 4                                        # sprite_flags: 0 off, 1 in front, 3 behind
+
+
+def objects_of(xy: torch.Tensor, on: torch.Tensor, rounds: int = 16) -> torch.Tensor:
+    """Sprites shown (on [B, S]) at xy [B, S, 2] -> each one's object [B, S]: the lowest slot among the sprites
+    it is joined to, sprite to sprite, by touching (at most a sprite apart in x and in y: edge to edge or corner
+    to corner, as a piece's or a character's sprites sit). A sprite not shown is its own object."""
+    b, s = on.shape
+    near = ((xy[:, :, None] - xy[:, None]).abs() <= SPRITE).all(-1) & on[:, :, None] & on[:, None]   # [B, S, S]
+    label = torch.arange(s, device=xy.device).expand(b, s)
+    for _ in range(rounds):                     # the lowest label spreads one touch further each round
+        label = torch.minimum(label, torch.where(near, label[:, None, :], s).amin(-1))
+    return label
+
+
+def per_object(log_probs: torch.Tensor, label: torch.Tensor, temperature: float,
+               generator: torch.Generator | None) -> torch.Tensor:
+    """Per-sprite log-probabilities [B, S, ..., C] and objects [B, S] -> one class per object, drawn from the
+    sum of its sprites' log-probabilities (they must agree), given to each sprite [B, S, ...]."""
+    index = label.view(*label.shape, *[1] * (log_probs.dim() - 2)).expand_as(log_probs)
+    summed = torch.zeros_like(log_probs).scatter_add_(1, index, log_probs)
+    return choose(summed, temperature, generator).gather(1, index[..., 0])
 
 
 class SlotDreamer(LayeredDreamer):
@@ -41,6 +66,7 @@ class SlotDreamer(LayeredDreamer):
         probs_d = torch.zeros(b, SPRITES, SPRITE * SPRITE, LAYER_COLOURS, device=self.device)
         off = F.one_hot(torch.tensor(TRANSPARENT, device=self.device), LAYER_COLOURS).float()
         limit = torch.tensor([WIDTH - 1, LINES - 1], device=self.device)
+        label = objects_of(prev_xy, prev_on) if self.objects else None
         for step in range(self.steps):
             frame["sprite_flags"] = flags_d.to(last["sprite_flags"].dtype)
             frame["sprite_xy"] = xy_d.to(last["sprite_xy"].dtype)
@@ -53,9 +79,12 @@ class SlotDreamer(LayeredDreamer):
             s = f[:, m.sprite_at:m.camera_at]
             flag_logits = m.flag_head(s).float()
             flags = choose(flag_logits, temp, g)
-            flags = torch.where(flags == 2, torch.ones_like(flags), flags)              # 2 is never a flag
             move_logits = m.move_head(s).view(b, SPRITES, 2, MOVE_CLASSES).float()
             mv = choose(move_logits, temp, g)
+            if label is not None:                       # an object that was shown: one presence, one movement
+                flags = torch.where(prev_on, per_object(flag_logits.log_softmax(-1), label, temp, g), flags)
+                mv = torch.where(prev_on[..., None], per_object(move_logits.log_softmax(-1), label, temp, g), mv)
+            flags = torch.where(flags == 2, torch.ones_like(flags), flags)              # 2 is never a flag
             place = torch.stack((choose(m.place_x(s), temp, g), choose(m.place_y(s), temp, g)), -1)
             jump = (mv == JUMP) | ~prev_on[..., None]
             xy = torch.minimum(torch.where(jump, place, prev_xy + mv - MOVE).clamp_min(0), limit)
@@ -70,6 +99,8 @@ class SlotDreamer(LayeredDreamer):
                 k = (shown_now.sum(1, keepdim=True) + passes - 1) // passes                # [B, 1]
                 rank = torch.where(shown_now, sure, -math.inf).argsort(1, descending=True).argsort(1)
                 take = empty | (shown_now & (rank < k))
+                if label is not None:                   # an object's sprites are decided together
+                    take = torch.zeros_like(take).scatter_reduce(1, label, take, "amax").gather(1, label) & ~decided
             flags_d = torch.where(take, flags, flags_d)
             xy_d = torch.where(take[..., None], xy, xy_d)
             probs_d = torch.where(take[..., None, None], probs, probs_d)
@@ -134,7 +165,8 @@ class SlotLayers(LayeredBase):
             out["sprite_pixels"], _ = HeadCrossEntropy.apply(s[shown], self.sprite_pixels.weight,
                                                              self.sprite_pixels.bias, self.colour_table(),
                                                              self.colour_bias,
-                                                             layers["sprites"].long().flatten(-2)[shown], chunk)
+                                                             layers["sprites"].long().flatten(-2)[shown],
+                                                             even_share(layers["sprites"].flatten(-2)[shown]), chunk)
         else:
             out["sprite_pixels"] = s.sum() * 0
         return out

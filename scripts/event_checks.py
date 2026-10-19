@@ -7,7 +7,9 @@
 Checks (--checks, default all):
 - restart (diagnostics/restart.py): a top-out, the curtain, the menus and a new game (320 frames);
 - line_clears (diagnostics/line_clears.py): from 10 frames before a clear starts, 60 frames: the rows gone, the
-  stack dropped (scored per clear size too).
+  stack dropped (scored per clear size too);
+- play (diagnostics/play.py): 240 frames of play mid-game: cells lost with no full row (false clears, pieces
+  losing blocks), pieces changing their block count, full rows that never clear.
 
 Any model: run folders (their model_latest.pt) or checkpoint files, pixel or layered (diagnostics/worlds.py).
 Every model dreams the same --trials events per check (same --seed). Prints each event's scores and the means,
@@ -31,7 +33,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from token_world.data.nes_palette import tetris_palette
-from token_world.diagnostics import line_clears, restart
+from token_world.diagnostics import line_clears, play, restart
 from token_world.diagnostics.worlds import load, run_folder
 
 CHECKS = {
@@ -39,6 +41,7 @@ CHECKS = {
     "restart": (restart.restarts, restart.score, restart.sheet, restart.FIELDS, lambda event: None),
     "line_clears": (line_clears.clears, line_clears.score, line_clears.sheet, line_clears.FIELDS,
                     lambda event: event.name),
+    "play": (play.plays, play.score, play.sheet, play.FIELDS, lambda event: None),
 }
 SUMMARY = ("step", "check", "group", "events", "score", "value")
 
@@ -77,7 +80,7 @@ def main():
             Image.fromarray(sheet(event, dreams, palette)).save(args.out / f"{check}_{n}.png")
         print()
         for (w, group), rows in sorted(scores.items(), key=lambda item: (item[0][0], item[0][1] != "all", item[0][1])):
-            means = {k: float(np.mean([r[k] for r in rows])) for k in fields}
+            means = {k: float(np.nanmean([r[k] for r in rows])) for k in fields}      # an event may have no score (NaN)
             print(f"{check} {group} ({len(rows)}) {names[w]}: " + " ".join(f"{k} {v:.3g}" for k, v in means.items()))
             summary[w] += [{"step": worlds[w].step, "check": check, "group": group, "events": len(rows), "score": k,
                             "value": v} for k, v in means.items()]

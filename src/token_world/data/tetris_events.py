@@ -20,12 +20,55 @@ STATE, LEVEL, MODE, LINES = 0x48, 0x44, 0xC0, 0x50
 FALLING, CHECK_ROWS, CLEARING, TOP_OUT, IN_GAME = 1, 3, 4, 10, 4
 CLEAR_NAMES = {1: "line clear: single", 2: "line clear: double", 3: "line clear: triple", 4: "line clear: tetris"}
 ALONE = 16                          # "falling alone": no buttons for this many frames while a piece falls
+EVENTS = ("gravity (no buttons)", "falling alone", "soft drop", "shift", "rotate", "spawn", *CLEAR_NAMES.values(),
+          "level up", "top-out", "game start")       # what events_at names; bit i of frame_events is EVENTS[i]
+SETTLE = 90                         # frames after an event to look for its first visible change
+NEXT_BOX = (slice(120, 152), slice(188, 228))      # the next-piece box (its redraw is random, never an event)
 LOOKAHEAD = 40                      # RAM frames past an event that detection may read (line counts)
+
+
+def event_slug(name: str) -> str:
+    """An EVENTS name as a column name's part ("line clear: single" -> "line_clear_single"; the trainer's live_
+    columns, the run viewer's live panels)."""
+    return "".join(c if c.isalnum() else "_" for c in name).strip("_").replace("__", "_")
+
 
 def lines_count(ram: np.ndarray) -> np.ndarray:
     """[..., 2048] -> the BCD lines counter."""
     lo, hi = ram[..., LINES].astype(int), ram[..., LINES + 1].astype(int)
     return (lo >> 4) * 10 + (lo & 15) + 100 * (hi & 15)
+
+
+def changes(frames: np.ndarray) -> np.ndarray:
+    """[T, 256, 256] model frames -> [T, 256, 256] bool: each pixel that differs from the frame before, outside
+    the tick border and the next-piece box (frame 0: none)."""
+    from token_world.data.model_frames import BAND
+    out = np.zeros(frames.shape, bool)
+    out[1:] = frames[1:] != frames[:-1]
+    out[:, :BAND] = out[:, -BAND:] = False
+    out[:, NEXT_BOX[0], NEXT_BOX[1]] = False
+    return out
+
+
+def frame_events(frames: np.ndarray, ram: np.ndarray, actions: np.ndarray) -> np.ndarray:
+    """One window's frames [T, 256, 256], RAM [T, 2048] and stream actions [T] (actions[t] took frame t to
+    t + 1) -> [T] int64: bit i set on the picture where an EVENTS[i] event first shows (the first picture
+    from e + 1 on that changes, within SETTLE; an event between RAM frames e - 1 and e: the picture shows the
+    RAM of the frame before), as the scenario checks align them (diagnostics/tetris_scenarios.py). For the
+    training data's own event scores (train_dynamics_ui.py live_event_scores); events whose picture falls past
+    the window are not labelled."""
+    t = len(frames)
+    changed = changes(frames).reshape(t, -1).any(1)
+    out = np.zeros(t, np.int64)
+    for e in range(1, t - 1):
+        names = events_at(ram, actions[:-1], e)
+        if not names:
+            continue
+        shown = [f for f in range(e + 1, min(e + 1 + SETTLE, t)) if changed[f]]
+        if shown:
+            for name in names:
+                out[shown[0]] |= 1 << EVENTS.index(name)
+    return out
 
 
 def events_at(ram: np.ndarray, actions: np.ndarray, e: int) -> list[str]:

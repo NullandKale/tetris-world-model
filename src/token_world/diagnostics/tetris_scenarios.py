@@ -38,17 +38,14 @@ from torch.utils.data import DataLoader
 
 from token_world.data.model_frames import BAND
 from token_world.data.nes_layers import TRANSPARENT, compose, model_frame
-from token_world.data.tetris_events import CLEAR_NAMES, LEVEL, LOOKAHEAD, events_at
+from token_world.data.tetris_events import EVENTS, LEVEL, LOOKAHEAD, NEXT_BOX, SETTLE, events_at
 from token_world.data.world_nes_tetris import WorldNesTetrisStreams
 from token_world.models.dynamics import incoming_actions
 
 CONTEXT, FRAMES, LEAD = 48, 64, 2
 HORIZONS = (LEAD, 8, 16)
 PLAYFIELD = (slice(52, 212), slice(92, 172))
-NEXT_BOX = (slice(120, 152), slice(188, 228))
-SCENARIOS = ("gravity (no buttons)", "falling alone", "soft drop", "shift", "rotate", "spawn",
-             *CLEAR_NAMES.values(), "level up", "top-out", "game start")
-SETTLE = 90                         # frames after an event to look for its first visible change
+SCENARIOS = EVENTS
 
 
 @dataclass

@@ -1,8 +1,7 @@
 """World models over layered NES frames (data/nes_layers.py, docs/guides/layered_tokens.md): what they share.
 
 A frame is tokens of five kinds, in this order: CELLS background cells (the world-grid cells in view, BANDS
-x VIEW), the sprites (each model's own: models/layered_pixels.py a screen-space sprite picture in 16 x 16
-patches, models/layered_slots.py the 64 OAM slots), BANDS camera rows, one frame token (the backdrop colour)
+x VIEW), the sprites (models/layered_pixels.py: a screen-space sprite picture in 16 x 16 patches; models/layered_slots.py the 64 OAM slots), BANDS camera rows, one frame token (the backdrop colour)
 and BORDER_TOKENS border tokens. The spatiotemporal transformer of models/dynamics.py runs over them, with
 two changes:
 
@@ -42,8 +41,8 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
 from token_world.data.nes_layers import BANDS, CANVAS_COLS, CANVAS_ROWS, CELL, LAYER_COLOURS, VIEW, WIDTH
-from token_world.models.dynamics import (Attention, HeadCrossEntropy, button_bits, pixel_logits,
-                                         training_mask)
+from token_world.models.dynamics import (Attention, HeadCrossEntropy, SpatialAttention, button_bits, even_share,
+                                         mixed_rotary, pixel_logits, rotary, training_mask)
 
 CELLS = BANDS * VIEW                                    # 255
 COLUMNS = WIDTH // CELL                                 # 16 tokens across the screen
@@ -51,8 +50,6 @@ BORDER_TOKENS = 2 * COLUMNS                             # 32: the two border ban
 FRAME_TOKENS = 1
 CELL_SLOTS = BANDS * CANVAS_COLS                        # cells' temporal identities: (band, canvas column)
 UNKNOWN = LAYER_COLOURS                                 # an input pixel never seen (cells scrolling in)
-ROPE_BASE = 10_000.0                                    # rotary's longest wavelength scale (frames)
-SPACE_ROPE_BASE = 10.0                                  # RoPE-Mixed's frequency scale (its code's), places in 16 px
 MOVE = 16
 MOVE_CLASSES = 2 * MOVE + 2                             # -MOVE..MOVE, then JUMP
 JUMP = MOVE_CLASSES - 1
@@ -120,59 +117,6 @@ class SlotCache:
         return self.k[rows], self.v[rows], seen[:, None, None]
 
 
-def rotary(x: torch.Tensor, times: torch.Tensor) -> torch.Tensor:
-    """RoPE over time (Su et al., 2104.09864; Open-Oasis's temporal attention): x [B, T, N, h, hd] at frames
-    `times` [T] -> x with each pair of channels rotated by an angle proportional to its frame, so a query and
-    a key score by how many frames apart they are, whatever window slot they sit in."""
-    half = x.shape[-1] // 2
-    freq = ROPE_BASE ** -(torch.arange(half, device=x.device, dtype=torch.float32) / half)
-    angle = times.to(torch.float32)[:, None] * freq                                   # [T, hd / 2]
-    cos, sin = angle.cos()[None, :, None, None].to(x.dtype), angle.sin()[None, :, None, None].to(x.dtype)
-    x1, x2 = x[..., :half], x[..., half:]
-    return torch.cat((x1 * cos - x2 * sin, x1 * sin + x2 * cos), -1)
-
-
-def mixed_rotary(x: torch.Tensor, angle: torch.Tensor) -> torch.Tensor:
-    """x [..., h, hd] whose first 2P channels are rotated as P pairs (i, P + i) by angle [..., h, P]; the rest
-    pass unchanged."""
-    p = angle.shape[-1]
-    cos, sin = angle.cos().to(x.dtype), angle.sin().to(x.dtype)
-    x1, x2, rest = x[..., :p], x[..., p:2 * p], x[..., 2 * p:]
-    return torch.cat((x1 * cos - x2 * sin, x1 * sin + x2 * cos, rest), -1)
-
-
-class SpatialAttention(Attention):
-    """Attention within a frame; with rope (the space_rope option), half its channels rotated by each token's
-    place on screen along learned 2D directions (RoPE-Mixed: per layer and head, initialised as its code does,
-    two perpendicular directions at a random angle per head, magnitudes SPACE_ROPE_BASE ** -(i / P))."""
-
-    def __init__(self, dim: int, heads: int, rope: bool = False):
-        super().__init__(dim, heads)
-        self.rope = rope
-        if rope:
-            pairs = dim // heads // 4                                                  # half the channels
-            mag = SPACE_ROPE_BASE ** -(torch.arange(pairs // 2 + pairs % 2).float() / (pairs // 2 + pairs % 2))
-            turn = torch.rand(heads, 1) * 2 * torch.pi
-            angles = torch.cat((turn.expand(-1, len(mag)), turn.expand(-1, len(mag)) + torch.pi / 2), 1)[:, :pairs]
-            mags = torch.cat((mag, mag))[:pairs]
-            self.rope_freq = nn.Parameter(torch.stack((mags * angles.sin(), mags * angles.cos()), -1))  # [h, P, (y, x)]
-
-    def forward(self, x: torch.Tensor, place: torch.Tensor | None = None, placed: torch.Tensor | None = None):
-        """x [M, N, d]; place [M, N, 2] (y, x in 16-pixel units) and placed [N] (rope only)."""
-        if not self.rope:
-            return super().forward(x, causal=False)
-        m, n, d = x.shape
-        h = self.heads
-        q, k, v = self.qkv(x).view(m, n, 3, h, d // h).unbind(2)                        # [M, N, h, hd]
-        angle = torch.einsum("mnc,hpc->mnhp", place.float(), self.rope_freq.float())
-        rotated = 2 * self.rope_freq.shape[1]
-        keep = torch.ones(n, 1, d // h, device=x.device, dtype=x.dtype)
-        keep[~placed, :, :rotated] = 0                                                  # no place: content only
-        q, k = mixed_rotary(q, angle) * keep, mixed_rotary(k, angle) * keep
-        y = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2))
-        return self.out(y.transpose(1, 2).reshape(m, n, d))
-
-
 class RoutedTemporal(Attention):
     """Causal temporal attention per identity: each token attends to the earlier frames' tokens that share
     its identity (and to itself), with queries and keys rotated by their frame (rotary): the model's only
@@ -220,20 +164,36 @@ class RoutedTemporal(Attention):
 
 
 class LayeredBlock(nn.Module):
-    """Spatial attention within a frame, temporal attention per identity, MLP."""
+    """Spatial attention within a frame, temporal attention per identity, MLP. action_norm: the frame's buttons
+    set a scale and shift on each of the three norms, from zero (models/dynamics.py Block)."""
 
-    def __init__(self, dim: int, heads: int, slots: int, space_rope: bool = False):
+    def __init__(self, dim: int, heads: int, slots: int, space_rope: bool = False, action_norm: bool = False):
         super().__init__()
         self.norm_s, self.norm_t, self.norm_m = nn.LayerNorm(dim), nn.LayerNorm(dim), nn.LayerNorm(dim)
         self.spatial, self.temporal = SpatialAttention(dim, heads, space_rope), RoutedTemporal(dim, heads, slots)
         self.mlp = nn.Sequential(nn.Linear(dim, 4 * dim), nn.GELU(), nn.Linear(4 * dim, dim))
+        if action_norm:
+            self.modulation = nn.Sequential(nn.SiLU(), nn.Linear(dim, 6 * dim))     # (scale, shift) per norm
+            nn.init.zeros_(self.modulation[1].weight)
+            nn.init.zeros_(self.modulation[1].bias)
+        else:
+            self.modulation = None
 
-    def forward(self, x, slots, cache=None, at=0, place=None, placed=None):
+    def forward(self, x, slots, cache=None, at=0, place=None, placed=None, action=None):
         b, t, n, d = x.shape
         place = None if place is None else place.reshape(b * t, n, 2)
-        x = x + self.spatial(self.norm_s(x).reshape(b * t, n, d), place, placed).view(b, t, n, d)
-        x = x + self.temporal(self.norm_t(x), slots, cache, at)
-        return x + self.mlp(self.norm_m(x))
+        if self.modulation is None:
+            ns, nt, nm = self.norm_s, self.norm_t, self.norm_m
+        else:
+            mods = self.modulation(action)[:, :, None].to(x.dtype).chunk(6, -1)        # each [B, T, 1, d]
+
+            def modulated(norm, scale, shift):
+                return lambda z: norm(z) * (1 + scale) + shift
+            ns, nt, nm = (modulated(norm, mods[2 * i], mods[2 * i + 1])
+                          for i, norm in enumerate((self.norm_s, self.norm_t, self.norm_m)))
+        x = x + self.spatial(ns(x).reshape(b * t, n, d), place, placed).view(b, t, n, d)
+        x = x + self.temporal(nt(x), slots, cache, at)
+        return x + self.mlp(nm(x))
 
 
 def mean_ce(logits: torch.Tensor, target: torch.Tensor, where: torch.Tensor) -> torch.Tensor:
@@ -260,9 +220,11 @@ class LayeredBase(nn.Module):
     Dreamer: type
 
     def __init__(self, dim: int = 96, layers: int = 8, heads: int = 4, frames: int = 64, colour_dim: int = 16,
-                 recompute: bool = False, registers: int = 0, space_rope: bool = False, fixed_camera: bool = False):
+                 recompute: bool = False, registers: int = 0, space_rope: bool = False, fixed_camera: bool = False,
+                 action_norm: bool = False):
         super().__init__()
         self.frames, self.dim, self.space_rope, self.fixed_camera = frames, dim, space_rope, fixed_camera
+        self.action_norm = action_norm
         self.recompute = recompute     # training keeps only each block's input and recomputes the rest: memory for time
         self.sprite_at, self.camera_at = CELLS, CELLS + self.SPRITE_TOKENS
         self.frame_at = self.camera_at + (0 if fixed_camera else BANDS)
@@ -285,7 +247,8 @@ class LayeredBase(nn.Module):
             self.camera_band, self.camera_x, self.camera_y = e(BANDS), e(CAMERA_X), e(CAMERA_Y)
         self.backdrop, self.border_pos = e(LAYER_COLOURS), e(BORDER_TOKENS)
         self.action = nn.Linear(9, dim)
-        self.blocks = nn.ModuleList(LayeredBlock(dim, heads, self.slots, space_rope) for _ in range(layers))
+        self.blocks = nn.ModuleList(LayeredBlock(dim, heads, self.slots, space_rope, action_norm)
+                                    for _ in range(layers))
         self.norm = nn.LayerNorm(dim)
         self.cell_pixels = nn.Linear(dim, CELL * CELL * colour_dim)               # tied to the colour table
         self.colour_bias = nn.Parameter(torch.zeros(LAYER_COLOURS))
@@ -452,10 +415,11 @@ class LayeredBase(nn.Module):
         x = self.embed(layers, actions, mask, soft)
         slots = slots_of(layers, self.tokens)
         place, placed = self.screen(layers) if self.space_rope else (None, None)
+        action = self.action(button_bits(actions)) if self.action_norm else None          # [B, T, dim]
         remember = self.recompute and self.training and torch.is_grad_enabled() and cache is None
         for i, block in enumerate(self.blocks):
-            x = (checkpoint(block, x, slots, None, at, place, placed, use_reentrant=False) if remember else
-                 block(x, slots, None if cache is None else cache[i], at, place, placed))
+            x = (checkpoint(block, x, slots, None, at, place, placed, action, use_reentrant=False) if remember else
+                 block(x, slots, None if cache is None else cache[i], at, place, placed, action))
         return self.norm(x)
 
     def new_cache(self) -> list[SlotCache]:
@@ -503,7 +467,7 @@ class LayeredBase(nn.Module):
         h = torch.cat((features[:, :, :CELLS][cell_where], features[:, :, self.border_at:self.border_end][bw]))
         y = torch.cat((cells[cell_where], border[bw]))
         out["cells"], _ = HeadCrossEntropy.apply(h, self.cell_pixels.weight, self.cell_pixels.bias,
-                                                 self.colour_table(), self.colour_bias, y, chunk)
+                                                 self.colour_table(), self.colour_bias, y, even_share(y), chunk)
         sprites = slice(self.sprite_at, self.camera_at)
         out.update(self.sprite_loss(features[:, :, sprites], mask[:, :, sprites], layers, seen, chunk))
         out["backdrop"] = mean_ce(self.backdrop_head(features[:, :, self.frame_at]), layers["backdrop"],
@@ -532,12 +496,15 @@ class LayeredDreamer:
     pixel's colour probabilities, as models/dynamics.py's dreams). The frame returned is each pixel's most
     likely colour. When the window is full, the last `keep` frames are encoded again at positions
     0..keep-1. temperature: the categories' sampling temperature (0: the most likely). steps: passes over
-    which a model with sprite decisions decides them, the surest first (MaskGIT's order).
+    which a model with sprite decisions decides them, the surest first (MaskGIT's order). objects: a model
+    with sprite decisions makes them per object, not per sprite (models/layered_slots.py).
     """
 
     def __init__(self, model: LayeredBase, layers: dict, actions: torch.Tensor, keep: int | None = None,
-                 temperature: float = 1.0, generator: torch.Generator | None = None, steps: int = 1):
+                 temperature: float = 1.0, generator: torch.Generator | None = None, steps: int = 1,
+                 objects: bool = False):
         self.model, self.temperature, self.generator, self.steps = model, temperature, generator, steps
+        self.objects = objects
         self.keep = model.frames * 3 // 4 if keep is None else keep
         self.device = actions.device
         layers = {k: v for k, v in layers.items() if k in model.KEYS}
@@ -616,7 +583,7 @@ class LayeredDreamer:
                                    "sprites": sprite_probs, "border": border_probs}}
 
 
-OPTIONS = ("registers", "space_rope", "share_pixels", "fixed_camera")     # a run's architecture options (off when absent)
+OPTIONS = ("registers", "space_rope", "share_pixels", "fixed_camera", "action_norm")     # a run's architecture options (off when absent)
 
 
 def build(config: dict, recompute: bool = False) -> LayeredBase:

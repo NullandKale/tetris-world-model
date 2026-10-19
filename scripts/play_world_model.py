@@ -1,29 +1,36 @@
-"""Tetris next to its world model: the real game and one model's dream, frame by frame in lockstep.
+"""Tetris next to its world models: the real game and every model's dream, frame by frame in lockstep.
 
-    python scripts/play_world_model.py [--run output/world_model_tetris_base]
+    python scripts/play_world_model.py [--runs output/world_model_tetris_base D:/.../model_step58000.pt ...]
 
-The real game runs in World NES. Every frame one controller byte (your keys,
-or the bot) goes to both the console and the model, any model: the pixel model
-or a layered one (diagnostics/worlds.py). The dream starts from the last 48
-real frames (and their layers); after that it sees only the buttons. One model
-generates at a time; pick it in the toolbar.
+The real game runs in World NES. Every frame one controller byte (the bot's, by
+default, or your keys) goes to the console and to every model alike, any model:
+the pixel model or a layered one (diagnostics/worlds.py). The dreams start as
+the browser's does: from the first 3 frames of a level-0 game
+(data/real_tetris.py game_start; --seed 0, the default, is the very start the
+browser ships), the real game running on from the same frames; after that each
+dream sees only the buttons. --runs names the models (run folders or archived
+checkpoints, any steps); without it, the latest long-trained run.
 
-A worker thread owns the console, the bot and the model, and composes real,
-dream and their difference into one image per frame; the UI copies that
-image to its canvas once per frame. Frames advance at up to the speed cap
-(60 = the NES), or as fast as the model generates.
+A worker thread owns the console, the bot and the models, steps every dream
+once per real frame, and composes the real game and each dream (or each
+dream's difference from the real game) into one image per frame; the UI copies
+that image to its canvas once per frame. Frames advance at up to the speed
+cap (60 = the NES), or as fast as all the models generate together.
 
 The pixel model's dream is soft (models/dynamics.py): each pixel is a colour
-distribution, shown as its expected colour, and the difference panel shows how
-likely each pixel is to be wrong. A layered model's dream is committed: its
-layers composed, and the difference panel shows the wrong pixels. The toolbar
-sets how many frames are kept when the window slides (a change starts a new
-dream) and the pixel model's change weight, at once: the odds of every pixel
-change times it (models/dynamics.py weigh_changes), so an unsure piece is drawn
-with too many cells instead of thin ones.
+distribution, shown as its expected colour, and its difference shows how likely
+each pixel is to be wrong. A layered model's dream is committed: its layers
+composed, and its difference shows the wrong pixels. The toolbar sets the pixel
+models' change weight (the odds of every pixel change times it,
+models/dynamics.py weigh_changes, so an unsure piece is drawn with too many
+cells instead of thin ones) and --keep how many frames are kept when a window
+slides (default three quarters of each model's window).
 
 Keys: arrows move and soft-drop, X / Z rotate, Enter is Start, Right Shift is
-Select. R restarts the dream from the real game, Space pauses, Esc quits.
+Select (with the controller on You). S taps Start into the dreams alone: a dream that has topped out before
+the real game waits on the covered board for Start, as the real game does (it never leaves without one), and
+the real game's Start only comes when the real game ends. R starts every dream again from the game's start
+(the same one every time), D shows dreams or differences, Space pauses, Esc quits.
 """
 from __future__ import annotations
 
@@ -48,7 +55,7 @@ sys.path.insert(0, str(ROOT / "src"))
 from token_world.data.model_frames import BORDER_VERSION, GAME_ROWS
 from token_world.data.tetris_bot import A, B, DOWN, LEFT, RIGHT, SELECT, START, UP
 from token_world.data.nes_palette import tetris_palette
-from token_world.data.real_tetris import RealTetris
+from token_world.data.real_tetris import game_start, start_context
 from token_world.diagnostics.worlds import World, load
 
 KEYS = {"Left": LEFT, "Right": RIGHT, "Down": DOWN, "Up": UP, "x": A, "X": A, "z": B, "Z": B,
@@ -80,20 +87,33 @@ def runs_with_checkpoints() -> list[Path]:
     return sorted(runs)
 
 
+def run_label(run: Path) -> str:
+    """A run folder's name, or an archived checkpoint's run and step (D:/.../<run>/model_step58000.pt)."""
+    return run.name if run.is_dir() else f"{run.parent.name} @ {run.stem.removeprefix('model_step')}"
+
+
+def window(run: Path) -> int:
+    """The frames a run (folder or checkpoint file) was trained on."""
+    if run.is_dir():
+        return json.loads((run / "run_config.json").read_text())["frames"]
+    return torch.load(run, map_location="cpu", weights_only=False)["args"]["frames"]
+
+
 def load_model(run: Path) -> tuple[World, str]:
     world = load(run)
     params = sum(p.numel() for p in world.model.parameters()) / 1e6
-    kind = "layered, committed" if world.layered else "soft"
-    return world, f"{run.name} @ step {world.step:,} ({params:.1f}M, EMA, {kind})"
+    kind = "layered, committed" if world.layered else "latent, sampled" if world.latent else "soft"
+    where = f"{run.name} @ {world.step}" if run.is_dir() else run_label(run)
+    return world, f"{where} ({params:.1f}M, EMA, {kind})"
 
 
 class Composer:
-    """real | dream | difference, scaled, into one preallocated RGB image."""
+    """The real game and each dream (or its difference), scaled, side by side in one preallocated RGB image."""
 
-    def __init__(self, palette: np.ndarray, scale: int, gap: int = 12):
+    def __init__(self, palette: np.ndarray, scale: int, panels: int, gap: int = 12):
         self.palette, self.scale, self.gap = palette, scale, gap
         self.panel = 256 * scale
-        self.image = np.empty((self.panel, 3 * self.panel + 2 * gap, 3), np.uint8)
+        self.image = np.empty((self.panel, panels * self.panel + (panels - 1) * gap, 3), np.uint8)
         self.image[:] = np.array([int(BG[i:i + 2], 16) for i in (1, 3, 5)], np.uint8)
 
     def x(self, i: int) -> int:
@@ -103,35 +123,45 @@ class Composer:
         s = self.scale
         self.image[:, self.x(i):self.x(i) + self.panel] = rgb.repeat(s, 0).repeat(s, 1)
 
-    def compose(self, real: np.ndarray, dream: np.ndarray, wrong: np.ndarray) -> np.ndarray:
-        """real [256, 256] palette indices, dream [256, 256, 3] expected colours, wrong [256, 256] each
-        pixel's probability of anything but the real colour."""
+    def compose(self, real: np.ndarray, dreams: list[tuple[np.ndarray, np.ndarray]], differences: bool) -> np.ndarray:
+        """real [256, 256] palette indices; dreams: each model's expected colours [256, 256, 3] and each pixel's
+        probability of anything but the real colour [256, 256]; differences: show those (magenta = wrong)."""
         real_rgb = self.palette[real]
         self.put(0, real_rgb)
-        self.put(1, dream)
-        w = wrong[..., None]
-        self.put(2, (real_rgb * 0.3 * (1 - w) + np.array([255, 0, 200]) * w).astype(np.uint8))
+        for i, (dream, wrong) in enumerate(dreams, 1):
+            if differences:
+                w = wrong[..., None]
+                dream = (real_rgb * 0.3 * (1 - w) + np.array([255, 0, 200]) * w).astype(np.uint8)
+            self.put(i, dream)
         return self.image
 
 
-class Engine(threading.Thread):
-    """Runs the real game and the dream in lockstep; publishes one composed image per frame."""
+class Dream:
+    """One model's live dream in the app, with its running score."""
 
-    def __init__(self, run: Path, keep: int, palette: np.ndarray, scale: int, seed: int):
+    def __init__(self, run: Path, world: World, name: str, keep: int):
+        self.run, self.world, self.name, self.keep = run, world, name, keep
+        self.dreamer, self.dreamed, self.wrong, self.wrong_sum = None, 0, 0.0, 0.0
+
+
+class Engine(threading.Thread):
+    """Runs the real game and every dream in lockstep; publishes one composed image per frame."""
+
+    def __init__(self, runs: list[Path], keep: int | None, palette: np.ndarray, scale: int, seed: int):
         super().__init__(daemon=True)
-        self.run_path, self.keep, self.seed = run, keep, seed
+        self.runs, self.keep, self.seed = runs, keep, seed
         self.palette = palette
         self.colours = torch.as_tensor(palette, dtype=torch.float32, device="cuda")
-        self.composer = Composer(palette, scale)
+        self.composer = Composer(palette, scale, 1 + len(runs))
         self.commands: queue.Queue = queue.Queue()
         self.keys: set[int] = set()
         self.keys_lock = threading.Lock()
         self.lock = threading.Lock()
         self.version, self.image, self.stats = 0, None, {"status": "starting"}
-        self.controller, self.paused, self.fps_cap, self.stopping = "you", False, 60, False
-        self.change_weight = 1.0
-        self.world = self.dreamer = None
-        self.model_name = ""
+        self.controller, self.paused, self.fps_cap, self.stopping = "bot", False, 60, False
+        self.change_weight, self.differences = 1.0, False
+        self.dream_start = 0                               # frames left of a Start tap into the dreams alone
+        self.dreams: list[Dream] = []
 
     # -- called from the UI thread ------------------------------------------------------------
     def buttons(self) -> int:
@@ -154,42 +184,49 @@ class Engine(threading.Thread):
                 self.version += 1
             self.stats.update(stats)
 
-    def load(self, run: Path) -> None:
-        """Swap in another model; on failure keep the current one and say why."""
-        self.publish(None, status=f"loading {run.name} ...")
-        try:
-            world, name = load_model(run)
-        except Exception as exc:
-            self.publish(None, status=f"could not load {run.name}: {exc}")
-            return
-        self.world = self.dreamer = None
-        torch.cuda.empty_cache()
-        self.world, self.model_name, self.run_path = world, name, run
-        self.restart()
+    def load(self) -> None:
+        """Every model in --runs; one that fails to load is left out, and the status says why."""
+        failed = []
+        for run in self.runs:
+            self.publish(None, status=f"loading {run_label(run)} ...")
+            try:
+                world, name = load_model(run)
+            except Exception as exc:
+                failed.append(f"{run_label(run)}: {exc}")
+                continue
+            self.dreams.append(Dream(run, world, name, self.keep or window(run) * 3 // 4))
+        if not self.dreams:
+            raise RuntimeError("no model loaded: " + "; ".join(failed))
+        self.publish(None, failed="; ".join(failed))
 
     def restart(self) -> None:
-        """A new dream from the last CONTEXT real frames (and their layers)."""
-        frames, actions = np.stack(self.real.frames), np.array(self.real.actions, np.int64)
-        layers = ({k: np.stack([f[k] for f in self.real.layers]) for k in self.real.layers[0]}
-                  if self.world.layered else None)
-        self.dreamer = self.world.dreaming(frames, actions, layers, self.keep, change_weight=self.change_weight)
-        self.dreamed, self.wrong_sum = 0, 0.0
-        self.publish(None, status="dreaming", model=self.model_name)
+        """The real game back at its start (game_start, the same one every time) and every dream anew from its
+        frames, as the browser starts."""
+        self.publish(None, status="starting a new game (the bot plays the menus) ...")
+        self.real = game_start(self.seed)
+        frames, actions, layers = start_context(self.real)
+        for d in self.dreams:
+            d.dreamer = None
+        torch.cuda.empty_cache()
+        for d in self.dreams:
+            d.dreamer = d.world.dreaming(frames, actions, layers if d.world.layered else None, d.keep,
+                                         change_weight=self.change_weight)
+            d.dreamed, d.wrong, d.wrong_sum = 0, 0.0, 0.0
+        self.publish(None, status="dreaming")
 
     def command(self, name: str, value=None) -> None:
-        if name == "model":
-            self.load(value)
-        elif name == "decoding":
-            self.keep = value
-            self.restart()
-        elif name == "change_weight":
+        if name == "change_weight":
             self.change_weight = value
-            if self.dreamer is not None:
-                self.dreamer.set_change_weight(value)
+            for d in self.dreams:
+                d.dreamer.set_change_weight(value)
         elif name == "controller":
             self.controller = value
             if value == "bot":
                 self.real.new_bot()
+        elif name == "differences":
+            self.differences = not self.differences
+        elif name == "dream_start":
+            self.dream_start = 2
         elif name == "restart":
             self.restart()
         elif name == "pause":
@@ -199,15 +236,25 @@ class Engine(threading.Thread):
         elif name == "quit":
             self.stopping = True
 
+    def step(self, d: Dream, frame: np.ndarray, action: int) -> tuple[np.ndarray, np.ndarray]:
+        """One dream's next frame -> its expected colours and each pixel's chance of being wrong."""
+        likely, probs = d.dreamer.step(action)
+        if probs is None:                                  # committed: wrong or not
+            miss = (likely != frame).astype(np.float32)
+            dream = self.palette[likely]
+        else:
+            real = torch.from_numpy(frame).cuda().long()
+            miss = (1 - probs.gather(-1, real[..., None])[..., 0]).cpu().numpy()
+            dream = (probs @ self.colours).round().clamp(0, 255).byte().cpu().numpy()
+        d.wrong = float(miss[GAME_ROWS].mean())
+        d.dreamed += 1
+        d.wrong_sum += d.wrong
+        return dream, miss
+
     def run(self) -> None:
         try:
-            self.publish(None, status="booting the game (the bot plays until a piece is falling) ...")
-            self.real = RealTetris(self.seed, layered=True)
-            played = 0
-            while not (played > 600 and self.real.playing()):
-                self.real.step(None)
-                played += 1
-            self.load(self.run_path)
+            self.load()
+            self.restart()
             fps_frames, fps_since, fps = 0, time.monotonic(), 0.0
             while not self.stopping:
                 while not self.commands.empty():
@@ -217,23 +264,18 @@ class Engine(threading.Thread):
                     continue
                 started = time.monotonic()
                 frame, action = self.real.step(None if self.controller == "bot" else self.buttons())
-                likely, probs = self.dreamer.step(action)
-                if probs is None:                                  # committed: wrong or not
-                    miss = (likely != frame).astype(np.float32)
-                    dream = self.palette[likely]
+                if self.dream_start:                       # the dreams get Start, the real game does not
+                    self.dream_start -= 1
+                    action_dreamed = action | START
                 else:
-                    real = torch.from_numpy(frame).cuda().long()
-                    miss = (1 - probs.gather(-1, real[..., None])[..., 0]).cpu().numpy()
-                    dream = (probs @ self.colours).round().clamp(0, 255).byte().cpu().numpy()
-                image = self.composer.compose(frame, dream, miss)
-                wrong = float(miss[GAME_ROWS].mean())
-                self.dreamed += 1
-                self.wrong_sum += wrong
+                    action_dreamed = action
+                image = self.composer.compose(frame, [self.step(d, frame, action_dreamed) for d in self.dreams],
+                                              self.differences)
                 fps_frames += 1
                 if time.monotonic() - fps_since >= 1:
                     fps, fps_frames, fps_since = fps_frames / (time.monotonic() - fps_since), 0, time.monotonic()
-                self.publish(image, fps=fps, action=action, wrong=wrong, mean_wrong=self.wrong_sum / self.dreamed,
-                             dreamed=self.dreamed, controller=self.controller)
+                self.publish(image, fps=fps, action=action, controller=self.controller,
+                             scores=[(d.dreamed, d.wrong, d.wrong_sum / max(d.dreamed, 1)) for d in self.dreams])
                 spare = 1 / self.fps_cap - (time.monotonic() - started)
                 if spare > 0:
                     time.sleep(spare)
@@ -243,10 +285,10 @@ class Engine(threading.Thread):
 
 
 class App:
-    def __init__(self, root: tk.Tk, engine: Engine, runs: list[Path]):
-        self.root, self.engine, self.runs = root, engine, runs
+    def __init__(self, root: tk.Tk, engine: Engine):
+        self.root, self.engine = root, engine
         self.shown = 0
-        root.title("Tetris: real game vs world model")
+        root.title("Tetris: real game vs world models")
         root.configure(bg=BG)
         style = ttk.Style(root)
         style.theme_use("clam")
@@ -257,17 +299,6 @@ class App:
 
         bar = ttk.Frame(root, padding=(10, 8))
         bar.pack(fill="x")
-        ttk.Label(bar, text="Model").pack(side="left")
-        self.model = ttk.Combobox(bar, state="readonly", width=34, values=[r.name for r in runs])
-        self.model.set(engine.run_path.name)
-        self.model.bind("<<ComboboxSelected>>", lambda e: self.send("model", runs[self.model.current()]))
-        self.model.pack(side="left", padx=(6, 16))
-        self.keep = tk.IntVar(value=engine.keep)
-        ttk.Label(bar, text="Keep").pack(side="left")
-        ttk.Spinbox(bar, values=tuple(sorted({engine.keep // 2, engine.keep * 2 // 3, engine.keep,
-                                              engine.keep * 4 // 3 - 1})),
-                    width=4, textvariable=self.keep, state="readonly",
-                    command=self.decoding).pack(side="left", padx=(4, 10))
         ttk.Label(bar, text="Change weight").pack(side="left")
         self.change_weight = tk.DoubleVar(value=engine.change_weight)
         ttk.Spinbox(bar, values=(1.0, 1.5, 2.0, 3.0, 5.0, 8.0), width=4, textvariable=self.change_weight,
@@ -279,28 +310,33 @@ class App:
                     command=lambda: self.send("fps", self.fps.get())).pack(side="left", padx=(6, 16))
         ttk.Label(bar, text="Controller").pack(side="left")
         self.controller = tk.StringVar(value=engine.controller)
-        for label, value in (("You", "you"), ("Bot", "bot")):
-            ttk.Radiobutton(bar, text=label, value=value, variable=self.controller, takefocus=False,
+        for text, value in (("Bot", "bot"), ("You", "you")):
+            ttk.Radiobutton(bar, text=text, value=value, variable=self.controller, takefocus=False,
                             command=lambda: self.send("controller", self.controller.get())).pack(side="left", padx=4)
-        ttk.Button(bar, text="Restart dream (R)", takefocus=False,
+        ttk.Button(bar, text="Restart (R)", takefocus=False,
                    command=lambda: self.send("restart")).pack(side="left", padx=(16, 4))
-        self.pause_button = ttk.Button(bar, text="Pause (Space)", takefocus=False, command=lambda: self.send("pause"))
-        self.pause_button.pack(side="left", padx=4)
+        ttk.Button(bar, text="Start the dreams (S)", takefocus=False,
+                   command=lambda: self.send("dream_start")).pack(side="left", padx=4)
+        ttk.Button(bar, text="Dreams / differences (D)", takefocus=False,
+                   command=lambda: self.send("differences")).pack(side="left", padx=4)
+        ttk.Button(bar, text="Pause (Space)", takefocus=False, command=lambda: self.send("pause")).pack(side="left", padx=4)
 
         c = engine.composer
-        titles = ("Real game (World NES)", "World model dream", "Difference (magenta = wrong pixels)")
+        titles = ["Real game (World NES)"] + [run_label(r) for r in engine.runs]
         self.canvas = tk.Canvas(root, width=c.image.shape[1], height=c.image.shape[0] + 24, bg=BG,
                                 highlightthickness=0)
         self.canvas.pack(padx=10)
         for i, title in enumerate(titles):
-            self.canvas.create_text(c.x(i) + c.panel // 2, 11, text=title, fill="#d8d8e0", font=("Segoe UI", 11))
+            self.canvas.create_text(c.x(i) + c.panel // 2, 11, text=title, fill="#d8d8e0", width=c.panel,
+                                    font=("Segoe UI", 10))
         self.photo = ImageTk.PhotoImage(Image.fromarray(c.image))
         self.canvas.create_image(0, 24, anchor="nw", image=self.photo)
         self.status = tk.StringVar(value="starting")
-        ttk.Label(root, textvariable=self.status, style="Status.TLabel", padding=(10, 6)).pack(fill="x")
+        ttk.Label(root, textvariable=self.status, style="Status.TLabel", padding=(10, 6), font=("Consolas", 10),
+                  justify="left").pack(fill="x")
         ttk.Label(root, style="Status.TLabel", padding=(10, 0, 10, 8),
-                  text="Arrows move / soft-drop, X / Z rotate, Enter = Start, Right Shift = Select   "
-                       "|   R restart dream, Space pause, Esc quit").pack(fill="x")
+                  text="Arrows move / soft-drop, X / Z rotate, Enter = Start, Right Shift = Select (controller You)"
+                       "   |   S Start into the dreams, R restart, D dreams / differences, Space pause, Esc quit").pack(fill="x")
 
         root.bind("<KeyPress>", lambda e: self.key(e, True))
         root.bind("<KeyRelease>", lambda e: self.key(e, False))
@@ -308,16 +344,12 @@ class App:
         self.canvas.focus_set()
         self.poll()
 
-    def decoding(self) -> None:
-        """Toolbar decoding setting changed: a new dream with it (Dreamer keep)."""
-        self.send("decoding", self.keep.get())
-
     def send(self, *command) -> None:
         self.engine.commands.put(command)
         self.canvas.focus_set()                                   # keys go to the game, not the toolbar
 
     def key(self, event, down: bool) -> None:
-        if isinstance(event.widget, (ttk.Combobox, ttk.Spinbox)):
+        if isinstance(event.widget, ttk.Spinbox):
             return
         if down and event.keysym == "Escape":
             self.quit()
@@ -325,6 +357,10 @@ class App:
             self.send("pause")
         elif down and event.keysym in ("r", "R"):
             self.send("restart")
+        elif down and event.keysym in ("d", "D"):
+            self.send("differences")
+        elif down and event.keysym in ("s", "S"):
+            self.send("dream_start")
         elif event.keysym in KEYS:
             self.engine.press(KEYS[event.keysym], down)
 
@@ -335,12 +371,15 @@ class App:
             self.shown = version
         if "fps" in stats:
             held = " ".join(n for n, b in BUTTON_NAMES if stats["action"] & b) or "-"
-            self.status.set(
-                f"{stats.get('model', '')}   |   {stats['fps']:.1f} fps   |   "
-                f"{stats['dreamed']:,} frames dreamed, pixels wrong now {stats['wrong']:.2%}, "
-                f"mean {stats['mean_wrong']:.2%}   |   {stats['controller']}: {held}"
-                + ("   |   PAUSED" if self.engine.paused else "")
-                + (f"   |   {stats['status']}" if stats.get("status") not in (None, "dreaming") else ""))
+            lines = [f"{stats['fps']:.1f} fps   |   {stats['controller']}: {held}"
+                     + ("   |   PAUSED" if self.engine.paused else "")
+                     + (f"   |   {stats['status']}" if stats.get("status") not in (None, "dreaming") else "")]
+            width = max(len(d.name) for d in self.engine.dreams)
+            lines += [f"{d.name:{width}s}   {dreamed:>6,} frames   pixels wrong now {wrong:6.2%}   mean {mean:6.2%}"
+                      for d, (dreamed, wrong, mean) in zip(self.engine.dreams, stats["scores"])]
+            if stats.get("failed"):
+                lines.append("not loaded: " + stats["failed"])
+            self.status.set("\n".join(lines))
         else:
             self.status.set(stats.get("status", ""))
         self.root.after(15, self.poll)
@@ -352,24 +391,23 @@ class App:
 
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    runs = runs_with_checkpoints()
-    p.add_argument("--run", type=Path, default=None,
-                   help="a run folder, any length (default: the latest run with MIN_STEPS steps)")
+    p.add_argument("--runs", type=Path, nargs="+", default=None,
+                   help="the models, run folders or checkpoint files, any steps; all dream at once "
+                        "(default: the latest run with MIN_STEPS steps)")
     p.add_argument("--keep", type=int, default=None,
-                   help="frames kept when the window slides (default: three quarters of the run's window)")
-    p.add_argument("--scale", type=int, default=2)
-    p.add_argument("--seed", type=int, default=int(time.time()) % 100_000)
+                   help="frames kept when a window slides (default: three quarters of each model's window)")
+    p.add_argument("--scale", type=int, default=None, help="pixels per NES pixel (default: what fits the screen)")
+    p.add_argument("--seed", type=int, default=0, help="the game start (0: the browser's, scripts/export_onnx.py)")
     args = p.parse_args()
-    if args.run is None and not runs:
-        p.error(f"no run on this frame layout has {MIN_STEPS:,} steps yet; pass --run")
-    run = args.run.resolve() if args.run else runs[-1]
-    if run not in runs:
-        runs.append(run)
+    runs = [r.resolve() for r in args.runs] if args.runs else runs_with_checkpoints()[-1:]
+    if not runs:
+        p.error(f"no run on this frame layout has {MIN_STEPS:,} steps yet; pass --runs")
     palette = tetris_palette().cpu().numpy().astype(np.uint8)
-    keep = args.keep or json.loads((run / "run_config.json").read_text())["frames"] * 3 // 4
-    engine = Engine(run, keep, palette, args.scale, args.seed)
     root = tk.Tk()
-    App(root, engine, runs)
+    panels = 1 + len(runs)
+    scale = args.scale or max(1, min(3, (root.winfo_screenwidth() - 40) // (panels * (256 + 12))))
+    engine = Engine(runs, args.keep, palette, scale, args.seed)
+    App(root, engine)
     engine.start()
     root.mainloop()
 

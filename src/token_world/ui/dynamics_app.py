@@ -5,6 +5,8 @@ from the run folders; the trainer's events only update the status and ask the vi
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 import queue
 import threading
 import tkinter as tk
@@ -34,17 +36,21 @@ def stalling(before: dict | None, now: dict) -> str:
 def launch(args, train_fn) -> None:
     """Open the window, run train_fn(args, events, stop) on a thread, block until closed."""
     root = tk.Tk()
-    root.title(f"World models ({', '.join(args.models)}) - live {', '.join(args.games)} histories")
-    root.geometry("1600x980")
-    root.minsize(1100, 700)
+    root.title(f"World models ({', '.join(Path(o).name for o in args.outputs.values())}) - live "   # the run folders:
+               f"{', '.join(args.games)} histories")                                               # runs side by side
+    width, height = min(1600, root.winfo_screenwidth() - 60), min(1000, root.winfo_screenheight() - 100)
+    root.geometry(f"{width}x{height}")
+    root.minsize(900, 600)
     setup_dark_theme(root)
     status = tk.StringVar(value="Starting live histories...")
     header = ttk.Frame(root)
     header.pack(fill="x", padx=8, pady=5)
-    ttk.Label(header, textvariable=status, style="Header.TLabel").pack(side="left")
     events: queue.Queue = queue.Queue()
     stop = threading.Event()
-    ttk.Button(header, text="Stop Training", command=stop.set, style="Stop.TButton").pack(side="right")
+    ttk.Button(header, text="Stop Training", command=stop.set, style="Stop.TButton").pack(side="right", anchor="n")
+    line = ttk.Label(header, textvariable=status, style="Header.TLabel", justify="left")
+    line.pack(side="left", fill="x", expand=True)
+    line.bind("<Configure>", lambda e: line.configure(wraplength=max(300, e.width - 10)))
     viewer = RunViewer(root, list(args.outputs.values()), args.compare)
     worker = threading.Thread(target=train_fn, args=(args, events, stop), daemon=True, name="world-model-trainer")
     worker.start()
@@ -82,7 +88,8 @@ def launch(args, train_fn) -> None:
             elif event[0] == "longdream":
                 name, step, summary = event[1:]
                 latest[name + " dream"] = f"{name} long dream @ {step:,}: " + "; ".join(
-                    f"{v} +128 {r['wrong_128']:.1%} mass {r['mass']:.2f} presence {r['presence']:.2f}"
+                    f"{v} +128 {r['wrong_128']:.1%} mass {r['mass']:.2f} hit {r['piece_hit_32']:.2f} "
+                    f"presence {r['presence']:.2f}"
                     + stalling(presence.get((name, v)), r) for v, r in summary.items())
                 presence.update({(name, v): r for v, r in summary.items()})
                 status.set("   |   ".join(latest.values()))

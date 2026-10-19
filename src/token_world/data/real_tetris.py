@@ -65,3 +65,46 @@ class RealTetris:
     def context(self, device="cuda") -> tuple[torch.Tensor, torch.Tensor]:
         """The last CONTEXT frames [T, 256, 256] and the buttons that produced them [T]."""
         return torch.from_numpy(np.stack(self.frames)).to(device), torch.tensor(list(self.actions), device=device)
+
+
+START = 3                        # frames a dream starts from, as the browser's (prefill takes all but the last)
+LEVEL = 0x44                     # the game's level byte
+SETTLE = 8                       # frames into the game the start ends: the camera has moved to the playfield
+
+
+def game_start(seed: int = 0) -> RealTetris:
+    """A live game at the browser's start (scripts/export_onnx.py ships its last START frames' layers): SETTLE
+    frames into a level-0 game, after its black frames (the bot plays the menus; seeds from `seed` are tried
+    until it picks level 0), the camera the same over the last START frames. Ending on the playfield: from the
+    black frames alone the model dreams the menu back first; and past the playfield's camera switch (the menus'
+    nametable to the playfield's, 2 frames in), as the dreams hold the start's camera."""
+    for seed in range(seed, seed + 200):
+        game = RealTetris(seed, layered=True)
+        for _ in range(20_000):
+            frame, _ = game.step(None)
+            if game.observation.ram[MODE] == IN_GAME and (frame[16:240] == frame[16, 0]).all():
+                break                                    # the first black frame of the game
+        else:
+            continue
+        while True:                                      # to the last one
+            frame, _ = game.step(None)
+            if not (frame[16:240] == frame[16, 0]).all():
+                break
+        for _ in range(SETTLE):                          # the playfield's camera (its nametable) comes 2 frames in
+            game.step(None)
+        if game.observation.ram[LEVEL] != 0:             # (set by now: Start held with A adds 10 levels)
+            continue
+        frames = list(game.layers)[-START:]
+        if any((f["camera"] != frames[-1]["camera"]).any() for f in frames):
+            continue
+        return game
+    raise RuntimeError("no level-0 game start found")
+
+
+def start_context(game: RealTetris) -> tuple[np.ndarray, np.ndarray, dict]:
+    """A game's last START frames: model frames [START, 256, 256], controller bytes [START] and layers (each key
+    [START, ...]), what a dream starts from."""
+    layers = list(game.layers)[-START:]
+    return (np.stack(list(game.frames)[-START:]), np.array(list(game.actions)[-START:], np.int64),
+            {k: np.stack([f[k] for f in layers]) for k in layers[0]})
+

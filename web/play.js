@@ -5,7 +5,8 @@
 //   ?verbose              onnxruntime's own log, everything (node placements, ...)
 //   ?check                first dream the start with no buttons against PyTorch's frames (model/reference.bin)
 import * as ort from "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.30.0/dist/ort.webgpu.min.mjs";
-import { Dreamer, startLayers } from "./dreamer.js";
+import { Dreamer, startFrames } from "./dreamer.js";
+import { setupEditor } from "./shot_editor.js";
 import { Timings, catchProfiles, findBackend, log, logged, profile, warn, watchDevice } from "./diagnostics.js";
 
 const OPTIONS = new URLSearchParams(location.search);
@@ -54,7 +55,10 @@ async function start() {
     ({ backend, gpu } = await findBackend(ort, OPTIONS.get("backend")));
     status(`Loading the model (${backend})…`, backend !== "webgpu");
     const meta = JSON.parse(new TextDecoder().decode(await load("context.json")));
-    context = { start: startLayers(meta, await load("context.bin")), actions: meta.actions };
+    context = { start: startFrames(meta, await load("context.bin")), actions: meta.actions };
+    const original = context;                      // the page's own start; an image start replaces `context`
+    setupEditor({ palette: meta.palette, base: original.start,
+                  play: (start, actions) => restartWith({ start, actions }), normal: () => restartWith(original) });
     dreamer = await Dreamer.create(ort, load, context.start, context.actions, {
       executionProviders: [backend], log,
       sessionOptions: { ...(PROFILE ? { enableProfiling: true } : {}),
@@ -160,14 +164,18 @@ $("pad").addEventListener("contextmenu", (e) => e.preventDefault());   // no lon
 addEventListener("keydown", (e) => key(e, true));
 addEventListener("keyup", (e) => key(e, false));
 addEventListener("blur", () => { keyboard = 0; touches.clear(); update(); });
-$("restart").addEventListener("click", async () => {
+// Start the dream again from `start` (the page's, or an image's: shot_editor.js); Restart replays the current one.
+async function restartWith(start) {
+  if (!dreamer) return;
   paused = true;
   await pending;
+  context = start;
   await dreamer.reset(context.start, context.actions);
   paused = false;
   $("pause").textContent = "Pause";
   screen.focus();
-});
+}
+$("restart").addEventListener("click", () => restartWith(context));
 $("pause").addEventListener("click", () => {
   paused = !paused;
   $("pause").textContent = paused ? "Resume" : "Pause";

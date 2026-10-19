@@ -1,6 +1,7 @@
 """World model: exact pixel patches, causality, masking, the masked loss, action conditioning, soft decoding,
 the two training stages (teacher forcing; rollouts with the pred-to-real blend) and the sampled choice per
 frame (the latent)."""
+import math
 import sys
 import unittest
 from pathlib import Path
@@ -10,9 +11,10 @@ import torch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT / "src"), str(ROOT / "scripts")]
 
-from token_world.models.dynamics import (COLOURS, Dreamer, Dynamics, build, choice_kl, deepen, incoming_actions,
-                                         masked_loss, own_share, patch_pixels, rollout, sample_choice, training_mask,
-                                         unpatch_pixels, weigh_changes)
+from token_world.models.dynamics import (COLOURS, Attention, Dreamer, Dynamics, border_pixels, build, choice_kl, deepen,
+                                         incoming_actions, masked_loss, motion_loss, motion_tokens, own_share,
+                                         patch_pixels, rollout, sample_choice, training_mask, unpatch_pixels,
+                                         weigh_changes)
 
 
 def tiny():
@@ -34,6 +36,16 @@ def soft_window(model, x):
 
 
 class DynamicsTests(unittest.TestCase):
+    def test_time_is_rotary_so_only_frames_apart_count(self):
+        torch.manual_seed(0)
+        attention = Attention(32, 4, rotate=True).eval()
+        x = torch.randn(3, 6, 32)                                   # 3 positions' 6 frames
+        with torch.no_grad():
+            first, later = attention(x, causal=True, at=0), attention(x, causal=True, at=40)
+            self.assertTrue(torch.allclose(first, later, atol=1e-5))
+            self.assertFalse(torch.allclose(first, attention(x.flip(1), causal=True).flip(1), atol=1e-3))
+        self.assertFalse(any("time" in name for name, _ in Dynamics(32, 2, 2, frames=8, colour_dim=4).named_parameters()))
+
     def test_patches_round_trip_and_order(self):
         index = window(1, 1)[0, 0]
         pixels = patch_pixels(index, 16)
@@ -95,6 +107,32 @@ class DynamicsTests(unittest.TestCase):
         free = mask[cut == 0].float().mean(2)
         self.assertTrue(0.2 < ((free == 0).cumprod(1).sum(1) >= 2).float().mean().item() < 0.8)   # usual cuts
 
+    def test_training_mask_hides_a_share_of_frames_entirely(self):
+        cut = torch.tensor([0, 4] * 200)
+        plain = training_mask(400, 8, 256, "cpu", torch.Generator().manual_seed(3), cut=cut)
+        mask = training_mask(400, 8, 256, "cpu", torch.Generator().manual_seed(3), cut=cut, hidden=0.5)
+        self.assertTrue((mask | ~plain).all())                                  # only adds hidden tokens
+        self.assertFalse(mask[:, 0].any())
+        self.assertFalse(mask[cut == 4][:, :4].any())                           # the clean past stays visible
+        maskable = plain.any(2)                                                 # frames that are predicted
+        whole = mask.all(2)[maskable].float().mean().item()
+        self.assertTrue(0.42 < whole < 0.62)                                    # half, plus the cosine's few
+        self.assertLess(plain.all(2)[maskable].float().mean().item(), 0.12)
+
+    def test_training_mask_hides_the_given_frames_whenever_predicted(self):
+        cut = torch.tensor([0, 4] * 200)
+        hide = torch.zeros(400, 8, dtype=torch.bool)
+        hide[:, 2] = hide[:, 6] = True
+        plain = training_mask(400, 8, 256, "cpu", torch.Generator().manual_seed(3), cut=cut)
+        mask = training_mask(400, 8, 256, "cpu", torch.Generator().manual_seed(3), cut=cut, hide=hide)
+        self.assertTrue((mask | ~plain).all())                                  # only adds hidden tokens
+        self.assertTrue(torch.equal(mask[:, [1, 3, 4, 5, 7]], plain[:, [1, 3, 4, 5, 7]]))
+        for f in (2, 6):                                                        # all of a frame or none
+            self.assertTrue((mask[:, f].all(1) | ~mask[:, f].any(1)).all())
+        self.assertTrue(mask[cut == 4][:, 6].all())                             # after the cut: hidden
+        self.assertFalse(mask[cut == 4][:, 2].any())                            # in a clean past: visible
+        self.assertTrue(mask[cut == 0][:, 2].all(1).float().mean() > 0.4)       # predicted: hidden
+
     def test_masked_loss_scores_only_masked_tokens_and_trains(self):
         model = tiny()
         x = window(2, 6, 5)
@@ -129,6 +167,73 @@ class DynamicsTests(unittest.TestCase):
         self.assertEqual(len(g0), len(g1))
         for a, b in zip(g0, g1):
             self.assertTrue(torch.allclose(a, b, atol=1e-6, rtol=1e-4))
+
+    def test_a_weighted_loss_is_the_weighted_mean_with_its_gradient(self):
+        x, acts = window(2, 6, 11), torch.randint(0, 256, (2, 6))
+        mask = training_mask(2, 6, 256, "cpu", torch.Generator().manual_seed(6))
+        target = patch_pixels(x, 16)
+        weight = 1 + 9 * (torch.rand(target.shape, generator=torch.Generator().manual_seed(2)) < 0.1).float()
+        results = []
+        for fused in (True, False):
+            model = tiny()
+            features = model(x, acts, mask)
+            if fused:
+                total, per_pixel, _ = masked_loss(model, features, target, mask, chunk=100, weight=weight)
+            else:
+                where = mask.nonzero(as_tuple=True)
+                logits = model.logits(features[where]).float()
+                ce = torch.nn.functional.cross_entropy(logits.flatten(0, 1), target[where].long().flatten(),
+                                                       reduction="none")
+                total = (ce * weight[where].flatten()).sum() / weight[where].sum()
+                per_pixel = ce.detach().view(-1, 256)
+            total.backward()
+            results.append((total.detach(), per_pixel, [p.grad.clone() for p in model.parameters() if p.grad is not None]))
+        (l0, pp0, g0), (l1, pp1, g1) = results
+        self.assertTrue(torch.allclose(l0, l1, atol=1e-6))
+        self.assertTrue(torch.allclose(pp0, pp1, atol=1e-5))                      # per pixel: unweighted
+        for a, b in zip(g0, g1):
+            self.assertTrue(torch.allclose(a, b, atol=1e-6, rtol=1e-4))
+
+    def test_the_change_weight_falls_on_game_pixels_that_change(self):
+        self.assertIsNone(tiny().loss_weights(patch_pixels(window(1, 3), 16)))     # unweighted: none
+        model = Dynamics(dim=32, layers=2, heads=2, patch=16, frames=6, colour_dim=8, change_weight=10.0)
+        x = torch.zeros(1, 3, 256, 256, dtype=torch.uint8)
+        x[:, 1:, 100, 50] = 3                                                       # a game pixel changes at frame 1
+        x[:, 1:, 2, 50] = 3                                                         # and a border pixel
+        x[:, 2, 100, 60] = 4                                                        # another at frame 2
+        weight = unpatch_pixels(model.loss_weights(patch_pixels(x, 16)), 16)
+        self.assertEqual(weight[0, 1, 100, 50].item(), 10.0)
+        self.assertEqual(weight[0, 2, 100, 50].item(), 1.0)                        # stayed from 1 to 2
+        self.assertEqual(weight[0, 2, 100, 60].item(), 10.0)
+        self.assertEqual(weight[0, 1, 2, 50].item(), 1.0)                          # the border is not weighted
+        self.assertEqual(int((weight == 10).sum()), 2)
+        self.assertEqual(model.loss_weights(patch_pixels(x, 16))[:, 0].max().item(), 1.0)   # frame 0: nothing before
+
+    def test_decoding_undoes_the_change_weight(self):
+        plain = tiny().eval()
+        weighted = Dynamics(dim=32, layers=2, heads=2, patch=16, frames=6, colour_dim=8, change_weight=4.0).eval()
+        weighted.load_state_dict(plain.state_dict())
+        x, acts = window(1, 6, 13), torch.randint(0, 256, (1, 6))
+        last = patch_pixels(x[0, 2].long(), 16)
+        border = border_pixels(16)
+        with torch.no_grad():
+            mask = torch.zeros(1, 6, 256, dtype=torch.bool)
+            mask[:, 3] = True
+            raw = plain.logits(plain(x, acts, mask)[:, 3]).float().softmax(-1)[0]  # [N, P*P, COLOURS]
+        undone = weigh_changes(raw, last, torch.where(border, 1.0, 0.25)[..., None])
+        # a dream: the plain model's probabilities with the odds of change on game pixels times 1/4
+        dreamed = Dreamer(weighted, x[0, :3], acts[0, :3], keep=3).step(int(acts[0, 3]))
+        self.assertTrue(torch.allclose(dreamed, unpatch_pixels(undone.permute(2, 0, 1), 16).permute(1, 2, 0),
+                                       atol=1e-5))
+        self.assertTrue(torch.allclose(Dreamer(plain, x[0, :3], acts[0, :3], keep=3).step(int(acts[0, 3])),
+                                       unpatch_pixels(raw.permute(2, 0, 1), 16).permute(1, 2, 0), atol=1e-5))
+        # a scored rollout too: its pixels expected wrong, one frame ahead of the real history
+        wrong = rollout(weighted, x[:, :4], acts[:, :4], start=3)[2][0, 0]
+        real = patch_pixels(x[0, 3].long(), 16)
+        self.assertAlmostEqual(wrong.item(), 1 - undone.gather(-1, real[..., None]).mean().item(), places=5)
+        # it inverts the lean a weighted loss trains: odds of change times 4 on game pixels, then undone
+        leaned = weigh_changes(raw, last, torch.where(border, 1.0, 4.0)[..., None])
+        self.assertTrue(torch.allclose(weigh_changes(leaned, last, weighted.change_undo("cpu")), raw, atol=1e-6))
 
     def test_tied_head_scores_pixels_against_the_colour_embedding(self):
         model = tiny()
@@ -176,6 +281,111 @@ class DynamicsTests(unittest.TestCase):
             self.assertTrue(torch.allclose(shallow(x, acts, mask), deep(x, acts, mask), atol=1e-5))
         self.assertFalse(torch.equal(deep.blocks[1].spatial.qkv.weight, shallow.blocks[0].spatial.qkv.weight))
 
+    def test_one_more_layer_computes_what_the_shallow_one_did(self):
+        torch.manual_seed(3)
+        shallow = Dynamics(dim=32, layers=3, heads=2, patch=16, frames=6, colour_dim=8).eval()
+        torch.manual_seed(8)
+        deep = Dynamics(dim=32, layers=4, heads=2, patch=16, frames=6, colour_dim=8).eval()
+        deepen(deep, shallow.state_dict())
+        x, acts = window(1, 6, 11), torch.randint(0, 256, (1, 6))
+        mask = torch.rand(1, 6, 256, generator=torch.Generator().manual_seed(5)) < 0.3
+        with torch.no_grad():
+            self.assertTrue(torch.allclose(shallow(x, acts, mask), deep(x, acts, mask), atol=1e-5))
+        for i, j in ((0, 0), (1, 1), (2, 3)):                                   # the new block is third
+            for a, b in zip(shallow.blocks[i].state_dict().values(), deep.blocks[j].state_dict().values()):
+                self.assertTrue(torch.equal(a, b))
+        self.assertEqual(deep.blocks[2].spatial.out.weight.abs().sum().item(), 0)
+        with self.assertRaises(ValueError):
+            deepen(shallow, deep.state_dict())
+
+    def test_the_new_layer_goes_where_it_is_asked(self):
+        torch.manual_seed(3)
+        shallow = Dynamics(dim=32, layers=3, heads=2, patch=16, frames=6, colour_dim=8).eval()
+        x, acts = window(1, 6, 12), torch.randint(0, 256, (1, 6))
+        mask = torch.rand(1, 6, 256, generator=torch.Generator().manual_seed(6)) < 0.3
+        for at in range(4):
+            torch.manual_seed(9)
+            deep = Dynamics(dim=32, layers=4, heads=2, patch=16, frames=6, colour_dim=8).eval()
+            deepen(deep, shallow.state_dict(), new_at=at)
+            with torch.no_grad():
+                self.assertTrue(torch.allclose(shallow(x, acts, mask), deep(x, acts, mask), atol=1e-5))
+            self.assertEqual(deep.blocks[at].spatial.out.weight.abs().sum().item(), 0)
+            old = [j for j in range(4) if j != at]
+            for i, j in enumerate(old):
+                for a, b in zip(shallow.blocks[i].state_dict().values(), deep.blocks[j].state_dict().values()):
+                    self.assertTrue(torch.equal(a, b))
+        with self.assertRaises(ValueError):
+            deepen(Dynamics(dim=32, layers=5, heads=2, patch=16, frames=6, colour_dim=8), shallow.state_dict(), new_at=1)
+
+    def test_a_copied_layer_starts_near_the_shallow_model_and_is_not_a_no_op(self):
+        torch.manual_seed(3)
+        shallow = Dynamics(dim=32, layers=3, heads=2, patch=16, frames=6, colour_dim=8).eval()
+        x, acts = window(1, 6, 13), torch.randint(0, 256, (1, 6))
+        mask = torch.rand(1, 6, 256, generator=torch.Generator().manual_seed(7)) < 0.3
+        with torch.no_grad():
+            want = shallow(x, acts, mask)
+        for at in range(4):
+            deep = Dynamics(dim=32, layers=4, heads=2, patch=16, frames=6, colour_dim=8).eval()
+            deepen(deep, shallow.state_dict(), new_at=at, copy=True)
+            neighbour = at - 1 if at > 0 else 1
+            new, near = deep.blocks[at].spatial.out.weight, deep.blocks[neighbour].spatial.out.weight
+            self.assertTrue(torch.equal(new, near))
+            source = shallow.blocks[at - 1 if at > 0 else 0].spatial.out.weight
+            self.assertTrue(torch.allclose(new, 0.5 * source))
+            with torch.no_grad():
+                got = deep(x, acts, mask)
+            self.assertLess(((got - want).norm() / want.norm()).item(), 0.3)          # close, not exact (s3_plain: 0.17-0.25)
+        with self.assertRaises(ValueError):
+            deepen(Dynamics(dim=32, layers=4, heads=2, patch=16, frames=6, colour_dim=8), shallow.state_dict(), copy=True)
+
+    def test_buttons_reach_only_the_chosen_blocks(self):
+        torch.manual_seed(4)
+        model = Dynamics(dim=32, layers=3, heads=2, patch=16, frames=6, colour_dim=8, action_norm=True,
+                         action_blocks=(2,)).eval()
+        self.assertIsNone(model.blocks[0].modulation)
+        self.assertIsNone(model.blocks[1].modulation)
+        self.assertIsNotNone(model.blocks[2].modulation)
+        with torch.no_grad():
+            model.blocks[2].modulation[1].weight.normal_(0, 0.1)
+        x = window(1, 6, 14)
+        mask = torch.zeros(1, 6, 256, dtype=torch.bool)
+        seen = {}
+        hook = model.blocks[2].register_forward_hook(lambda m, args, out: seen.__setitem__("in", args[0]))
+        with torch.no_grad():
+            a = model(x, torch.zeros(1, 6, dtype=torch.long), mask)
+            first = seen["in"].clone()
+            b = model(x, torch.full((1, 6), 64, dtype=torch.long), mask)
+        hook.remove()
+        self.assertTrue(torch.equal(first, seen["in"]))          # the blocks before see no buttons
+        self.assertFalse(torch.allclose(a, b))                    # the last block does
+        with self.assertRaises(ValueError):
+            Dynamics(dim=32, layers=3, heads=2, patch=16, frames=6, colour_dim=8, action_blocks=(2,))
+
+    def test_local_attention_starts_as_without_and_biases_by_offset(self):
+        torch.manual_seed(0)
+        plain = Dynamics(dim=32, layers=2, heads=2, patch=16, frames=6, colour_dim=8, space_rope=True).eval()
+        local = Dynamics(dim=32, layers=2, heads=2, patch=16, frames=6, colour_dim=8, space_rope=True,
+                         local_attention=True).eval()
+        missing, extra = local.load_state_dict(plain.state_dict(), strict=False)
+        self.assertEqual(sorted(missing), [f"blocks.{i}.spatial.local_bias" for i in range(2)])
+        x, acts = window(1, 6, 7), torch.randint(0, 256, (1, 6))
+        mask = training_mask(1, 6, 256, "cpu", torch.Generator().manual_seed(1))
+        with torch.no_grad():
+            self.assertTrue(torch.allclose(local(x, acts, mask), plain(x, acts, mask), atol=1e-6))   # from zero
+            attention = local.blocks[0].spatial
+            offsets = attention.offsets                                              # [256, 256]
+            self.assertEqual(offsets[0, 17].item(), offsets[100, 117].item())        # the same (dy, dx) = (1, 1)
+            self.assertNotEqual(offsets[0, 17].item(), offsets[0, 18].item())
+            self.assertEqual(offsets[5, 5].item(), offsets[200, 200].item())        # (0, 0)
+            attention.local_bias[:, offsets[0, 0]] = 20.0                            # a head that only sees itself
+            q = torch.randn(1, 256, 32)
+            y = attention(q, local.place)
+            v = attention.qkv(q).view(1, 256, 3, 2, 16)[:, :, 2].reshape(1, 256, 32)
+            self.assertTrue(torch.allclose(y, attention.out(v), atol=1e-3))        # each token its own value
+        loss = masked_loss(local, local(x, acts, mask), patch_pixels(x, 16), mask)[0]
+        loss.backward()
+        self.assertGreater(local.blocks[0].spatial.local_bias.grad.abs().sum().item(), 0)
+
     def test_cached_frame_matches_the_full_window(self):
         model = tiny().eval()
         x, acts = window(2, 6, 6), torch.randint(0, 256, (2, 6))
@@ -208,6 +418,61 @@ class DynamicsTests(unittest.TestCase):
         mask = training_mask(1, 6, 256, "cpu", torch.Generator().manual_seed(1))
         masked_loss(model, model(x, acts, mask), patch_pixels(x, 16), mask)[0].backward()
         self.assertTrue(all(p.grad is not None for p in model.blocks[0].mlp.parameters()))
+
+    def test_space_rope_and_qk_norm_train_and_cache_like_the_full_window(self):
+        torch.manual_seed(0)
+        model = Dynamics(dim=32, layers=2, heads=2, patch=16, frames=6, colour_dim=8, space_rope=True,
+                         qk_norm=True).eval()
+        names = [n for n, _ in model.named_parameters()]
+        self.assertTrue(any("space_pos" in n for n in names))                     # the learned place stays (+ APE)
+        self.assertTrue(any("rope_freq" in n for n in names))
+        self.assertIsNotNone(model.blocks[0].temporal.q_norm)
+        self.assertIsInstance(model.blocks[0].mlp, torch.nn.Sequential)            # not modern's other changes
+        self.assertEqual(model.place[0, 17].tolist(), [1.0, 1.0])                 # (row, column) of patch 17
+        x, acts = window(1, 6, 9), torch.randint(0, 256, (1, 6))
+        mask = torch.zeros(1, 6, 256, dtype=torch.bool)
+        with torch.no_grad():
+            full = model(x, acts, mask)
+            cache = model.new_cache()
+            model(x[:, :5], acts[:, :5], mask[:, :5], cache=cache)
+            step = model(x[:, 5:], acts[:, 5:], mask[:, 5:], cache=cache, at=5)
+            self.assertTrue(torch.allclose(full[:, 5], step[:, 0], atol=1e-4))
+            plain = Dynamics(dim=32, layers=2, heads=2, patch=16, frames=6, colour_dim=8, qk_norm=True).eval()
+            self.assertFalse(any("rope_freq" in n for n, _ in plain.named_parameters()))
+        model.train()
+        mask = training_mask(1, 6, 256, "cpu", torch.Generator().manual_seed(1))
+        masked_loss(model, model(x, acts, mask), patch_pixels(x, 16), mask)[0].backward()
+        self.assertTrue(all(p.grad is not None for p in model.blocks[0].spatial.parameters()))
+        self.assertEqual(type(build({"dim": 32, "layers": 2, "heads": 2, "patch": 16, "frames": 6, "colour_dim": 8,
+                                     "space_rope": True}).place), torch.Tensor)
+
+    def test_action_norm_starts_as_without_then_conditions_every_block(self):
+        torch.manual_seed(0)
+        model = Dynamics(dim=32, layers=2, heads=2, patch=16, frames=6, colour_dim=8, action_norm=True).eval()
+        plain = Dynamics(dim=32, layers=2, heads=2, patch=16, frames=6, colour_dim=8).eval()
+        plain.load_state_dict({k: v for k, v in model.state_dict().items() if "modulation" not in k})
+        x, acts = window(1, 6, 9), torch.randint(0, 256, (1, 6))
+        mask = torch.zeros(1, 6, 256, dtype=torch.bool)
+        mask[:, 5] = True
+        with torch.no_grad():
+            self.assertTrue(torch.allclose(model(x, acts, mask), plain(x, acts, mask), atol=1e-6))   # zero at first
+            for block in model.blocks:
+                torch.nn.init.normal_(block.modulation[1].weight, std=0.1)
+            self.assertFalse(torch.allclose(model(x, acts, mask), plain(x, acts, mask), atol=1e-4))  # the norms move
+            other = acts.clone()
+            other[0, 5] = (int(acts[0, 5]) + 1) % 256
+            self.assertFalse(torch.allclose(model(x, acts, mask)[:, 5], model(x, other, mask)[:, 5], atol=1e-4))
+            full = model(x, acts, mask)
+            cache = model.new_cache()
+            model(x[:, :5], acts[:, :5], mask[:, :5], cache=cache)
+            step = model(x[:, 5:], acts[:, 5:], mask[:, 5:], cache=cache, at=5)
+            self.assertTrue(torch.allclose(full[:, 5], step[:, 0], atol=1e-4))
+        model.train()
+        mask = training_mask(1, 6, 256, "cpu", torch.Generator().manual_seed(1))
+        masked_loss(model, model(x, acts, mask), patch_pixels(x, 16), mask)[0].backward()
+        self.assertTrue(all(b.modulation[1].weight.grad is not None for b in model.blocks))
+        self.assertTrue(build({"dim": 32, "layers": 2, "heads": 2, "patch": 16, "frames": 6, "colour_dim": 8,
+                               "action_norm": True}).blocks[0].modulation is not None)
 
     def test_recompute_keeps_loss_and_gradients(self):
         x, acts = window(2, 6, 10), torch.randint(0, 256, (2, 6))
@@ -242,7 +507,9 @@ class SoftDecodingTests(unittest.TestCase):
     def test_cached_rollout_matches_the_full_window(self):
         model = tiny().eval()
         x, acts = window(2, 6, 6), torch.randint(0, 256, (2, 6))
-        tokens, unsure, wrong, drawn = rollout(model, x, acts, start=3)
+        tokens, unsure, wrong, drawn, resynced, motion = rollout(model, x, acts, start=3)
+        self.assertIsNone(resynced)                                                # no resync asked for
+        self.assertIsNone(motion)                                                  # no motion model
         self.assertEqual(tokens.shape, (2, 3, 256, 32))
         self.assertEqual((unsure.shape, wrong.shape), ((2, 3), (2, 3)))
         self.assertTrue(((wrong > 0) & (wrong <= 1)).all())
@@ -254,6 +521,29 @@ class SoftDecodingTests(unittest.TestCase):
                 mask[:, at] = True
                 reference[:, at] = model.soft_frame(model(reference, acts, mask)[:, at])
         self.assertTrue(torch.allclose(tokens, model._patches(reference[:, 3:]), atol=1e-4))
+
+    def test_a_resynced_rollout_replaces_only_the_patches_that_went_off(self):
+        model = tiny().eval()
+        x, acts = window(2, 6, 6), torch.randint(0, 256, (2, 6))
+        own = rollout(model, x, acts, start=3)[0]
+        tokens, _, _, _, resynced, _ = rollout(model, x, acts, start=3, resync=0)   # every patch is off by >= 0
+        self.assertTrue(torch.allclose(tokens, model._patches(x[:, 3:]), atol=1e-5))   # the real frames
+        self.assertTrue(torch.equal(resynced, torch.ones(2, 3)))
+        tokens, _, _, _, resynced, _ = rollout(model, x, acts, start=3, resync=257)  # no patch has 257 pixels
+        self.assertTrue(torch.allclose(tokens, own, atol=1e-5))                   # the model's own frames
+        self.assertTrue(torch.equal(resynced, torch.zeros(2, 3)))
+        with torch.no_grad():                         # in between: a patch is real exactly where it went off
+            mask = torch.zeros(2, 6, 256, dtype=torch.bool)
+            mask[:, 3] = True
+            probs = model.logits(model(x, acts, mask)[:, 3]).float().softmax(-1)
+        off = (probs.argmax(-1) != patch_pixels(x[:, 3], 16)).sum(-1)              # [2, 256] pixels off
+        threshold = int(off.float().median())
+        tokens, _, _, _, resynced, _ = rollout(model, x, acts, start=3, resync=threshold)
+        diverged = off >= threshold
+        real, mine = model._patches(x[:, 3:4])[:, 0], own[:, 0]
+        self.assertTrue(torch.allclose(tokens[:, 0][diverged], real[diverged], atol=1e-5))
+        self.assertTrue(torch.allclose(tokens[:, 0][~diverged], mine[~diverged], atol=1e-5))
+        self.assertTrue(torch.allclose(resynced[:, 0], diverged.float().mean(1)))
 
     def test_a_soft_token_is_the_patch_embedding_of_its_soft_pixels(self):
         model = tiny().eval()
@@ -296,12 +586,24 @@ class SoftDecodingTests(unittest.TestCase):
         expected = rollout(model, x[:1], acts[:1], start=3)[0][0]
         dreamer = Dreamer(model, x[0, :3], acts[0, :3], keep=3)
         probs = [dreamer.step(int(a)) for a in acts[0, 3:]]
-        self.assertTrue(torch.allclose(torch.stack(dreamer.frames[3:]), expected, atol=1e-5))   # same frames
+        self.assertTrue(torch.allclose(torch.stack(dreamer.frames[3:], 1)[0], expected, atol=1e-5))   # same frames
         self.assertEqual(probs[0].shape, (256, 256, COLOURS))
         self.assertTrue(torch.allclose(probs[0].sum(-1), torch.ones(256, 256), atol=1e-4))
         for _ in range(5):                                                         # then it slides and keeps going
             dreamer.step(0)
         self.assertLessEqual(len(dreamer.frames), model.frames)
+
+    def test_a_batch_of_dreams_dreams_each_as_alone(self):
+        model = tiny().eval()
+        x, acts = window(2, 6, 12), torch.randint(0, 256, (2, 6))
+        both = Dreamer(model, x[:, :3], acts[:, :3], keep=3)
+        alone = [Dreamer(model, x[i, :3], acts[i, :3], keep=3) for i in range(2)]
+        for t in range(3, 9):                                     # past the window (6): both slide alike
+            pressed = acts[:, t % 6]
+            together = both.step(pressed)
+            self.assertEqual(together.shape, (2, 256, 256, COLOURS))
+            for i in range(2):
+                self.assertTrue(torch.allclose(together[i], alone[i].step(int(pressed[i])), atol=1e-5))
 
     def test_weighing_changes_multiplies_their_odds(self):
         probs = torch.tensor([[0.75, 0.15, 0.10], [0.2, 0.3, 0.5]])
@@ -353,6 +655,281 @@ class TrainingTests(unittest.TestCase):
         self.assertEqual(float(losses["rollout_frames"]), 0.0)
         losses["total"].backward()
         self.assertGreater(model.blocks[0].temporal.qkv.weight.grad.abs().sum().item(), 0)
+
+    def test_a_direction_press_weighs_the_frames_it_reaches(self):
+        import train_dynamics_ui as D
+        from token_world.data.tetris_bot import A, DOWN, LEFT, START
+        incoming = torch.tensor([[-1, 0, LEFT, 0, 0, DOWN, 0, A | DOWN, A, 0, START, 0]])
+        weight = D.press_weights(incoming, 10.0)[0]
+        # Left reaches its frame and the next; Down alone and Start nothing; A held two frames reaches three
+        self.assertEqual(weight.tolist(), [1, 1, 10, 10, 1, 1, 1, 10, 10, 10, 1, 1])
+        self.assertIsNone(D.press_weights(incoming, 1.0))
+
+    def test_pressed_frames_and_a_twins_branch_frames(self):
+        import train_dynamics_ui as D
+        from token_world.data.tetris_bot import A, DOWN, LEFT
+        incoming = torch.tensor([[-1, 0, LEFT, 0, 0, DOWN, 0, A, 0, 0],
+                                 [-1, 0, LEFT, 0, 0, DOWN, 0, 0, 0, 0]])      # the twin: its A at 7 released
+        self.assertEqual(D.pressed_frames(incoming)[0].tolist(), [0, 0, 1, 1, 0, 0, 0, 1, 1, 0])
+        # the twin's branch press is action 6 (incoming at frame 7): frames 7 and 8 count as the real one's do
+        reached = D.pressed_frames(incoming, torch.tensor([-1, 6]))
+        self.assertEqual(reached[0].tolist(), [0, 0, 1, 1, 0, 0, 0, 1, 1, 0])
+        self.assertEqual(reached[1].tolist(), [0, 0, 1, 1, 0, 0, 0, 1, 1, 0])
+
+    def test_a_press_weighted_step_changes_only_the_loss_weighting(self):
+        import train_dynamics_ui as D
+        from token_world.data.tetris_bot import RIGHT
+        x = window(4, 6, 34)
+        acts = torch.zeros(4, 6, dtype=torch.long)
+        acts[:, 2] = RIGHT
+        out = [D.train_step(m, m, x, acts, generator=torch.Generator().manual_seed(0), press_weight=w)
+               for m, w in ((tiny(), 1.0), (tiny(), 10.0))]
+        self.assertTrue(torch.allclose(out[0]["game"], out[1]["game"]))           # the same unweighted losses
+        self.assertFalse(torch.allclose(out[0]["total"], out[1]["total"]))
+        out[1]["total"].backward()
+
+    def test_motion_starts_as_without_and_goes_in_wherever_it_is_known(self):
+        from token_world.data.tetris_motion import CODES, UNKNOWN
+        torch.manual_seed(0)
+        model = Dynamics(dim=32, layers=2, heads=2, patch=16, frames=6, colour_dim=8, motion=True).eval()
+        x, acts = window(1, 6, 21), torch.randint(0, 256, (1, 6))
+        mask = torch.zeros(1, 6, 256, dtype=torch.bool)
+        mask[:, 4:] = True
+        motion = motion_tokens(torch.randint(0, CODES, (1, 6, 32, 32)), 16)
+        with torch.no_grad():
+            self.assertTrue(torch.allclose(model(x, acts, mask, motion=motion), model(x, acts, mask)))   # from zero
+            model.motion_in.weight.normal_()
+            added = model.motion_embedding(motion)
+            self.assertTrue((added.abs().sum(-1) > 0).all())                         # masked tokens too
+            unknown = torch.full_like(motion, UNKNOWN)
+            self.assertTrue((model.motion_embedding(unknown) == 0).all())          # withheld: nothing
+            self.assertFalse(torch.allclose(model(x, acts, mask, motion=motion), model(x, acts, mask)))
+
+    def test_motion_loss_scores_the_masked_picture_cells_and_trains_the_head(self):
+        from token_world.data.tetris_motion import UNKNOWN, code_of
+        torch.manual_seed(0)
+        model = Dynamics(dim=32, layers=2, heads=2, patch=16, frames=6, colour_dim=8, motion=True)
+        x, acts = window(2, 6, 22), torch.randint(0, 256, (2, 6))
+        mask = training_mask(2, 6, 256, "cpu", torch.Generator().manual_seed(3))
+        cells = torch.zeros(2, 6, 32, 32, dtype=torch.uint8)
+        cells[:, :, 10, 12] = code_of(1, -1)                                         # a turn's cell
+        cells[:, :, 10, 14] = code_of(0, 1)                                          # a shift's
+        cells[:, :2] = UNKNOWN
+        cell_mask = mask[..., None].expand(-1, -1, -1, 4)
+        out = motion_loss(model, model(x, acts, mask), motion_tokens(cells, 16), cell_mask)
+        self.assertTrue(torch.isfinite(out["motion"]))
+        self.assertTrue(0 <= out["motion_turned"] <= 1 and 0 <= out["motion_moved"] <= 1)
+        out["motion"].backward()
+        self.assertGreater(model.motion_out.weight.grad.abs().sum().item(), 0)
+        self.assertGreater(model.blocks[0].temporal.qkv.weight.grad.abs().sum().item(), 0)
+        border = torch.zeros_like(cells)
+        border[:, :, :2] = code_of(1, 0)                                             # the border's rows only
+        none = motion_loss(model, model(x, acts, mask), motion_tokens(border, 16), cell_mask)
+        clean = motion_loss(model, model(x, acts, mask), motion_tokens(torch.zeros_like(cells), 16), cell_mask)
+        self.assertAlmostEqual(none["motion"].item(), clean["motion"].item(), places=6)   # not scored
+
+    def test_a_dream_writes_its_own_motion_into_its_history(self):
+        from token_world.models.dynamics import FrameDecoder, motion_cells
+        torch.manual_seed(0)
+        model = Dynamics(dim=32, layers=2, heads=2, patch=16, frames=6, colour_dim=8, motion=True).eval()
+        with torch.no_grad():
+            model.motion_in.weight.normal_()
+        x, acts = window(1, 6, 23), torch.randint(0, 256, (1, 6))
+        decoder = FrameDecoder(model, 1, x.device, (False, torch.bfloat16))
+        decoder.prefill(x[:, :3], acts[:, :3])
+        first = decoder.next(acts[:, 3:4], 3)
+        second = decoder.next(acts[:, 4:5], 4)
+        # the same from the whole window: frame 3 its soft frame and its own motion, frame 4 masked
+        soft = soft_window(model, x)
+        soft[:, 3] = first["soft"]
+        given = torch.full((1, 6, 256, 4), 255, dtype=torch.long)
+        given[:, 3] = motion_tokens(first["motion"], 16)
+        mask = torch.zeros(1, 6, 256, dtype=torch.bool)
+        mask[:, 4] = True
+        with torch.no_grad():
+            whole = model.logits(model(soft, acts, mask, motion=given)[:, 4]).float().softmax(-1)
+        from token_world.models.dynamics import unpatch_pixels as unpatch
+        self.assertTrue(torch.allclose(second["probs"], unpatch(whole.permute(0, 3, 1, 2), 16).permute(0, 2, 3, 1),
+                                       atol=1e-4))
+        dreamer = Dreamer(model, x[0, :3], acts[0, :3], keep=3)
+        for t in range(3, 9):                                                        # past the window: it slides
+            dreamer.step(int(acts[0, t % 6]))
+            self.assertEqual(dreamer.motion.shape, (32, 32))
+        self.assertEqual(len(dreamer.motions), len(dreamer.frames))
+        self.assertTrue((dreamer.motion[:2] == 0).all() and (dreamer.motion[-2:] == 0).all())   # the border: still
+
+    def test_motion_first_draws_the_pixels_given_the_motion_it_drew(self):
+        from token_world.models.dynamics import FrameDecoder, motion_tokens as tokens_of, unpatch_pixels as unpatch
+        torch.manual_seed(0)
+        model = Dynamics(dim=32, layers=2, heads=2, patch=16, frames=6, colour_dim=8, motion=True,
+                         motion_first=True).eval()
+        with torch.no_grad():
+            model.motion_in.weight.normal_()
+        x, acts = window(1, 6, 24), torch.randint(0, 256, (1, 6))
+        decoder = FrameDecoder(model, 1, x.device, (False, torch.bfloat16))
+        decoder.prefill(x[:, :3], acts[:, :3])
+        out = decoder.next(acts[:, 3:4], 3)
+        mask = torch.zeros(1, 6, 256, dtype=torch.bool)
+        mask[:, 3] = True
+        given = torch.full((1, 6, 256, 4), 255, dtype=torch.long)
+        with torch.no_grad():
+            first = model(x, acts, mask)[:, 3]                                       # motion, step 1
+            committed = model.committed_motion(first)
+            given[:, 3] = committed
+            second = model(x, acts, mask, motion=given)[:, 3]                       # motion, step 2
+            moved = torch.where(committed != 255, committed, model.drawn_motion(second))
+            self.assertTrue(torch.equal(tokens_of(out["motion"], 16), moved))
+            given[:, 3] = moved
+            probs = model.logits(model(x, acts, mask, motion=given)[:, 3]).float().softmax(-1)   # the pixels
+        self.assertTrue(torch.allclose(out["probs"], unpatch(probs.permute(0, 3, 1, 2), 16).permute(0, 2, 3, 1),
+                                       atol=1e-4))
+        with self.assertRaises(ValueError):
+            Dynamics(dim=32, layers=2, heads=2, patch=16, frames=6, colour_dim=8, motion_first=True)
+
+    def test_one_step_motion_draws_every_cell_from_the_first_pass_then_the_pixels_given_it(self):
+        from token_world.models.dynamics import FrameDecoder, motion_tokens as tokens_of, unpatch_pixels as unpatch
+        torch.manual_seed(0)
+        model = Dynamics(dim=32, layers=2, heads=2, patch=16, frames=6, colour_dim=8, motion=True,
+                         motion_first=True).eval()
+        model.motion_steps = 1
+        with torch.no_grad():
+            model.motion_in.weight.normal_()
+        x, acts = window(1, 6, 25), torch.randint(0, 256, (1, 6))
+        decoder = FrameDecoder(model, 1, x.device, (False, torch.bfloat16))
+        decoder.prefill(x[:, :3], acts[:, :3])
+        out = decoder.next(acts[:, 3:4], 3)
+        mask = torch.zeros(1, 6, 256, dtype=torch.bool)
+        mask[:, 3] = True
+        given = torch.full((1, 6, 256, 4), 255, dtype=torch.long)
+        with torch.no_grad():
+            moved = model.drawn_motion(model(x, acts, mask)[:, 3])                     # the one motion pass
+            self.assertTrue(torch.equal(tokens_of(out["motion"], 16), moved))
+            given[:, 3] = moved
+            probs = model.logits(model(x, acts, mask, motion=given)[:, 3]).float().softmax(-1)   # the pixels
+        self.assertTrue(torch.allclose(out["probs"], unpatch(probs.permute(0, 3, 1, 2), 16).permute(0, 2, 3, 1),
+                                       atol=1e-4))
+
+    def test_motion_first_training_gives_a_share_of_masked_frames_their_motion_and_does_not_score_it(self):
+        import train_dynamics_ui as D
+        from token_world.data.tetris_motion import code_of
+        torch.manual_seed(0)
+        x = window(4, 6, 34)
+        cells = torch.zeros(4, 6, 32, 32, dtype=torch.uint8)
+        cells[:, 2:, 12, 14] = code_of(1, 0)
+        seen = []
+        for first in (False, True):
+            model = Dynamics(dim=32, layers=2, heads=2, patch=16, frames=6, colour_dim=8, motion=True,
+                             motion_first=first)
+            calls = []
+            forward = lambda *a, **k: (calls.append(k["motion"]), model(*a, **k))[1]
+            losses = D.train_step(model, forward, x, torch.randint(0, 256, (4, 6)),
+                                  generator=torch.Generator().manual_seed(0), motion=cells)
+            self.assertTrue(torch.isfinite(losses["motion"]))
+            mask = D.training_mask(4, 6, 256, "cpu", torch.Generator().manual_seed(0))
+            given = (calls[0] != 255) & mask[..., None]                              # masked cells given
+            partly = given.any(-1) & ~given.all(-1)
+            seen.append((given.float().sum() / (4 * mask.sum()), partly.any()))
+        self.assertEqual(seen[0][0].item(), 0.0)                                     # plain: masked cells never
+        self.assertGreater(seen[1][0].item(), 0.1)                                   # motion first: a share,
+        self.assertTrue(seen[1][1])                                                  # some tokens only partly
+
+    def test_a_resynced_motion_rollout_gives_the_replaced_patches_their_real_motion(self):
+        from token_world.data.tetris_motion import CODES
+        torch.manual_seed(0)
+        model = Dynamics(dim=32, layers=2, heads=2, patch=16, frames=6, colour_dim=8, motion=True,
+                         motion_first=True).eval()
+        x, acts = window(2, 6, 7), torch.randint(0, 256, (2, 6))
+        cells = torch.randint(0, CODES, (2, 6, 32, 32), dtype=torch.uint8)
+        own = rollout(model, x, acts, start=3, motion=cells)[5]                    # [2, 3, 32, 32] its own motion
+        self.assertEqual(own.shape, (2, 3, 32, 32))
+        self.assertFalse(torch.equal(own.to(torch.uint8), cells[:, 3:]))          # not the real motion
+        every = rollout(model, x, acts, start=3, resync=0, motion=cells)[5]       # every patch replaced
+        self.assertTrue(torch.equal(every.to(torch.uint8), cells[:, 3:]))
+        none = rollout(model, x, acts, start=3, resync=257, motion=cells)[5]      # none replaced
+        self.assertTrue(torch.equal(none, own))
+
+    def test_a_motion_model_trains_on_resynced_rollouts_with_the_motion_they_were_drawn_with(self):
+        import train_dynamics_ui as D
+        from token_world.data.tetris_motion import CODES
+        torch.manual_seed(0)
+        model = Dynamics(dim=32, layers=2, heads=2, patch=16, frames=6, colour_dim=8, motion=True,
+                         motion_first=True)
+        x, acts = window(2, 6, 8), torch.randint(0, 256, (2, 6))
+        cells = torch.randint(0, CODES, (2, 6, 32, 32), dtype=torch.uint8)
+        calls = []
+        forward = lambda *a, **k: (calls.append(k["motion"]), model(*a, **k))[1]
+        losses = D.train_step(model, forward, x, acts, depth=3, generator=torch.Generator().manual_seed(1),
+                              resync=257, motion=cells)                         # the history keeps its own motion
+        k = int(losses["rollout_frames"])
+        self.assertGreaterEqual(k, 1)
+        self.assertTrue(torch.isfinite(losses["total"]) and torch.isfinite(losses["motion"]))
+        losses["total"].backward()
+        self.assertTrue(all(torch.isfinite(p.grad).all() for p in model.parameters() if p.grad is not None))
+        given, real = calls[0], D.motion_tokens(cells, 16)
+        known = given != 255                                                      # what was not withheld
+        drawn = (given != real) & known                                            # given, and not the real motion
+        frames = drawn.flatten(2).any(-1).any(0).nonzero()[:, 0].tolist()
+        self.assertTrue(frames, "the dreamed history's motion should differ from the real")
+        self.assertEqual(len(frames), len(set(frames)))
+        self.assertTrue(all(1 <= f < 5 for f in frames))                           # only rollout frames, never the last
+        self.assertLessEqual(max(frames) - min(frames) + 1, k)
+
+    def test_the_first_motion_step_commits_the_sure_cells_and_one_more(self):
+        from token_world.data.tetris_motion import STILL, UNKNOWN, code_of
+        torch.manual_seed(0)
+        model = Dynamics(dim=32, layers=2, heads=2, patch=16, frames=6, colour_dim=8, motion=True,
+                         motion_first=True).eval()
+        cw, ccw = code_of(1, -1), code_of(-1, 1)
+        with torch.no_grad():
+            model.motion_out.weight.zero_()
+            bias = torch.full((4, 46), -30.0)
+            bias[:, STILL] = 0.0                                                     # every cell sure it stays
+            model.motion_out.bias.copy_(bias.flatten())
+            logits = model.motion_logits(torch.zeros(1, 256, 32))
+            features = torch.zeros(1, 256, 32)
+        # a piece over tokens 100 and 101, unsure between two turns: cell (100, 0) the most confident of them
+        unsure = {(100, 0): 0.55, (100, 1): 0.52, (101, 2): 0.51}
+
+        def logits_of(f):
+            out = logits.clone()
+            for (n, c), p in unsure.items():
+                out[0, n, c] = -30.0
+                out[0, n, c, cw], out[0, n, c, ccw] = math.log(p), math.log(1 - p)
+            return out
+        model.motion_logits = logits_of
+        committed = model.committed_motion(features)
+        self.assertEqual(committed[0, 100, 0].item(), cw)                           # the most confident unsure cell
+        self.assertEqual(committed[0, 100, 1].item(), UNKNOWN)                      # the other unsure ones: step 2
+        self.assertEqual(committed[0, 101, 2].item(), UNKNOWN)
+        self.assertEqual(int((committed == UNKNOWN).sum()), 2)                      # everything else is sure
+        self.assertTrue((committed[0, :16] == STILL).all())                         # the border
+
+    def test_motion_is_withheld_from_whole_windows_or_before_a_cut(self):
+        import train_dynamics_ui as D
+        from token_world.data.tetris_motion import UNKNOWN
+        motion = torch.zeros(4000, 8, 1, 1, dtype=torch.long)
+        given = D.withheld_motion(motion, torch.Generator().manual_seed(0))[:, :, 0, 0] == UNKNOWN   # [B, T]
+        none, full = given.all(1), ~given.any(1)
+        self.assertAlmostEqual(none.float().mean().item(), D.MOTION_DROP, delta=0.03)
+        self.assertAlmostEqual(full.float().mean().item(), 1 - 2 * D.MOTION_DROP, delta=0.03)
+        part = given[~none & ~full]
+        self.assertTrue((part[:, :-1] >= part[:, 1:]).all())                      # withheld up to a cut, then given
+
+    def test_a_motion_step_trains_on_the_motion_and_reports_it(self):
+        import train_dynamics_ui as D
+        from token_world.data.tetris_motion import code_of
+        torch.manual_seed(0)
+        model = Dynamics(dim=32, layers=2, heads=2, patch=16, frames=6, colour_dim=8, motion=True)
+        x = window(4, 6, 34)
+        cells = torch.zeros(4, 6, 32, 32, dtype=torch.uint8)
+        cells[:, 2:, 12, 14] = code_of(1, 0)
+        losses = D.train_step(model, model, x, torch.randint(0, 256, (4, 6)), generator=torch.Generator().manual_seed(0),
+                              motion=cells)
+        self.assertTrue(torch.isfinite(losses["motion"]))
+        losses["total"].backward()
+        self.assertGreater(model.motion_out.weight.grad.abs().sum().item(), 0)
+        with self.assertRaises(ValueError):                                          # it needs the batch's motion
+            D.train_step(model, model, x, torch.randint(0, 256, (4, 6)))
 
     def test_rollout_step_with_a_blend_reports_and_trains(self):
         import train_dynamics_ui as D

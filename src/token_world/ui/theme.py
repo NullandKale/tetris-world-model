@@ -34,6 +34,12 @@ def setup_dark_theme(root: tk.Widget) -> ttk.Style:
     style.configure("State.TLabel", background=BG_DARK, foreground=ACCENT_GREEN, font=("Segoe UI", 9, "bold"))
     style.configure("MetricVal.TLabel", background=BG_DARK, foreground=TEXT_PRIMARY, font=("Consolas", 9))
     style.configure("PanelTitle.TLabel", background=BG_DARK, foreground=TEXT_MUTED, font=("Segoe UI", 8))
+    style.configure("Explain.TLabel", background=BG_DARK, foreground="#a8a8bc", font=("Segoe UI", 9))
+    style.configure("Legend.TLabel", background=BG_DARK, foreground=TEXT_PRIMARY, font=("Segoe UI", 9, "bold"))
+    style.configure("TRadiobutton", background=BG_DARK, foreground=TEXT_PRIMARY, focuscolor=ACCENT_BLUE)
+    style.map("TRadiobutton", background=[("active", BG_DARK)],
+              indicatorcolor=[("selected", ACCENT_BLUE), ("!selected", CARD_DARK)])
+    style.configure("TPanedwindow", background=BORDER_DARK)
     style.configure("RolloutTitle.TLabel", background=BG_DARK, foreground=TEXT_MUTED, font=("Segoe UI", 9, "bold"))
     style.configure("RolloutStep.TLabel", background=BG_DARK, foreground=ACCENT_BLUE, font=("Consolas", 10, "bold"))
 

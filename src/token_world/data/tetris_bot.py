@@ -139,13 +139,26 @@ def best_placement(board: np.ndarray, piece: str, next_piece: str | None, well: 
     return MOVES[piece][2][int(np.where(ok, score, -np.inf).argmax())]
 
 
+def turn_button(orientation: int, goal: int, rng: np.random.Generator) -> int:
+    """The button that turns the piece toward `goal` the short way: A takes it to the next id in IDS_OF (the
+    game's order), B to the one before; a half turn, or a piece with two orientations, either at random. Turning
+    with A alone made 81% of the data's turns A and tied the direction to the press itself, and no model learned
+    which way B turns (docs/guides/recipe_attempts.md, 2026-10-14)."""
+    ids = IDS_OF[TYPE_OF[orientation]]
+    step = (ids.index(goal) - ids.index(orientation)) % len(ids)
+    if len(ids) == 4 and step != 2:
+        return A if step == 1 else B
+    return int(rng.choice((A, B)))
+
+
 PATIENT_FRAMES = (30, 180)                          # no-button wait of a patient piece, then soft drop
 SPIN_HEIGHT = 8                                     # a spinning piece needs a stack at most this many rows high
 SPIN_RATE = 1 / 8                                   # chance per waiting frame that a spinning piece rotates
 
 
 class PerfectBrain:
-    """Plans each new piece from RAM, then rotates, shifts and soft-drops it into place.
+    """Plans each new piece from RAM, then rotates (the short way: turn_button), shifts and soft-drops it
+    into place.
 
     well: build for tetrises (scores). patience: the chance that a piece, once
     lined up, is left to fall by gravity for PATIENT_FRAMES frames before it is
@@ -179,7 +192,8 @@ class PerfectBrain:
         if orientation not in ORIENTATIONS:
             self.last_action = 0
             return 0
-        if self.target is None or self.last_y is None or y < self.last_y:     # a new piece spawned
+        stale = self.target is not None and TYPE_OF[self.target[0]] != TYPE_OF[orientation]
+        if self.target is None or self.last_y is None or y < self.last_y or stale:     # a new piece spawned
             self.target = self.choose(ram, orientation, rng)
             self.wait = int(rng.integers(*PATIENT_FRAMES)) if rng.random() < self.patience else 0
             self.waiting = False
@@ -201,7 +215,7 @@ class PerfectBrain:
                 self.waiting = self.wait > 0
                 action = int(rng.choice((A, B))) if self.spinning and rng.random() < SPIN_RATE else 0
             elif orientation != goal:
-                action = A
+                action = 0 if self.last_action & (A | B) else turn_button(orientation, goal, rng)
             elif x < column:
                 action = RIGHT
             elif x > column:

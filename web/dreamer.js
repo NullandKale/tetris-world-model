@@ -1,15 +1,16 @@
 // The world model as a game engine in the browser: one generated frame per controller state.
 //
 // Plays the graphs scripts/export_onnx.py writes (src/token_world/models/onnx_export.py) as
-// src/token_world/models/onnx_dreamer.py does in Python. The model is the layered one: a frame is its layers
-// (background cells, the sprite picture, the border bands), kept as context in the form the model reads, its
-// content (what each token holds, soft: each pixel's colour probabilities through the model's colour table,
-// [content tokens, dim] float32), and shown composed, each pixel its most likely colour. The start's real
-// layers are embedded (embed.onnx) and fill the key/value cache (prefill.onnx); each step decodes the next
-// frame for a controller byte and returns its colours, its content and the previous frame's keys and values
-// (step.onnx), which go into the cache in place; when the window is full the last `keep` frames' content is
-// encoded again at positions 0..keep-1. A step is one pass over the previous frame and the new one, so the
-// cache holds every frame but the last.
+// src/token_world/models/onnx_dreamer.py does in Python. The model is the pixel one with motion first: a frame
+// is kept as context in the form the model reads, its content (its patch tokens, soft: each pixel's colour
+// probabilities through the model's colour table, [tokens, dim] float32) and its motion (each token's 8 x 8
+// cells' codes, [tokens, cells] float32; meta.unknown where not known, as for the start's real frames), and shown
+// as each pixel's most likely colour. The start's real frames are embedded (embed.onnx) and fill the key/value
+// cache (prefill.onnx); each step decodes the next frame for a controller byte, its motion first and then its
+// pixels, and returns its colours, its content, its motion and the previous frame's keys and values (step.onnx),
+// which go into the cache in place; when the window is full the last `keep` frames are encoded again at
+// positions 0..keep-1. A step reads the previous frame and the new one, so the cache holds every frame but the
+// last.
 //
 // The cache is one keys and one values tensor a layer (model.json's cache: keys [tokens, heads, head_dim,
 // frames], values [tokens, heads, frames, head_dim]). On WebGPU it stays in GPU buffers for the whole dream:
@@ -18,7 +19,7 @@
 //
 // `ort` is passed in, so the same class runs on onnxruntime-web (browser) and onnxruntime-node (tests):
 // Dreamer.create(ort, load, start, actions, options), where load(name) resolves a model file's bytes and
-// start holds the start's layers: for each of model.json's inputs, { data: Uint8Array, shape }.
+// start holds the start's frames: { data: Uint8Array of palette indices, shape: [frames, 256, 256] }.
 // dreamer.timing holds the last step's times (ms): run (the graph, with the picture's download), write
 // (the cache write) and encode (a window slide's re-encode, 0 when none); dreamer.runs counts each graph's runs
 // and dreamer.sessions holds them (diagnostics.js profile). options.log(text) hears each graph's setup time.
@@ -53,35 +54,39 @@ export class Dreamer {
   constructor(ort, meta, embed, prefill, step, keep, writer) {
     Object.assign(this, { ort, meta, embed, prefill, step, keep, writer, cache: null });
     [this.n, this.dim] = meta.content;
+    this.cells = meta.motion[1];
     this.sessions = { embed, prefill, step };
     this.runs = { embed: 0, prefill: 0, step: 0 };
     this.timing = { run: 0, write: 0, encode: 0 };
   }
 
-  // Start again from the start's real layers and their incoming controller bytes.
+  // Start again from the start's real frames and their incoming controller bytes (their motion not known).
   async reset(start, actions) {
-    const feeds = Object.fromEntries(this.meta.inputs.map((name) =>
-      [name, new this.ort.Tensor("uint8", start[name].data, start[name].shape)]));
-    const { content } = await this.embed.run(feeds);
+    const { content } = await this.embed.run({ frames: new this.ort.Tensor("uint8", start.data, start.shape) });
     this.runs.embed++;
     const size = this.n * this.dim;
     this.content = Array.from(actions, (_, i) => content.data.slice(i * size, (i + 1) * size));
+    this.motion = Array.from(actions, () => new Float32Array(this.n * this.cells).fill(this.meta.unknown));
     this.actions = Array.from(actions, Number);
     await this.encode();
   }
 
   async encode() {
     this.content = this.content.slice(-this.keep);
+    this.motion = this.motion.slice(-this.keep);
     this.actions = this.actions.slice(-this.keep);
     // the last frame goes in with the next step; prefill takes a fixed meta.prefill frames, these padded after
     // them (no real frame sees a later one, and the steps write over them)
     const t = this.content.length - 1, p = this.meta.prefill;
     const size = this.n * this.dim, all = new Float32Array(p * size);
     this.content.slice(0, t).forEach((x, i) => all.set(x, i * size));
+    const cells = this.n * this.cells, motion = new Float32Array(p * cells);
+    this.motion.slice(0, t).forEach((x, i) => motion.set(x, i * cells));
     const actions = new Int32Array(p).fill(-1);
     actions.set(this.actions.slice(0, t));
     const out = await this.prefill.run({
       content: new this.ort.Tensor("float32", all, [p, this.n, this.dim]),
+      motion: new this.ort.Tensor("float32", motion, [p, this.n, this.cells]),
       actions: new this.ort.Tensor("int32", actions, [p]),
     });
     this.runs.prefill++;
@@ -102,6 +107,7 @@ export class Dreamer {
     const int32 = (values) => new this.ort.Tensor("int32", Int32Array.from(values), [values.length]);
     const out = await this.step.run({
       previous: new this.ort.Tensor("float32", this.content.at(-1), [this.n, this.dim]),
+      previous_motion: new this.ort.Tensor("float32", this.motion.at(-1), [this.n, this.cells]),
       actions: int32([this.actions.at(-1), action]), at: int32([at]),
       ...Object.fromEntries(this.meta.cache.names.map((name, i) => [name, this.cache[i]])) });
     const ran = performance.now();
@@ -109,6 +115,7 @@ export class Dreamer {
     this.writer.write(this.cache, out.new_keys, out.new_values, at - 1);     // the previous frame, at at - 1
     for (const t of [out.new_keys, out.new_values]) if (t.location === "gpu-buffer") t.dispose();
     this.content.push(Float32Array.from(out.content.data));
+    this.motion.push(Float32Array.from(out.motion.data));
     this.actions.push(action);
     this.timing.run = ran - began;
     this.timing.write = performance.now() - ran;
@@ -189,8 +196,7 @@ class CpuWriter {
   }
 }
 
-// The page's start (scripts/export_onnx.py): context.json says where each layer sits in context.bin.
-export function startLayers(meta, bytes) {
-  return Object.fromEntries(meta.inputs.map(({ name, shape, offset }) =>
-    [name, { data: bytes.subarray(offset, offset + shape.reduce((a, b) => a * b, 1)), shape }]));
+// The page's start (scripts/export_onnx.py): context.bin is its frames, context.json their shape.
+export function startFrames(meta, bytes) {
+  return { data: bytes, shape: meta.shape };
 }

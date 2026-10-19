@@ -1,8 +1,16 @@
-"""Long dreams with no buttons: does the world model keep a falling piece intact and let it fall?
+"""Long dreams, with and without buttons: does the world model keep a falling piece intact, let it fall,
+and move it as the buttons say?
 
 A trial is a real game paused at a fresh piece: its last CONTEXT real frames and the buttons that made
-them, then FUTURE real frames in which nobody presses anything (gravity alone). A model dreams the same
-FUTURE frames from the context. Dreams are soft (models/dynamics.py): each pixel is a colour
+them, then FUTURE (1,000) real frames, either with nobody pressing anything (gravity alone) or with the bot
+playing on (pressed: its presses, Trial.buttons). A model dreams the same FUTURE frames from the context,
+given the same buttons. The scores below look at the first FIRST (128) frames, as every test did before
+2026-10-09 (FUTURE was 128); over all FUTURE frames, where a dream long since follows its own pieces (random
+ones differ from the real game's), the play check's integrity scores (diagnostics/play.py integrity: cells
+lost outside a clear, pieces changing their block count, full rows that never clear), which need nothing of
+the real game: lost_long, morph_long, full_long and size_long (pieces born too big or too small), per 100
+frames. No-button dreams test the clock and the pieces on their own (a model that ignores the buttons
+can pass them); pressed dreams test that it moves, rotates and drops the piece when the real one does. Dreams are soft (models/dynamics.py): each pixel is a colour
 distribution. Scored on the playfield: pixels expected wrong at HORIZONS (an expectation), and the block
 mass at the last frame against the real one (1.0 = as many filled pixels; pieces that melt or grow move
 it), where a pixel is filled when the dream gives it a block at least SURE likely: a faint haze of maybe
@@ -26,10 +34,11 @@ haze counts, a committed model's pixels are 0 or 1). Both falling toward 0 is th
 
 shape asks whether the piece stays the piece it is (an S does not turn into an O): in the frames where the
 real upper playfield holds one whole piece (4 cells), the share in which the dream's holds the same cells up to
-where they are (no buttons: no rotation).
+where they are (so a pressed dream must rotate it when the real one rotates).
 """
 from __future__ import annotations
 
+import gc
 from dataclasses import dataclass
 from typing import Iterator
 
@@ -40,9 +49,14 @@ from torch.utils.data import IterableDataset, get_worker_info
 
 from token_world.data.model_frames import BAND, border_codes
 from token_world.data.real_tetris import CONTEXT, RealTetris
+from token_world.diagnostics.line_clears import WELL, well_cells
+from token_world.diagnostics.play import integrity
 from token_world.models.dynamics import Dreamer
 
-FUTURE = 128
+FUTURE = 1000                                    # frames a trial dreams (128 before 2026-10-09)
+FIRST = 128                                      # the frames the piece scores, HORIZONS and the bias test look at
+EVERY = 8                                        # the pictures (sheet, animation) show every this many frames
+BATCH = 16                                       # trials dreamed side by side (dreams)
 PLAYFIELD = (slice(52, 212), slice(92, 172))
 UPPER = (slice(52, 140), slice(92, 172))         # the playfield above any stack a fresh-piece trial has
 PIECE_HORIZONS = (16, 32)
@@ -76,15 +90,33 @@ TIMER = _timer_pixels()
 class Trial:
     context: np.ndarray           # [CONTEXT, 256, 256] uint8 model frames
     actions: np.ndarray           # [CONTEXT] the button byte that produced each
-    future: np.ndarray            # [FUTURE, 256, 256] the real frames with no buttons
+    future: np.ndarray            # [FIRST, 256, 256] the first real frames (the scores')
     level: int
     layers: dict | None = None    # the context's layered frames, each key [CONTEXT, ...] (data/nes_layers.py)
+    buttons: np.ndarray | None = None   # [FUTURE] the button byte that produced each future frame; None: none
+    pictures: np.ndarray | None = None  # [FUTURE // EVERY, 256, 256] every EVERY-th real frame (sheet,
+                                        # animation); None: from future
+
+    def __post_init__(self):
+        if self.buttons is None:
+            self.buttons = np.zeros(FUTURE, np.int64)
+        if self.pictures is None:
+            self.pictures = self.future[EVERY - 1::EVERY]
+
+    @property
+    def pressed(self) -> bool:
+        return bool(self.buttons.any())
+
+    @property
+    def what(self) -> str:
+        frames = len(self.buttons)
+        return f"the bot's buttons for {frames} frames" if self.pressed else f"no buttons for {frames} frames"
 
 
-def trials(seed: int, per_band: int | None = None, layered: bool = False) -> Iterator[Trial]:
-    """Real games paused at a fresh piece, then FUTURE frames with no buttons. per_band: that many from
-    each level band in BANDS, then stop; None: endless, whatever levels the bot's games reach. layered: the
-    context's layers too (Trial.layers)."""
+def trials(seed: int, per_band: int | None = None, layered: bool = False, pressed: bool = False) -> Iterator[Trial]:
+    """Real games paused at a fresh piece, then FUTURE frames with no buttons (pressed: the bot plays on, and
+    its presses are the trial's buttons). per_band: that many from each level band in BANDS, then stop; None:
+    endless, whatever levels the bot's games reach. layered: the context's layers too (Trial.layers)."""
     found = {band: 0 for band in BANDS}
     while per_band is None or any(n < per_band for n in found.values()):
         real = RealTetris(seed, layered)
@@ -101,37 +133,44 @@ def trials(seed: int, per_band: int | None = None, layered: bool = False) -> Ite
                     found[band] += 1
                 context, actions = np.stack(real.frames), np.array(real.actions, np.int64)
                 layers = {k: np.stack([f[k] for f in real.layers]) for k in real.layers[0]} if layered else None
-                future = np.stack([real.step(0)[0] for _ in range(FUTURE)])
-                yield Trial(context, actions, future, level, layers)
+                future, buttons = zip(*(real.step(None if pressed else 0) for _ in range(FUTURE)))
+                yield Trial(context, actions, np.stack(future[:FIRST]), level, layers, np.array(buttons, np.int64),
+                            np.stack(future[EVERY - 1::EVERY]))
                 break
 
 
 class TrialStream(IterableDataset):
     """Endless live trials, one console per DataLoader worker (training keeps one worker filling it)."""
 
-    def __init__(self, seed: int, layered: bool = False):
-        self.seed, self.layered = seed, layered
+    def __init__(self, seed: int, layered: bool = False, pressed: bool = False):
+        self.seed, self.layered, self.pressed = seed, layered, pressed
 
     def __iter__(self):
         info = get_worker_info()
-        yield from trials(self.seed * 1000 + (info.id if info else 0), layered=self.layered)
+        yield from trials(self.seed * 1000 + (info.id if info else 0), layered=self.layered, pressed=self.pressed)
 
 
 @dataclass
 class Dream:
-    """A dream, kept as what the scores and pictures need of its colour distributions."""
-    rgb: np.ndarray               # [FUTURE, 256, 256, 3] uint8: each pixel's expected colour
+    """A dream, kept as what the scores and pictures need of its colour distributions: its first FIRST frames
+    whole, its well's blocks every frame, and every EVERY-th frame's picture when asked for."""
+    rgb: np.ndarray               # [FIRST, 256, 256, 3] uint8: each pixel's expected colour
     right: dict[int, np.ndarray]  # frame h (HORIZONS) -> [256, 256] each pixel's probability of the real colour
-    filled: np.ndarray            # [FUTURE, 256, 256] float16: each pixel's probability of a block, every frame
-    likely: np.ndarray            # [FUTURE, 256, 256] uint8: each pixel's most likely colour (coherence scores)
-    sure: np.ndarray              # [FUTURE, 256, 256] float16: its probability
+    filled: np.ndarray            # [FIRST, 256, 256] float16: each pixel's probability of a block, every frame
+    likely: np.ndarray            # [FIRST, 256, 256] uint8: each pixel's most likely colour (coherence scores)
+    sure: np.ndarray              # [FIRST, 256, 256] float16: its probability
+    cells: np.ndarray             # [FUTURE, 20, 10] bool: the well's blocks every frame (integrity scores)
+    seen: np.ndarray | None = None  # [FUTURE // EVERY, 256, 256, 3] uint8: every EVERY-th frame's expected colours
 
     @classmethod
     def of_frames(cls, trial: "Trial", frames: np.ndarray, palette: np.ndarray) -> "Dream":
-        """Exact frames [FUTURE, 256, 256] as a dream that is sure of every pixel (tests, the real game)."""
+        """Exact frames [T >= FIRST, 256, 256] as a dream that is sure of every pixel (tests, the real game,
+        the layered models' committed dreams)."""
         empty = empty_colour(trial)
-        return cls(palette[frames], {h: (frames[h - 1] == trial.future[h - 1]).astype(np.float32) for h in HORIZONS},
-                   (frames != empty).astype(np.float16), frames, np.ones(frames.shape, np.float16))
+        first = frames[:FIRST]
+        return cls(palette[first], {h: (first[h - 1] == trial.future[h - 1]).astype(np.float32) for h in HORIZONS},
+                   (first != empty).astype(np.float16), first, np.ones(first.shape, np.float16),
+                   np.stack([well_cells(f, empty) for f in frames]), palette[frames[EVERY - 1::EVERY]])
 
 
 def empty_colour(trial: "Trial") -> int:
@@ -140,26 +179,59 @@ def empty_colour(trial: "Trial") -> int:
 
 
 @torch.no_grad()
-def dream(model, trial: Trial, palette: np.ndarray, keep: int | None = None, change_weight: float = 1.0) -> Dream:
-    """The model's FUTURE frames from the trial's context, nobody pressing anything (change_weight: Dreamer's)."""
+def dreams(model, trials: list[Trial], palette: np.ndarray, keep: int | None = None, change_weight: float = 1.0,
+           pictures: int = 0, batch: int = BATCH) -> Iterator[Dream]:
+    """Each trial's FUTURE frames from its context, given its buttons (change_weight: Dreamer's), BATCH trials
+    dreamed side by side (models/dynamics.py Dreamer) -> its Dream, in order; the first `pictures` trials keep
+    their pictures (Dream.seen)."""
     device = next(model.parameters()).device
     colours = torch.as_tensor(palette, dtype=torch.float32, device=device)
-    empty = empty_colour(trial)
-    rgb, right, filled, likely, sure = [], {}, [], [], []
-    with torch.autocast(device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
-        dreamer = Dreamer(model, torch.from_numpy(trial.context).to(device),
-                          torch.from_numpy(trial.actions).to(device), keep, change_weight)
-        for h in range(1, FUTURE + 1):
-            probs = dreamer.step(0).float()                                   # [256, 256, COLOURS]
-            rgb.append((probs @ colours).round().clamp(0, 255).byte().cpu().numpy())
-            if h in HORIZONS:
-                real = torch.from_numpy(trial.future[h - 1]).to(device).long()
-                right[h] = probs.gather(-1, real[..., None])[..., 0].cpu().numpy()
-            filled.append((1 - probs[..., empty]).half().cpu().numpy())
-            top = probs.max(-1)
-            likely.append(top.indices.byte().cpu().numpy())
-            sure.append(top.values.half().cpu().numpy())
-    return Dream(np.stack(rgb), right, np.stack(filled), np.stack(likely), np.stack(sure))
+    for lo in range(0, len(trials), batch):
+        group = trials[lo:lo + batch]
+        b = len(group)
+        empty = torch.tensor([empty_colour(t) for t in group], device=device)
+        buttons = torch.from_numpy(np.stack([t.buttons for t in group])).to(device)
+        shown = torch.tensor([i for i in range(b) if lo + i < pictures], dtype=torch.long, device=device)
+        rgb, filled, likely, sure, cells, seen, right = [], [], [], [], [], [], {}
+        with torch.autocast(device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
+            make = getattr(model, "Dreamer", Dreamer)    # the latent model's own (models/latent_dynamics.py)
+            dreamer = make(model, torch.from_numpy(np.stack([t.context for t in group])).to(device),
+                           torch.from_numpy(np.stack([t.actions for t in group])).to(device), keep, change_weight)
+            for h in range(1, FUTURE + 1):
+                probs = dreamer.step(buttons[:, h - 1]).float()                  # [b, 256, 256, COLOURS]
+                top = probs.max(-1)
+                expected = None
+                if h <= FIRST:
+                    expected = (probs @ colours).round().clamp(0, 255).byte()
+                    rgb.append(expected.cpu().numpy())
+                    gone = probs.gather(-1, empty.view(b, 1, 1, 1).expand(b, 256, 256, 1))[..., 0]
+                    filled.append((1 - gone).half().cpu().numpy())
+                    likely.append(top.indices.byte().cpu().numpy())
+                    sure.append(top.values.half().cpu().numpy())
+                if h in HORIZONS:
+                    real = torch.from_numpy(np.stack([t.future[h - 1] for t in group])).to(device).long()
+                    right[h] = probs.gather(-1, real[..., None])[..., 0].cpu().numpy()
+                block = top.indices[:, WELL[0], WELL[1]] != empty.view(b, 1, 1)               # well_cells
+                cells.append((block.reshape(b, 20, CELL, 10, CELL).sum((2, 4)) >= CELL_FILLED).cpu().numpy())
+                if h % EVERY == 0 and len(shown):
+                    expected = (probs[shown] @ colours).round().clamp(0, 255).byte() if expected is None \
+                        else expected[shown]
+                    seen.append(expected.cpu().numpy())
+        del dreamer                                  # its CUDA graph's memory goes back only after a collection
+        gc.collect()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+        for i in range(b):
+            kept = int((shown == i).nonzero()[0, 0]) if (shown == i).any() else None
+            yield Dream(np.stack([f[i] for f in rgb]), {h: right[h][i] for h in HORIZONS},
+                        np.stack([f[i] for f in filled]), np.stack([f[i] for f in likely]),
+                        np.stack([f[i] for f in sure]), np.stack([f[i] for f in cells]),
+                        np.stack([f[kept] for f in seen]) if kept is not None else None)
+
+
+def dream(model, trial: Trial, palette: np.ndarray, keep: int | None = None, change_weight: float = 1.0) -> Dream:
+    """One trial's dream (dreams), with its pictures."""
+    return next(dreams(model, [trial], palette, keep, change_weight, pictures=1))
 
 
 def score(trial: Trial, dreamed: Dream) -> dict[str, float]:
@@ -183,7 +255,9 @@ def score(trial: Trial, dreamed: Dream) -> dict[str, float]:
       holds a piece's worth of filled pixels, right or wrong; activation: the dream's expected block
       pixels there (each pixel's probability, however faint) over the real piece's (NaN with no piece);
     - shape: over the frames whose upper playfield holds one whole real piece (4 cells), the share in which
-      the dream's holds the same cells, wherever they are (an erased, garbled or swapped piece scores 0)."""
+      the dream's holds the same cells, wherever they are (an erased, garbled or swapped piece scores 0);
+    - lost_long, morph_long, full_long, size_long: the integrity scores (play.py) over all FUTURE frames.
+    Every score but the last three looks at the first FIRST frames."""
     out = {f"wrong_{h}": float(1 - dreamed.right[h][PLAYFIELD].mean()) for h in HORIZONS}
     out |= {f"timer_wrong_{h}": float(1 - dreamed.right[h][TIMER].mean()) for h in HORIZONS}
     empty = empty_colour(trial)
@@ -213,6 +287,8 @@ def score(trial: Trial, dreamed: Dream) -> dict[str, float]:
                           cells(sure[:, UPPER_CELLS[0], UPPER_CELLS[1]] & ~still))
     out["fall"] = _fall(real_upper, dream_upper)
     out["spawn"], out["spawn_lag"] = _spawn(real_frames, sure, static, empty)
+    start = well_cells(trial.context[-1], empty)[None]
+    out |= {f"{k}_long": v for k, v in integrity(np.concatenate([start, dreamed.cells])).items()}
     return out
 
 
@@ -280,15 +356,15 @@ def _spawn(real_frames: np.ndarray, sure: np.ndarray, static: np.ndarray, empty:
     return float(abs(mine - real) <= SPAWN_SLACK), float(mine - real)
 
 
-def sheet(trial: Trial, dreams: dict[str, Dream], palette: np.ndarray, every: int = 8) -> Image.Image:
-    """Rows: the real game, then each dream (expected colours); columns: the playfield every `every` frames,
-    scaled 2x."""
+def sheet(trial: Trial, dreams: dict[str, Dream], palette: np.ndarray, every: int = 64) -> Image.Image:
+    """Rows: the real game, then each dream (expected colours; its pictures, Dream.seen); columns: the playfield
+    every `every` frames (a multiple of EVERY), scaled 2x."""
     h, w = trial.future[0][CROP].shape
-    rows = {"real": palette[trial.future]} | {name: d.rgb for name, d in dreams.items()}
-    columns = range(every - 1, FUTURE, every)
+    rows = {"real": palette[trial.pictures]} | {name: d.seen for name, d in dreams.items()}
+    columns = range(every // EVERY - 1, len(trial.pictures), every // EVERY)
     out = Image.new("RGB", (220 + len(columns) * (w * 2 + 4), 20 + len(rows) * (h * 2 + 6)), "#181820")
     draw = ImageDraw.Draw(out)
-    draw.text((4, 4), f"level {trial.level}, no buttons for {FUTURE} frames; playfield every {every} frames",
+    draw.text((4, 4), f"level {trial.level}, {trial.what}; playfield every {every} frames",
               fill="white")
     for r, (name, frames) in enumerate(rows.items()):
         y = 20 + r * (h * 2 + 6)
@@ -299,51 +375,83 @@ def sheet(trial: Trial, dreams: dict[str, Dream], palette: np.ndarray, every: in
     return out
 
 
-def animation(trial: Trial, dreams: dict[str, Dream], palette: np.ndarray, every: int = 2) -> list[Image.Image]:
-    """GIF frames: the real playfield next to each dream's (expected colours), every `every` frames, scaled
-    2x, labelled."""
+def animation(trial: Trial, dreams: dict[str, Dream], palette: np.ndarray) -> list[Image.Image]:
+    """GIF frames: the real playfield next to each dream's (expected colours), every EVERY frames (their
+    pictures), scaled 2x, labelled."""
     h, w = trial.future[0][CROP].shape
-    panels = {"real": palette[trial.future]} | {name: d.rgb for name, d in dreams.items()}
+    panels = {"real": palette[trial.pictures]} | {name: d.seen for name, d in dreams.items()}
     width = len(panels) * (w * 2 + 8)
     frames = []
-    for f in range(0, FUTURE, every):
+    for i in range(len(trial.pictures)):
+        f = (i + 1) * EVERY - 1                                                 # the frame this picture shows
         image = Image.new("RGB", (width, h * 2 + 34), "#181820")
         draw = ImageDraw.Draw(image)
-        for i, (name, seq) in enumerate(panels.items()):
-            x = i * (w * 2 + 8)
+        for n, (name, seq) in enumerate(panels.items()):
+            x = n * (w * 2 + 8)
             draw.text((x + 2, 2), name, fill="white")
-            image.paste(Image.fromarray(seq[f][CROP]).resize((w * 2, h * 2), Image.NEAREST), (x, 16))
-        draw.text((2, h * 2 + 20), f"level {trial.level}, frame +{f + 1}, no buttons", fill="#a8a8b8")
+            image.paste(Image.fromarray(seq[i][CROP]).resize((w * 2, h * 2), Image.NEAREST), (x, 16))
+        draw.text((2, h * 2 + 20), f"level {trial.level}, frame +{f + 1}, "
+                  + (f"buttons {trial.buttons[f]:#04x}" if trial.pressed else "no buttons"), fill="#a8a8b8")
         frames.append(image)
     return frames
 
 
+def stacked(*pictures):
+    """Pictures (sheet images, or animation frame lists of the same length) one above the other: a test's
+    variants (no buttons, then the bot's buttons) in one long_dream.png / .gif."""
+    if isinstance(pictures[0], list):
+        return [stacked(*frames) for frames in zip(*pictures)]
+    out = Image.new("RGB", (max(p.width for p in pictures), sum(p.height for p in pictures)), "#181820")
+    y = 0
+    for p in pictures:
+        out.paste(p, (0, y))
+        y += p.height
+    return out
+
+
 def dream_world(world, trial: Trial, palette: np.ndarray, keep: int | None = None, seed: int = 0) -> Dream:
-    """Any model's (diagnostics/worlds.py World) FUTURE frames from the trial's context, nobody pressing
-    anything: the pixel model's dream (dream), or a layered model's (dream_layered: the trial needs layers)."""
+    """Any model's (diagnostics/worlds.py World) FUTURE frames from the trial's context and buttons: the pixel
+    model's dream (dream), or a layered model's (dream_layered: the trial needs layers)."""
     if world.layered:
         return dream_layered(world.model, trial, palette, seed=seed, steps=world.saved["args"].get("dream_steps", 1))
     return dream(world.model, trial, palette, keep)
 
 
 @torch.no_grad()
-def dream_layered(model, trial: Trial, palette: np.ndarray, temperature: float = 1.0, seed: int = 0,
-                  steps: int = 1) -> Dream:
-    """A layered model's (models/layered.py) FUTURE frames from the trial's layered context, nobody pressing
-    anything, composed into model frames (data/nes_layers.py) and scored as committed frames (Dream.of_frames).
-    steps: the passes a model with sprite decisions decides them over (models/layered_slots.py)."""
+@torch.no_grad()
+def dreams_layered(model, trials: list[Trial], palette: np.ndarray, temperature: float = 1.0, seed: int = 0,
+                   steps: int = 1, batch: int = BATCH, objects: bool = False) -> Iterator[Dream]:
+    """A layered model's (models/layered.py) FUTURE frames for each trial from its layered context and buttons,
+    BATCH trials dreamed side by side (its Dreamer takes a batch of games), composed into model frames
+    (data/nes_layers.py) and scored as committed frames (Dream.of_frames) -> its Dream, in order. objects: the
+    slot model's decisions per object (models/layered_slots.py)."""
     from token_world.data.nes_layers import TRANSPARENT, compose, model_frame
     device = next(model.parameters()).device
-    layers = {k: torch.from_numpy(np.asarray(v)).to(device)[None] for k, v in trial.layers.items()}
-    generator = torch.Generator(device=device).manual_seed(seed)
-    with torch.autocast(device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
-        dreamer = model.Dreamer(model, layers, torch.from_numpy(trial.actions).to(device)[None],
-                                temperature=temperature, generator=generator, steps=steps)
-        frames = []
-        for _ in range(FUTURE):
-            none = torch.zeros(1, dtype=torch.long, device=device)
-            f = {k: v[0].cpu().numpy() for k, v in dreamer.step(none).items() if k != "probs"}
-            frames.append(model_frame(compose(f), f["border"]))
-    frames = np.stack(frames)
-    return Dream.of_frames(trial, np.where(frames == TRANSPARENT, 0, frames), palette)
+    for lo in range(0, len(trials), batch):
+        group = trials[lo:lo + batch]
+        layers = {k: torch.from_numpy(np.stack([np.asarray(t.layers[k]) for t in group])).to(device)
+                  for k in group[0].layers}
+        buttons = torch.from_numpy(np.stack([t.buttons for t in group])).to(device)
+        generator = torch.Generator(device=device).manual_seed(seed + lo)
+        frames = [[] for _ in group]
+        with torch.autocast(device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
+            dreamer = model.Dreamer(model, layers, torch.from_numpy(np.stack([t.actions for t in group])).to(device),
+                                    temperature=temperature, generator=generator, steps=steps, objects=objects)
+            for h in range(FUTURE):
+                out = {k: v.cpu().numpy() for k, v in dreamer.step(buttons[:, h]).items() if k != "probs"}
+                for i, made in enumerate(frames):
+                    made.append(model_frame(compose({k: v[i] for k, v in out.items()}), out["border"][i]))
+        del dreamer                                  # as dreams(): its memory back before the next batch
+        gc.collect()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+        for trial, made in zip(group, frames):
+            made = np.stack(made)
+            yield Dream.of_frames(trial, np.where(made == TRANSPARENT, 0, made), palette)
+
+
+def dream_layered(model, trial: Trial, palette: np.ndarray, temperature: float = 1.0, seed: int = 0,
+                  steps: int = 1) -> Dream:
+    """One trial's layered dream (dreams_layered)."""
+    return next(dreams_layered(model, [trial], palette, temperature, seed, steps))
 

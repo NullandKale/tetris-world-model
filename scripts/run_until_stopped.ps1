@@ -13,27 +13,28 @@ this script runs; the display may still turn off. Settings live in the trainer
 defaults; -TrainerArgs passes extra ones through, e.g. -TrainerArgs "--cooldown
 90000 10000" (the end-of-run learning-rate decay, then a normal exit).
 
-The GPU must be power limited: at 350 W a batch-16 run crashed Windows
-(bugcheck 0x133 after an NVIDIA driver fault). The limit resets on reboot and
-after a driver recovery, so every launch checks it and refuses to train above
--MaxPowerWatts (set it in an admin prompt: nvidia-smi -pl 235). While this
+At 350 W a batch-16 run once crashed Windows (bugcheck 0x133 after an NVIDIA
+driver fault). Every launch logs the GPU's power limit and warns when it is
+above -MaxPowerWatts (set it in an admin prompt: nvidia-smi -pl 250), but
+never refuses to train over it. While this
 script runs, nvidia-smi logs power, temperature, clocks and utilisation once
 a second to output\gpu_telemetry.csv.
 #>
 param(
-    [ValidateSet("dynamics", "layered")][string]$Run = "dynamics",
+    [ValidateSet("dynamics", "layered", "vae", "latent")][string]$Run = "dynamics",
     [string]$Until = "",
     [string]$Python = "C:\Python314\python.exe",
     [int]$MaxRestarts = 20,
     [double]$MaxPowerWatts = 235,
-    [string]$TrainerArgs = ""
+    [string]$TrainerArgs = "",
+    [string]$Name = ""                  # a second run beside another: its own log, output\<Run>_<Name>_overnight.log
 )
 
 $ErrorActionPreference = "Stop"
 $root = Split-Path $PSScriptRoot -Parent
 Set-Location $root
-$log = Join-Path $root "output\${Run}_overnight.log"
-$trainer = @{ "dynamics" = "scripts\train_dynamics_ui.py"; "layered" = "scripts\train_layered.py" }[$Run]
+$log = Join-Path $root ("output\${Run}" + $(if ($Name) { "_$Name" } else { "" }) + "_overnight.log")
+$trainer = @{ "dynamics" = "scripts\train_dynamics_ui.py"; "layered" = "scripts\train_layered.py"; "vae" = "scripts\train_vae_ui.py"; "latent" = "scripts\train_latent_ui.py" }[$Run]
 
 $deadline = $null
 if ($Until) {
@@ -53,11 +54,10 @@ function Write-Log([string]$message) {
     Add-Content -Path $log -Value $line
 }
 
-function Assert-PowerLimit {
+function Get-PowerLimit {
     $limit = [double]((nvidia-smi --query-gpu=enforced.power.limit --format=csv,noheader,nounits) | Select-Object -First 1)
     if ($limit -gt $MaxPowerWatts) {
-        Write-Log "GPU power limit is $limit W, above $MaxPowerWatts W; not training. In an admin prompt: nvidia-smi -pl $MaxPowerWatts"
-        throw "GPU power limit $limit W"
+        Write-Log "warning: GPU power limit is $limit W, above $MaxPowerWatts W; training anyway (to lower it, in an admin prompt: nvidia-smi -pl $MaxPowerWatts)"
     }
     return $limit
 }
@@ -70,7 +70,7 @@ try {
         "--query-gpu=timestamp,power.draw,enforced.power.limit,temperature.gpu,clocks.sm,clocks.mem,utilization.gpu,memory.used",
         "--format=csv", "-l", "1", "-f", (Join-Path $root "output\gpu_telemetry.csv"))
     while ($true) {
-        $watts = Assert-PowerLimit
+        $watts = Get-PowerLimit
         $seconds = 0
         if ($deadline) {
             $seconds = [int][math]::Floor(($deadline - (Get-Date)).TotalSeconds)

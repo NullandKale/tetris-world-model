@@ -1,5 +1,5 @@
-"""ONNX export (models/onnx_export.py): the exported graphs dream what the layered model's Dreamer dreams, across
-window slides, for a model with a fixed camera and for one with camera tokens whose camera holds."""
+"""ONNX export (models/onnx_export.py): the exported graphs dream what the pixel model's Dreamer dreams with one
+motion step, across window slides."""
 import sys
 import tempfile
 import unittest
@@ -11,61 +11,59 @@ import torch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT / "src"), str(ROOT / "tests")]
 
-from token_world.data.nes_layers import LAYER_COLOURS
-from token_world.diagnostics.worlds import composed
-from token_world.models.layered import MOVE, MOVE_CLASSES
-from token_world.models.layered_pixels import PixelLayers
+from token_world.models.dynamics import COLOURS, Dreamer, Dynamics, motion_tokens
 
 try:
     import onnxruntime  # noqa: F401
     import onnxscript  # noqa: F401
     from token_world.models.onnx_dreamer import OnnxDreamer
-    from token_world.models.onnx_export import INPUTS, export
+    from token_world.models.onnx_export import export
 except ImportError:
     OnnxDreamer = None
 
-from test_layered import window
+from test_dynamics import window
 
-PALETTE = torch.randint(0, 256, (LAYER_COLOURS, 3), generator=torch.Generator().manual_seed(0)).to(torch.uint8)
+PALETTE = torch.randint(0, 256, (COLOURS, 3), generator=torch.Generator().manual_seed(0)).to(torch.uint8)
+
+
+def motion_model(**options) -> Dynamics:
+    model = Dynamics(dim=32, layers=2, heads=2, patch=16, frames=6, colour_dim=8, motion=True, motion_first=True,
+                     **options).eval()
+    with torch.no_grad():                                     # motion that matters (it starts at zero)
+        model.motion_in.weight.normal_()
+    model.motion_steps = 1
+    return model
 
 
 @unittest.skipIf(OnnxDreamer is None, "needs onnx, onnxruntime and onnxscript")
 class OnnxTests(unittest.TestCase):
     def dream_both(self, model):
         """3 real frames, then 7 dreamed (the 6-frame window fills and slides): each frame's colours from the
-        graphs and from PyTorch's Dreamer (temperature 0: the camera its most likely move, which holds)."""
-        layers, acts = window(1, 10, 2), torch.randint(-1, 256, (1, 10), generator=torch.Generator().manual_seed(5))
-        start = {k: v[0, :3] for k, v in layers.items()}
+        graphs and from PyTorch's Dreamer (each pixel's most likely colour)."""
+        x, acts = window(1, 10, 3), torch.randint(-1, 256, (1, 10), generator=torch.Generator().manual_seed(5))
         with tempfile.TemporaryDirectory() as folder:
-            export(model, Path(folder), PALETTE, start)
-            onnx = OnnxDreamer(Path(folder), {k: start[k].numpy() for k in INPUTS}, acts[0, :3].numpy(), keep=3)
+            export(model, Path(folder), PALETTE)
+            onnx = OnnxDreamer(Path(folder), x[0, :3].numpy(), acts[0, :3].numpy(), keep=3)
             with torch.no_grad():
-                dreamer = model.Dreamer(model, {k: v[:, :3] for k, v in layers.items()}, acts[:, :3], keep=3,
-                                        temperature=0.0)
+                dreamer = Dreamer(model, x[0, :3], acts[0, :3], keep=3)
                 for a in acts[0, 3:].tolist():
-                    frame = {k: v[0].numpy() for k, v in dreamer.step(torch.tensor([a])).items() if k != "probs"}
-                    self.assertTrue((frame["camera"] == start["camera"][-1].numpy()).all())
-                    expected = PALETTE.numpy()[composed(frame)].astype(np.float32)
-                    same = (onnx.step(a) == expected).all(-1).mean()
-                    self.assertGreater(same, 0.999)
+                    expected = PALETTE.numpy()[dreamer.step(a).argmax(-1).numpy()].astype(np.float32)
+                    self.assertGreater((onnx.step(a) == expected).all(-1).mean(), 0.999)
+                    drawn = motion_tokens(dreamer.motion[None], 16)[0].numpy()             # [N, cells]
+                    self.assertGreater((onnx.motion[-1] == drawn).mean(), 0.999)
 
-    def test_a_fixed_camera_model_dreams_as_pytorch(self):
+    def test_a_motion_first_model_dreams_as_pytorch(self):
         torch.manual_seed(0)
-        self.dream_both(PixelLayers(dim=32, layers=2, heads=2, frames=6, colour_dim=8, fixed_camera=True).eval())
+        self.dream_both(motion_model(space_rope=True, qk_norm=True, action_norm=True, local_attention=True))
 
-    def test_a_model_with_camera_tokens_dreams_as_pytorch_while_its_camera_holds(self):
+    def test_the_plain_options_dream_as_pytorch_too(self):
         torch.manual_seed(1)
-        model = PixelLayers(dim=32, layers=2, heads=2, frames=6, colour_dim=8, registers=2, space_rope=True).eval()
-        with torch.no_grad():                                    # its camera head: "no move", surely
-            model.camera_head[-1].bias[MOVE] += 100
-            model.camera_head[-1].bias[MOVE_CLASSES + MOVE] += 100
-        self.dream_both(model)
+        self.dream_both(motion_model())
 
-    def test_a_moving_start_is_refused(self):
-        model = PixelLayers(dim=32, layers=2, heads=2, frames=6, colour_dim=8).eval()
-        start = {k: v[0, :3] for k, v in window(1, 3, 2, scroll=4).items()}
-        with tempfile.TemporaryDirectory() as folder, self.assertRaises(ValueError):
-            export(model, Path(folder), PALETTE, start)
+    def test_a_model_without_motion_first_is_refused(self):
+        model = Dynamics(dim=32, layers=2, heads=2, patch=16, frames=6, colour_dim=8).eval()
+        with tempfile.TemporaryDirectory() as folder, self.assertRaises(NotImplementedError):
+            export(model, Path(folder), PALETTE)
 
 
 if __name__ == "__main__":

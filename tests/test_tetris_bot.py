@@ -56,8 +56,8 @@ class TetrisBotTests(unittest.TestCase):
         board[16:, :9] = True
         self.assertEqual(brain(ram_with(board, 0x12, 5, 0), rng), 0)          # plans; Down released
         self.assertEqual(brain.target, (0x11, 9))
-        self.assertEqual(brain(ram_with(board, 0x12, 5, 0), rng), T.A)
-        self.assertEqual(brain(ram_with(board, 0x12, 5, 0), rng), 0)          # A released before the next tap
+        self.assertIn(brain(ram_with(board, 0x12, 5, 0), rng), (T.A, T.B))   # two orientations: either button
+        self.assertEqual(brain(ram_with(board, 0x12, 5, 0), rng), 0)          # released before the next tap
         self.assertEqual(brain(ram_with(board, 0x11, 5, 0), rng), T.RIGHT)
         self.assertEqual(brain(ram_with(board, 0x11, 6, 0), rng), 0)
         self.assertEqual(brain(ram_with(board, 0x11, 6, 1), rng), T.RIGHT)
@@ -66,6 +66,17 @@ class TetrisBotTests(unittest.TestCase):
             brain(ram_with(board, 0x11, x, 1), rng)
         self.assertEqual(brain(ram_with(board, 0x11, 9, 1), rng), T.DOWN)
         self.assertEqual(brain(ram_with(board, 0x11, 9, 2), rng), T.DOWN)     # Down is held, not tapped
+
+    def test_turns_go_the_short_way(self):
+        rng = np.random.default_rng(0)
+        for piece in "JLT":
+            ids = T.IDS_OF[piece]
+            for i, o in enumerate(ids):
+                self.assertEqual(T.turn_button(o, ids[(i + 1) % 4], rng), T.A)
+                self.assertEqual(T.turn_button(o, ids[(i - 1) % 4], rng), T.B)
+                halves = {T.turn_button(o, ids[(i + 2) % 4], rng) for _ in range(40)}
+                self.assertEqual(halves, {T.A, T.B})
+        self.assertEqual({T.turn_button(0x11, 0x12, rng) for _ in range(40)}, {T.A, T.B})
 
     def test_switcher_plays_one_brain_until_its_interval_ends(self):
         switcher = T.BrainSwitcher(np.random.default_rng(3), long=False)

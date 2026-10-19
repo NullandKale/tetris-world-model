@@ -35,7 +35,26 @@ original small model, are in `recipe_attempts.md`. It replaces the exact-token m
   (`data/nes_palette.py`). Input and target are exact.
 - **Tokens:** each 16 x 16 patch is one transformer token, 256 per frame. A
   per-pixel colour embedding (58 -> 32) and a 16 x 16 stride-16 conv (ViT
-  patchify). Learned spatial and temporal position embeddings.
+  patchify). A learned place per patch (`space_pos`). **Time is rotary**
+  (RoPE inside the temporal attention, as the layered model and Open-Oasis;
+  since 2026-10-07): queries and keys are rotated by their frame, so attention
+  sees how many frames apart two frames are. It replaced one learned
+  embedding per window slot, and the change alone took the pixel model past
+  every earlier pixel run on long dreams by 10k (`recipe_attempts.md`, "Rotary
+  time on the pixel model"); runs from before it no longer load (their
+  `time_pos`).
+- **Options (off when absent from a run's config, `build`; trainer flags):**
+  - `--space-rope`: 2D rotary in the spatial attention as well (RoPE-Mixed,
+    learned 2D directions per layer and head, `SpatialAttention`), on top of
+    the learned place (RoPE-Mixed + APE, the paper's choice at a fixed
+    resolution; without the learned place it learned slower).
+  - `--qk-norm`: QK-norm in both attentions (the one part of `modern`).
+  - `--action-norm`: the buttons condition every block (adaptive LayerNorm, as
+    DiT and Open-Oasis): a small layer per block turns the frame's button
+    embedding into a scale and shift for each of its three norms, initialised
+    to zero. Without it the buttons enter once, added to every token at the
+    input. Costs ~1% speed and 447k parameters; the first change to improve
+    how the pixel model follows buttons (2026-10-08, `recipe_attempts.md`).
 - **Blocks:** spatial attention within a frame (bidirectional), then temporal
   attention at the same position over the frames so far (causal), then an MLP.
   The Contra runs used 12 blocks, width 512, 8 heads (62M parameters, block
@@ -45,8 +64,9 @@ original small model, are in `recipe_attempts.md`. It replaces the exact-token m
   `modern` blocks (the "modern" run, from scratch, 2026-10-01) are Llama-style:
   RMSNorm instead of LayerNorm, QK-norm (queries and keys RMS-normalised per
   head, so attention logits stay bounded) and a SwiGLU MLP with hidden 8/3 x
-  width (the parameters of the 4 x width GELU MLP). They export to the browser
-  unchanged (`tests/test_onnx.py`).
+  width (the parameters of the 4 x width GELU MLP). The browser export is
+  the layered model's since 2026-10-07 (`models/onnx_export.py`); the pixel
+  model's export is in the repository's history.
 - **Soft, never argmax (2026-10-03, the `stage1` run on).** A generated
   frame is its colour probabilities. It goes back into the context as each
   pixel's probability-weighted colour embedding (`embed_probs`; kept as the
@@ -102,6 +122,13 @@ original small model, are in `recipe_attempts.md`. It replaces the exact-token m
 
 ## Training
 
+Runs start through `scripts/run_until_stopped.ps1` in a classic console (`Start-Process conhost.exe -ArgumentList
+'powershell -ExecutionPolicy Bypass -File scripts\run_until_stopped.ps1 ...'`): on 2026-10-08 a Microsoft Store
+update of Windows Terminal closed every console inside it and the overnight run with them. `--out` names one
+model's run folder (default `world_model_tetris_<name>`); its window and its trainer process are checked after
+every launch. Log watchers poll the log (never `tail -f`, which on Windows holds the file open and the
+launcher's first write then fails).
+
 - **Masking (MaskGIT):** every masked frame draws its own rate from MaskGIT's
   cosine schedule, cos(pi/2 u) with u uniform, which favours high rates;
   that frame's tokens are replaced by a learned mask embedding at that rate.
@@ -150,6 +177,9 @@ original small model, are in `recipe_attempts.md`. It replaces the exact-token m
   in every frame and in the loss at full weight (the `noborder` runs,
   2026-10-02, tried a blank one and kept fewer pieces than standard; it may
   come back as a stage 3). Game, border and changed-pixel losses are reported, not weighted.
+  `--change-weight W` (2026-10-15, an experiment: recipe_attempts.md) weighs game pixels whose colour
+  differs from the frame before's W times (Dynamics.loss_weights); the model's probabilities then lean
+  to change by W's odds, and FrameDecoder undoes that on every decode (Dynamics.change_undo).
   Measured on the 8M model at step 50,056 (8 live windows, real inputs): the
   border is 6% of masked pixels and 50% of the gradient (sum of 1 - p over
   pixels); changed game pixels 0.16% and 15%; static game pixels 94% and 36%,
@@ -159,7 +189,7 @@ original small model, are in `recipe_attempts.md`. It replaces the exact-token m
   0.01 and 3.3% at 0.03, so it is not used: the loss already concentrates on
   the hard pixels.
 - **Data:** live emulator histories only, windows of 64 frames (63 new frames
-  per history per step). No eval set. Every window is trained on, so events
+  per history per step). No eval set. (Since 2026-10-10 the stream is `WORLD_MODEL`: the bot also pauses and soft-resets now and then, with waits of at most 48 frames, at unchanged event rates (`scripts/data_report.py`); every window is labelled, and the run window's Data tab shows what training got: `docs/guides/video_vae.md`.) Every window is trained on, so events
   come at the rate the game has them (the earlier event tossing kept every
   window with a rare event and few others; it went with the two-stage
   recipe). The emulators make several times the frames training uses: 16
@@ -283,6 +313,30 @@ scroll 2,727 on every respawn, so deaths become a third of all frames. Contra
 data needs a policy that gets past that pit before either setting helps.
 
 ## Speed
+
+### Fused head and embedding-bag patches (2026-10-14)
+
+A profile of the 96 x 3 model's training step (16 windows x 64 frames, compiled, bf16): the pixel head (logits
+over 58 colours for about 40M masked pixels, the softmax, the loss and its gradients) was 41% of the GPU time,
+its log-softmax kernel alone 18% at about 50 GB/s; the patch embedding (each pixel's colour embedding, a 2.1 GB
+tensor, then the 16 x 16 conv, both backward passes and the one-hot matmul to the colour table) 25%; attention
+9%. So the transformer was a third of the step, and 3 layers instead of 8 trained only 1.3x faster.
+
+- **The head** (`models/head_kernel.py`, used by `HeadCrossEntropy` on the GPU): one Triton kernel per pixel run
+  does the colour logits (tf32 matmuls), the log-sum-exp, the loss, the pixel vectors' gradient, and adds the
+  colour table's and colour bias's gradients once per program. 1M pixels: 2.4 ms against 11 ms.
+- **The patch embedding** (`models/patch_kernel.py`, `_patches` for index frames on the GPU): with M[pos,
+  colour] = the conv weight at pos times the colour's embedding ([256, 58, dim], float32), a token is the conv
+  bias plus its 256 pixels' rows of M; the forward kernel gathers and adds them, the backward kernel adds each
+  position's tokens' gradients by colour (one-hot matmuls), and autograd takes M's gradient to the conv weight
+  and the colour table. The embedded pixels and their gradient are never built. Soft frames (rollouts), the CPU
+  and the ONNX export keep the conv.
+- **Checked:** `tests/test_head_kernel.py` and `tests/test_patch_kernel.py` (the loss and every gradient against
+  the separate ops and the conv in float32; under bf16 at least as close to float32 as before; it compiles); from
+  the same weights and masks the training loss agrees to the fourth decimal over 16 steps.
+- **Measured** (96 x 3, alternating processes beside a training run): 1,100-1,140 ms a step before, 718-746 ms
+  after (-35%), peak memory 8.3 to 5.5 GB; 96 x 8 peak 14.5 to 12.2 GB. `s3_hidden` resumed at 3.0 steps/s
+  (2.3 before), under the same 225 W power limit.
 
 ### Small model, paired run and profile (2026-09-30)
 
@@ -519,6 +573,13 @@ pieces over a stack of 8 rows or fewer spin while they fall (A or B at
 random, 1 frame in 8), then turn back to the plan and drop: rotations went
 from 20.6 to 39.9 per 1,000 playing frames (30,000 frames, 3 games each).
 
+Since 2026-10-14 the perfect brain (and the reckless one, which drives like it)
+turns toward its plan the short way: A for the next orientation, B for the one
+before, either for a half turn or a two-orientation piece (`turn_button`).
+Turning with A alone had made 81% of the training stream's turns A (1,901 of
+2,348 J/L/T turns), and no model learned which way B turns
+(recipe_attempts.md, 2026-10-14); now A 1,042 and B 1,030.
+
 Event census (2026-10-02, 4 games x 50,000 frames, RAM events; per 1,000
 in-game frames) and the holding brain it led to. The other brains tap and
 soft-drop, so held shifts (the game's autorepeat), landings by gravity and long
@@ -572,6 +633,11 @@ kernel is used. That, and quadratic spatial attention, is why 8 px tokens cost
 
 ## Every model, every check
 
+While a run trains, every check runs with `--device cpu`: a rollout run holds about 21 of the GPU's 24 GB, and a
+check beside it on the GPU filled the memory and stalled both for two hours (2026-10-08). The checks' summaries
+average only the events that have a score (`np.nanmean`: the play check's shape is NaN for a stretch where a
+piece locked during the context).
+
 Every check and app below takes any model, the pixel model or a layered one (`docs/guides/layered_tokens.md`),
 through one interface, `diagnostics/worlds.py`: `load(run or checkpoint)` gives a World that rolls batches of
 windows out from real context (`rollout`) or dreams one game live (`dreaming`). Its frames are model frames
@@ -611,9 +677,9 @@ changed), and exact (no wrong event pixel at +2). It writes `scenarios.csv`
 and one contact sheet per scenario to `output/scenarios/<time>/`, and each run's
 means to its run folder's `scenarios.csv`.
 
-## Event checks: restarts and line clears, followed to the end
+## Event checks: restarts, line clears and play, followed to the end
 
-`scripts/event_checks.py <run> [<run> ...] [--checks restart line_clears]`: long events found live, each model
+`scripts/event_checks.py <run> [<run> ...] [--checks restart line_clears play]`: long events found live, each model
 dreaming them from real context fed the bot's real buttons (`World.follow`); sheets go to
 `output/event_checks/<time>/`.
 
@@ -626,6 +692,13 @@ dreaming them from real context fed the bot's real buttons (`World.follow`); she
   the last frame: `full_rows` the dream keeps (0 in the real game), `cells_wrong`, and `mass` (filled cells over
   the real game's: above 1, rows kept). Averaged over all clears and per size (single .. tetris). The scenario
   checks score only a clear's first 16 frames.
+- `play` (`diagnostics/play.py`): 240 frames of play from mid-game (buttons down in at least 5% of them, a
+  stack of 12+ cells, no top-out), frame to frame on the well's cells, per 100 frames: `lost`, cells that vanish
+  with no full row in the 30 frames before (false clears, pieces losing blocks); `morph`, frames whose cell
+  count changes by anything but 0 or +4 (a spawn) outside a clear; `full`, full rows standing past 30 frames.
+  The real frames score 0 on all three. Added 2026-10-07 after playing the layered model in the browser: "line
+  clears are overzealous, they happen when the line is not full, and the tetrominos morph"; the long dreams
+  press no buttons and `line_clears` scores only real clears, so neither could see it.
 
 Events come from `data/tetris_events.py` (shared with window tossing).
 Measured while building it: the picture shows the RAM of the frame before
@@ -636,17 +709,29 @@ top-out; the level byte (0x44) steps at every 10 lines.
 
 ## Playing and long dreams
 
-`scripts/play_world_model.py` is a Tk app: the real game in World NES and one
-model's dream side by side (real | dream | difference, drawn into one image
-and copied to the canvas once per frame), in lockstep, one generation at a
-time. You or the bot play; the model dreams from the last 48 real frames with
-the same buttons. It lists only long-trained runs (20,000+ steps), pixel or
-layered, and loads their averaged weights.
+`scripts/play_world_model.py [--runs <run folders or checkpoint files>]` is a Tk app: the real game in
+World NES and every model's dream side by side (real | dream | dream ..., or each dream's difference from
+the real game, D; drawn into one image and copied to the canvas once per frame), in lockstep, each model
+stepped once per real frame, with each one's pixels wrong now and on average. The bot plays by default (or
+you); every model dreams with the same buttons from the browser's start: the first 3
+frames of a level-0 game (`data/real_tetris.py` `game_start`; `--seed 0`, the default, is the very start the
+browser ships), the real game running on from the same frames; R goes back to that start. S taps Start into the dreams
+alone: after the top-out curtain the real game waits for Start indefinitely (no menu after 1,800 frames with
+no buttons; 2-22 frames after a tap, 2026-10-09), so a dream that tops out before the real game waits on the
+covered board as it should, until it gets one. The models are --runs (run
+folders or archived checkpoints, any steps), or else the latest long-trained run (20,000+ steps), pixel or
+layered; it loads their averaged weights.
 
 `scripts/long_dream_check.py [run or checkpoint ...]` checks that pieces fall and keep their
 shape: at a fresh piece, nobody presses anything for 128 frames, and each
 model dreams the same 128 frames; 2 trials per start-level band (0-4, 5-9,
-10-14, 15-19). It prints playfield pixels wrong at +16/+32/+64/+128 and block
+10-14, 15-19). Since 2026-10-08 it also dreams the same games with the bot
+playing on (its presses go to the real game and to the dream; `--buttons
+both|none|pressed`, default both), as every training test does: a model that
+ignores the buttons passes the no-button trials (`recipe_attempts.md`, "Long
+dreams with buttons"). Since 2026-10-09 the dreams are 1,000 frames: the scores
+below look at the first 128, and lost, morph and full (the play check's, per 100
+frames) at all 1,000 (`recipe_attempts.md`, "Long dreams of 1,000 frames"). It prints playfield pixels wrong at +16/+32/+64/+128 and block
 mass at +128 against the real game (1.0 = as many filled pixels), and writes
 strips to `output/long_dream/<time>/`. Baseline before patient pieces and
 longer rollouts:
@@ -770,47 +855,53 @@ Published by GitHub Pages from `site/` (`scripts/ship.py`):
 https://nullandkale.github.io/tetris-world-model/.
 
 ```powershell
-python scripts/export_onnx.py [checkpoint.pt]     # -> web/model/ (needs pip install .[onnx]); since 2026-10-07 the
-                                                  # page has the layered model's step 58,000 (layered_tokens.md)
+python scripts/export_onnx.py [checkpoint.pt]     # -> web/model/ (needs pip install .[onnx]); since 2026-10-18 the
+                                                  # page has s9_cool140's step 152,000 (recipe_attempts.md)
 python -m http.server 8000 -d web                 # open http://localhost:8000 in Chrome or Edge
 ```
 
-The export (`models/onnx_export.py`) writes the layered model's averaged
-weights as three graphs, plus the page's start: `context.bin`, one level-0 game
-start as its layers (3 frames, 8 frames into the game, after the playfield's
-camera switch), and `context.json` (where each layer sits, the buttons, the
-palette). A frame is kept as its content (each token's soft pixels and the
-backdrop, [543, 96]):
+The export (`models/onnx_export.py`) writes the pixel model's averaged weights
+(motion first; 2026-10-07 to 10-18 the page had the layered model,
+layered_tokens.md) as three graphs, plus the page's start: `context.bin`, one
+level-0 game start as model frames (3 frames of palette indices, 8 frames into
+the game) and `context.json` (their shape, the buttons, the palette). A frame
+is kept as its content (its patch tokens, soft for a dreamed frame: each
+pixel's colour probabilities through the colour table, [256, 96]) and its
+motion (each token's four 8 x 8 cells' codes, [256, 4]; not known for the
+start's frames, as the page ships no RAM):
 
-- `embed.onnx`: the start's layers (cells, cell_known, sprite_layer, border,
-  backdrop; uint8) -> their content.
-- `prefill.onnx`: content [47, 543, dim] and incoming actions -> the key/value
-  cache, one keys and one values tensor a layer, positions 0..46 filled. The
-  length is fixed (a shorter start is padded after its frames): a dynamic
-  length put about 190 shape nodes on the CPU in onnxruntime-web.
-- `step.onnx`: the previous frame's content, actions, position and the cache
-  -> the new frame composed (cells, the sprite picture over them, the border
-  bands; each pixel's most likely colour, through the palette in the graph,
-  all in float so it stays on the GPU), its content, and the previous frame's
-  keys and values [8, 543, 4, 24], which the host writes into the cache.
+- `embed.onnx`: the start's frames (uint8) -> their content.
+- `prefill.onnx`: content [47, 256, 96], motion and incoming actions -> the
+  key/value cache, one keys and one values tensor a layer, positions 0..46
+  filled. The length is fixed (a shorter start is padded after its frames): a
+  dynamic length put about 190 shape nodes on the CPU in onnxruntime-web.
+- `step.onnx`: the previous frame's content and motion, actions, position and
+  the cache -> the new frame (each pixel's most likely colour, through the
+  palette in the graph, all in float so it stays on the GPU), its content, its
+  motion, and the previous frame's keys and values [9, 256, 4, 24], which the
+  host writes into the cache.
 
-A dream holds the start's camera, so every token keeps its identity and the
-routed temporal attention is attention per token (each layer's keys are
-[543, 4, 24, 64], transposed as attention reads them, its values [543, 4, 64,
-24]). The model's camera head moves the camera at a game
-start (the menus and the playfield are different nametables), so the start is
-taken after that switch; the browser dream stays on the game screen (after a
-top-out it cannot change screens). A step is one pass over two frames, the
-previous one written into the cache (the Dreamer's commit pass) and the new
-one decided, as the pixel model's export did.
+A step decodes as `FrameDecoder` with one motion step (one step dreamed as
+well as two, recipe_attempts.md): pass 1 over the previous frame (written into
+the cache) and the new one hidden gives the new frame's motion, each cell its
+most likely code; pass 2 over the new frame alone, hidden with that motion and
+reading the previous frame's keys and values from pass 1, gives its pixels.
+Each layer's keys are [256, 4, 24, 64], transposed as attention reads them,
+its values [256, 4, 64, 24].
 
-Checks, against the model's own Dreamer at temperature 0 on the page's start
-with no buttons: the export script (onnxruntime, Python; 96 frames, 0 pixels
-differ, a window slide included), `web/test_dreamer.mjs` (`dreamer.js` on
-onnxruntime-node: as PyTorch), `tests/test_onnx.py` (small models with a fixed
-camera and with camera tokens, through a window slide), and
-`web/check_browser.mjs` (the page in Chrome with `?check`, or `--firefox`: as
-PyTorch).
+Checks, against the model's own Dreamer on the page's start with no buttons:
+the export script (onnxruntime, Python; 96 frames, 0 pixels differ, a window
+slide included), `web/test_dreamer.mjs` (`dreamer.js` on onnxruntime-node: as
+PyTorch), `tests/test_onnx.py` (small motion-first models, pixels and drawn
+motion, through a window slide), and `web/check_browser.mjs` (the page in
+Chrome with `?check`, or `--firefox`: as PyTorch; 2026-10-18 on the 3090: 41
+ms a step in the check, about 76 ms while playing, 13 frames/s; a step is
+about 2,400 kernels, onnxruntime-web's dispatch the limit).
+
+The page can also start from a picture ("Start from an image", `web/
+screenshot.js`): a screenshot, framed by its four corners and snapped to the
+NES's colours, becomes the start's three frames (NES lines 8-231 between the
+page's own border bands).
 
 Speed (2026-10-07; a laptop's integrated AMD GPU played at 4 frames/s):
 

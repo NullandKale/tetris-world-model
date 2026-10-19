@@ -5,13 +5,13 @@
 //     cd web && npm install && node test_dreamer.mjs      (MODEL=folder: another export than model/)
 import { readFile } from "node:fs/promises";
 import * as ort from "onnxruntime-node";
-import { Dreamer, startLayers } from "./dreamer.js";
+import { Dreamer, startFrames } from "./dreamer.js";
 
 const SIZE = 256 * 256 * 3, TOLERANCE = 2;
 const folder = process.env.MODEL ?? "model";
 const load = async (name) => new Uint8Array(await readFile(new URL(`${folder}/${name}`, import.meta.url)));
 const meta = JSON.parse(new TextDecoder().decode(await load("context.json")));
-const start = startLayers(meta, await load("context.bin"));
+const start = startFrames(meta, await load("context.bin"));
 const reference = await load("reference.bin");
 const count = reference.length / SIZE;
 

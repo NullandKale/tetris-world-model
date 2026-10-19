@@ -6,7 +6,9 @@ by frame. Its frames are always 256 x 256 model frames, so every score made for 
 
 - the pixel model (models/dynamics.py) decodes soft: each frame comes with each pixel's colour
   probabilities, and scores are expectations;
-- the layered models (models/layered_pixels.py, layered_slots.py) decode their layers and compose them
+- the latent model (models/latent_dynamics.py) samples its frames' latents and the frozen VAE decodes them
+  into colour probabilities: scored as the pixel model is;
+- the layered model (models/layered_pixels.py) decodes its layers and composes them
   (data/nes_layers.py compose); their frames are committed, and scores count pixels.
 
 load(run) reads a run folder's (or a checkpoint's) model with its averaged weights. Tests: the scenario
@@ -32,6 +34,7 @@ class World:
         self.model, self.saved, self.name, self.device = model, saved, name, torch.device(device)
         self.step = int(saved["step"])
         self.layered = saved["args"].get("kind") == "layered"
+        self.latent = saved["args"].get("kind") == "latent"
         self.palette = (saved["palettes"]["tetris"] if isinstance(saved["palettes"], dict) else
                         saved["palettes"]).cpu().numpy().astype(np.uint8)
 
@@ -40,18 +43,20 @@ class World:
 
     @torch.no_grad()
     def rollout(self, frames: np.ndarray, actions: np.ndarray, start: int, layers: dict | None = None,
-                temperature: float = 1.0, seed: int = 0, batch: int = 16) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+                temperature: float = 1.0, seed: int = 0, batch: int = 16,
+                motion: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """B windows: real model frames [B, T, 256, 256], incoming actions [B, T], and (layered models) their
         layered frames (each key [B, T, ...]) -> frames start..T-1 generated one after another from the real
         frames before `start` with the real buttons: (the frames, committed [B, T - start, 256, 256] uint8;
         each pixel's probability of the real frame's colour, and of the last context frame's colour, [B,
-        T - start, 256, 256] float16: the pixel model's own, 0 or 1 for the committed models)."""
+        T - start, 256, 256] float16: the pixel model's own, 0 or 1 for the committed models). motion: the
+        windows' motion codes [B, T, 32, 32] (data/tetris_motion.py), a motion model's context; others ignore it."""
         made, right, same = [], [], []
         for i in range(0, len(frames), batch):
             rows = slice(i, i + batch)
             m, r, s = self._rollout(frames[rows], actions[rows], start,
                                     None if layers is None else {k: v[rows] for k, v in layers.items()},
-                                    temperature, seed)
+                                    temperature, seed, None if motion is None else motion[rows])
             if r is None:                                    # committed: the frame is right or it is not
                 r = (m == frames[rows, start:]).astype(np.float16)
                 s = (m == frames[rows, start - 1:start]).astype(np.float16)
@@ -60,17 +65,25 @@ class World:
             same.append(s)
         return np.concatenate(made), np.concatenate(right), np.concatenate(same)
 
-    def _rollout(self, frames, actions, start, layers, temperature, seed):
+    def _rollout(self, frames, actions, start, layers, temperature, seed, motion=None):
         t = frames.shape[1]
         acts = torch.as_tensor(actions, device=self.device).long()
         with torch.autocast(self.device.type, dtype=torch.bfloat16, enabled=self.device.type == "cuda"):
             if not self.layered:
                 x = torch.as_tensor(frames, device=self.device)
-                decoder = self.model.decoder(len(x), self.device)
-                decoder.prefill(x[:, :start], acts[:, :start])
+                if self.latent:
+                    dreamer = self.model.Dreamer(self.model, x[:, :start], acts[:, :start],
+                                                 generator=torch.Generator(device=self.device).manual_seed(seed))
+                    following = lambda at: dreamer.step(acts[:, at])
+                else:
+                    decoder = self.model.decoder(len(x), self.device)
+                    known = (torch.as_tensor(motion[:, :start], device=self.device)
+                             if motion is not None and getattr(self.model, "motion", False) else None)
+                    decoder.prefill(x[:, :start], acts[:, :start], known)
+                    following = lambda at: decoder.next(acts[:, at:at + 1], at)["probs"]
                 made, right, same = [], [], []
                 for at in range(start, t):
-                    probs = decoder.next(acts[:, at:at + 1], at)["probs"].float()
+                    probs = following(at).float()
                     made.append(probs.argmax(-1).byte().cpu().numpy())
                     right.append(probs.gather(-1, x[:, at, ..., None].long())[..., 0].half().cpu().numpy())
                     same.append(probs.gather(-1, x[:, start - 1, ..., None].long())[..., 0].half().cpu().numpy())
@@ -115,7 +128,11 @@ class Dreaming:
         acts = torch.as_tensor(np.asarray(actions), device=device).long()
         # the history is encoded as the steps run (bf16 on the GPU), so its cache holds what the steps write
         with torch.autocast(device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
-            if not world.layered:
+            if world.latent:
+                self.dreamer = world.model.Dreamer(world.model, torch.as_tensor(np.asarray(frames), device=device),
+                                                   acts, keep=keep, change_weight=change_weight,
+                                                   generator=torch.Generator(device=device).manual_seed(seed))
+            elif not world.layered:
                 from token_world.models.dynamics import Dreamer
                 self.dreamer = Dreamer(world.model, torch.as_tensor(np.asarray(frames), device=device), acts,
                                        keep=keep, change_weight=change_weight)
@@ -128,7 +145,7 @@ class Dreaming:
     def set_change_weight(self, weight: float) -> None:
         """The pixel model's change weight from the next frame on (models/dynamics.py Dreamer); the committed
         models have none."""
-        if not self.world.layered:
+        if not self.world.layered and not self.world.latent:
             self.dreamer.set_change_weight(weight)
 
     @torch.no_grad()
@@ -165,6 +182,9 @@ def load(run: str | Path, device: str = "cuda") -> World:
     name = path.name if path.is_dir() else f"{path.parent.name}/{path.stem}"
     if saved["args"].get("kind") == "layered":
         from token_world.models.layered import build
+        model = build(saved["args"]).to(device).eval()
+    elif saved["args"].get("kind") == "latent":
+        from token_world.models.latent_dynamics import build
         model = build(saved["args"]).to(device).eval()
     else:
         from token_world.data.model_frames import BORDER_VERSION

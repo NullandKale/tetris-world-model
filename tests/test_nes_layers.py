@@ -10,7 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from token_world.data.model_frames import NES_TO_INDEX
 from token_world.data.nes_layers import (BANDS, BEHIND, CELL, ON_SCREEN, REGIONS, SPRITES, TRANSPARENT, VIEW,
-                                         LayerCanvas, compose, model_frame)
+                                         LayerCanvas, compose, model_frame, sprite_mask)
 
 SLOTS = np.array([55, 56, 57], np.uint8)
 
@@ -84,6 +84,22 @@ class LayerTests(unittest.TestCase):
         self.assertEqual(int((layer != TRANSPARENT).sum()), 64 + 32)
         palette = np.arange(32, dtype=np.uint8) + 0x10
         self.assertTrue((compose(f) == expected(bg, sp, palette)).all())
+
+    def test_the_sprite_mask_is_the_sprite_layer_in_model_frame_place(self):
+        bg = np.zeros((240, 256), int)
+        bg[100:108, 60:68] = 5
+        bg[100:104, 60:68] = 0
+        sp = np.zeros_like(bg)
+        sp[100:108, 60:68] = 0x20 | 0x05                                # behind: shows only on the top half
+        sp[50:58, 30:38] = 0x06
+        sp[2:6, 0:8] = 0x06                                             # in the overscan: not in the model frame
+        r = regions(bg, sp)
+        mask = sprite_mask(r)
+        layer = LayerCanvas().push(r, 0, SLOTS)["sprite_layer"] != TRANSPARENT
+        self.assertEqual(mask.shape, (256, 256))
+        self.assertTrue((mask[16:240] == layer[8:232]).all())          # NES lines 8-231 between the borders
+        self.assertFalse(mask[:16].any() or mask[240:].any())
+        self.assertEqual(int(mask.sum()), 64 + 32)
 
     def test_sprites_keep_their_slots_and_both_forms_compose_alike(self):
         bg = np.zeros((240, 256), int)

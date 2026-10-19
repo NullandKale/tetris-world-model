@@ -14,7 +14,8 @@ sys.path[:0] = [str(ROOT / "src"), str(ROOT / "scripts"), str(ROOT / "tests")]
 from token_world.data.model_frames import BAND
 from token_world.data.nes_palette import tetris_palette
 from token_world.diagnostics.run_outputs import (HORIZONS, KINDS, PREVIEW_GIFS, append_long_dream, horizon_fields,
-                                                 horizon_outputs, open_metrics, write_horizon_curve)
+                                                 horizon_outputs, load_optimizer, open_metrics, optimizer_state,
+                                                 write_horizon_curve)
 from token_world.ui.dynamics_app import stalling
 
 
@@ -78,7 +79,7 @@ class LayeredPreviewTests(unittest.TestCase):
             model = tiny(kind, frames=24).eval()
             with tempfile.TemporaryDirectory() as d:
                 out = Path(d)
-                m = train_layered.preview(model, layers, incoming, out, 1.0, steps=2)
+                m = train_layered.preview(model, layers, incoming, out, 1.0)
                 self.assertEqual(set(m), set(horizon_fields(("tetris",))))
                 for value in m.values():
                     self.assertTrue(0.0 <= value <= 1.0)
@@ -97,8 +98,7 @@ class LayeredPreviewTests(unittest.TestCase):
             model, drawer = tiny(kind, frames=12), tiny(kind, frames=12).eval()
             drawer.load_state_dict(model.state_dict())
             for blend in (0, 4):
-                losses = train_layered.train_step(model, model, layers, incoming, depth=6, blend=blend, drawer=drawer,
-                                                  steps=2)
+                losses = train_layered.train_step(model, model, layers, incoming, depth=6, blend=blend, drawer=drawer)
                 self.assertTrue(torch.isfinite(losses["total"]), kind.__name__)
                 self.assertTrue(1 <= losses["rollout_frames"].item() <= 6)
                 model.zero_grad()
@@ -124,6 +124,32 @@ class LongDreamOutputTests(unittest.TestCase):
             with old[0].open(newline="") as f:
                 self.assertEqual([r["step"] for r in csv.DictReader(f)], ["1", "2"])
 
+    def test_the_window_shows_no_button_and_pressed_dreams_apart(self):
+        from matplotlib.figure import Figure
+        from token_world.ui.run_viewer import (CURVE_VIEWS, RunData, compare_table, draw_curves, fit_steps,
+                                               long_dream_table, pressed)
+        self.assertEqual((pressed("1 pass"), pressed("layered t=1"), pressed("buttons"), pressed("buttons t=1")),
+                         (False, False, True, True))
+        row = {"level": 0, "wrong_16": 0.01, "wrong_32": 0.02, "wrong_64": 0.03, "wrong_128": 0.04, "mass": 1.0,
+               "piece_32": 1.0, "piece_hit_32": 0.5, "presence": 1.0, "shape": 0.8}
+        with tempfile.TemporaryDirectory() as d:
+            mine, theirs = Path(d) / "mine", Path(d) / "theirs"
+            mine.mkdir(), theirs.mkdir()
+            append_long_dream(mine, [{"step": 2000, "variant": v, **row} for v in ("1 pass", "buttons")])
+            append_long_dream(theirs, [{"step": 2000, "variant": "layered t=1", **row}])
+            runs = [RunData(mine), RunData(theirs)]
+            for run in runs:
+                run.refresh()
+            for view in CURVE_VIEWS:                                  # every view draws, with or without data
+                fig = Figure()
+                draw_curves(fig, runs[:1], runs[1:], view)
+                fit_steps(fig, runs[:1], view)
+            table = compare_table(*runs)
+            self.assertIn("no buttons:", table)
+            self.assertIn("2,000", table.split("the bot's buttons")[0])
+            self.assertIn("the bot's buttons: not tested in both runs yet", table)
+            self.assertIn("buttons", long_dream_table(runs))
+
     def test_the_stall_warning(self):
         self.assertEqual(stalling(None, {"presence": 0.8, "wrong_128": 0.03}), "")
         self.assertIn("STALLING", stalling(None, {"presence": 0.1, "wrong_128": 0.03}))
@@ -134,20 +160,19 @@ class LongDreamOutputTests(unittest.TestCase):
 
 class OptimizerStateTests(unittest.TestCase):
     def test_a_resume_matches_optimizer_state_by_name_whatever_the_order(self):
-        import train_layered
         torch.manual_seed(0)
         a, b = torch.nn.Parameter(torch.randn(3, 4)), torch.nn.Parameter(torch.randn(5))
         first = torch.optim.AdamW([a, b])
         (a.sum() + b.sum() * 2).backward()
         first.step()
-        saved = train_layered.optimizer_state(first, ["a", "b"])
+        saved = optimizer_state(first, ["a", "b"])
         again = torch.optim.AdamW([b, a])                                   # the model registers them the other way
-        train_layered.load_optimizer(again, saved, ["b", "a"])
+        load_optimizer(again, saved, ["b", "a"])
         self.assertTrue(torch.equal(again.state[a]["exp_avg"], first.state[a]["exp_avg"]))
         self.assertTrue(torch.equal(again.state[b]["exp_avg"], first.state[b]["exp_avg"]))
         positional = {k: v for k, v in saved.items() if k != "names"}      # saved before names: by position
         with self.assertRaises(ValueError):
-            train_layered.load_optimizer(torch.optim.AdamW([b, a]), positional, ["b", "a"])
+            load_optimizer(torch.optim.AdamW([b, a]), positional, ["b", "a"])
 
 
 if __name__ == "__main__":

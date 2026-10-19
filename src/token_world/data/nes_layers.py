@@ -16,7 +16,8 @@ line 32, a band boundary). Per frame:
   (cell_known: seen at least once; a cell scrolling into view arrives in part). Where the background is
   transparent a cell holds TRANSPARENT, and the frame's backdrop colour (backdrop) shows there.
 - camera [BANDS, 2]: the band's scroll (x 0..511, y 0..479) at its first line.
-- the sprites, two ways (models/layered_pixels.py reads the first, models/layered_slots.py the second):
+- the sprites, two ways (models/layered_pixels.py reads the first; the second is the PPU's own form, which
+  compose() also draws, and a dropped slot model read):
   - sprite_layer [LINES, WIDTH]: the sprite pixels that show, in screen space (TRANSPARENT elsewhere: no
     sprite, or a sprite behind an opaque background pixel). The frame is this over the background.
   - sprites [SPRITES, 8, 8] the pixels each OAM slot drew (TRANSPARENT where none: hidden by a lower slot or
@@ -97,7 +98,7 @@ class LayerCanvas:
 
 def compose(frame: dict) -> np.ndarray:
     """A layered frame -> the picture [LINES, WIDTH] in model colours (NES lines 0-239): its sprite picture
-    over the background, or, for a frame with sprite slots only (models/layered_slots.py's dreams), the slots
+    over the background, or, for a frame with sprite slots only, the slots
     drawn by the PPU's rule (lower slots in front of higher ones; a slot behind the background shows only
     where the background is transparent)."""
     cells, camera = frame["cells"], frame["camera"].astype(np.int64)
@@ -125,6 +126,20 @@ def compose(frame: dict) -> np.ndarray:
         show = put & ~opaque[y:y + h, x:x + w] if frame["sprite_flags"][slot] & BEHIND else put
         out[y:y + h, x:x + w][show] = pix[show]
         drawn[y:y + h, x:x + w] |= put
+    return out
+
+
+SPRITE_REGIONS = ("ppu_background", "ppu_sprites")
+
+
+def sprite_mask(regions: dict) -> np.ndarray:
+    """One observation's ppu_background and ppu_sprites -> [SIZE, SIZE] bool in model-frame place: the pixels
+    a sprite drew that show (LayerCanvas.push's PPU rule); the border bands hold none."""
+    bg = np.asarray(regions["ppu_background"], np.uint8).reshape(LINES, WIDTH)
+    sp = np.asarray(regions["ppu_sprites"], np.uint8).reshape(LINES, WIDTH)
+    shows = ((sp & 3) > 0) & (((sp & 0x20) == 0) | (bg == 0))
+    out = np.zeros((SIZE, SIZE), bool)
+    out[BAND:SIZE - BAND] = shows[OVERSCAN:LINES - OVERSCAN]
     return out
 
 

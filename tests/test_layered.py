@@ -1,7 +1,7 @@
 """The layered world models (models/layered.py, layered_pixels.py, layered_slots.py): temporal attention
 follows identities and rotary time, frames never see later frames, a dream's cache matches the full window,
-the losses train, dreams compose and batch, a rollout is the dream of those frames, and movement is scored
-from the history the model was given. Shared behaviour is checked on both models."""
+the losses train, dreams compose and batch, a rollout is the dream of those frames, and the camera's movement
+is scored from the history the model was given. Checked with and without the model's options."""
 import sys
 import unittest
 from pathlib import Path
@@ -25,8 +25,9 @@ class PixelsWithOptions(PixelLayers):
 
 
 class SlotsWithOptions(SlotLayers):
+    """Slots with the buttons conditioning every block, rotary by screen place and registers."""
     def __init__(self, *args, **kwargs):
-        super().__init__(*args, registers=4, space_rope=True, **kwargs)
+        super().__init__(*args, registers=4, space_rope=True, action_norm=True, **kwargs)
 
 
 KINDS = (PixelLayers, SlotLayers, PixelsWithOptions, SlotsWithOptions)
@@ -245,30 +246,6 @@ class SharedTests(unittest.TestCase):
                                         same["camera"]))
 
 
-class SlotTests(unittest.TestCase):
-    def test_a_stepped_dream_decides_every_sprite(self):
-        model = tiny(SlotLayers, frames=6).eval()
-        layers, acts = window(1, 3, 5), torch.randint(0, 256, (1, 3))
-        dreamer = model.Dreamer(model, layers, acts, keep=3, steps=4, generator=torch.Generator().manual_seed(1))
-        frame = {k: v[0] for k, v in dreamer.step(torch.zeros(1)).items() if k != "probs"}
-        on = (frame["sprite_flags"] & 1).bool()
-        self.assertTrue(set(np.unique(frame["sprite_flags"].numpy())) <= {0, 1, 3})
-        self.assertTrue((frame["sprites"][~on] == TRANSPARENT).all())
-        self.assertTrue((frame["sprite_xy"][~on] == 0).all())
-
-    def test_movement_is_scored_from_where_the_history_put_a_sprite(self):
-        model = tiny(SlotLayers)
-        layers, acts = window(1, 6, 9), torch.randint(0, 256, (1, 6))
-        mask = torch.ones(1, 6, model.tokens, dtype=torch.bool)
-        mask[:, 0] = False
-        features = model(layers, acts, mask)
-        same = model.loss(features, layers, acts, mask)
-        moved = {k: v.clone() for k, v in layers.items()}
-        moved["sprite_xy"][:, 2] += 4                                      # the history's sprites 4 px off
-        self.assertFalse(torch.allclose(model.loss(features, layers, acts, mask, seen=moved)["sprite_move"],
-                                        same["sprite_move"]))
-
-
 class OptionTests(unittest.TestCase):
     def test_space_rope_scores_by_offset_on_screen(self):
         torch.manual_seed(0)
@@ -306,8 +283,6 @@ class OptionTests(unittest.TestCase):
         self.assertTrue(placed[:CELLS].all() and placed[model.sprite_at:model.camera_at].all())
         self.assertFalse(placed[model.camera_at:model.border_at].any() or placed[model.register_at:].any())
         self.assertTrue(placed[model.border_at:model.border_end].all())
-        slots = tiny(SlotsWithOptions)
-        self.assertFalse(slots.screen(layers)[1][slots.sprite_at:slots.camera_at].any())  # their place is content
 
     def test_registers_are_never_hidden_and_have_no_target(self):
         model = tiny(PixelsWithOptions)
@@ -339,6 +314,72 @@ class OptionTests(unittest.TestCase):
         dreamer = model.Dreamer(model, layers, acts, generator=torch.Generator().manual_seed(0))
         for a in range(4):
             self.assertTrue(torch.equal(dreamer.step(torch.tensor([a]))["camera"], layers["camera"][:, -1]))
+
+
+class ActionNormTests(unittest.TestCase):
+    def test_the_buttons_condition_every_block_from_zero(self):
+        model = tiny(SlotsWithOptions)
+        self.assertTrue(all(b.modulation is not None for b in model.blocks))
+        self.assertTrue(all((b.modulation[1].weight == 0).all() for b in model.blocks))   # starts as without
+        layers, acts = window(1, 4, 3), torch.randint(0, 256, (1, 4))
+        mask = model.mask(1, 4, "cpu")
+        model.loss(model(layers, acts, mask), layers, acts, mask)["total"].backward()
+        self.assertTrue(all(b.modulation[1].weight.grad.abs().sum() > 0 for b in model.blocks))
+
+
+class SlotTests(unittest.TestCase):
+    def test_sprites_that_touch_are_one_object(self):
+        from token_world.models.layered_slots import objects_of
+        xy = torch.tensor([[[40, 40], [48, 40], [48, 48], [100, 40], [56, 56], [0, 0]]])
+        on = torch.tensor([[True, True, True, True, True, False]])
+        self.assertEqual(objects_of(xy, on)[0].tolist(), [0, 0, 0, 3, 0, 5])   # a chain is one; off is its own
+
+    def test_an_object_moves_and_shows_as_one(self):
+        from token_world.models.layered_slots import objects_of
+        model = tiny(SlotLayers, frames=6).eval()
+        layers, acts = window(1, 3, 5), torch.randint(0, 256, (1, 3))
+        piece = torch.tensor([[80, 40], [88, 40], [96, 40], [88, 48]])                # a T of four sprites
+        layers["sprite_xy"][:, :, :4] = piece.to(layers["sprite_xy"].dtype)
+        layers["sprite_flags"][:, :, :4] = 1
+        layers["sprite_flags"][:, :, 4:] = 0
+        last = {k: v[:, -1] for k, v in layers.items()}
+        before_xy, before_on = last["sprite_xy"].long(), (last["sprite_flags"] & 1).bool()
+        label = objects_of(before_xy, before_on)
+        self.assertEqual(int((label[0] == 0).sum()), 4)                                # the T is one object
+        for seed in range(4):
+            dreamer = model.Dreamer(model, layers, acts, keep=3, objects=True,
+                                    generator=torch.Generator().manual_seed(seed))
+            frame = {k: v[0] for k, v in dreamer.step(torch.zeros(1)).items() if k != "probs"}
+            on = (frame["sprite_flags"] & 1).bool()
+            for obj in label[0][before_on[0]].unique():
+                members = (label[0] == obj) & before_on[0]
+                self.assertEqual(len(on[members].unique()), 1)                     # all shown or all gone
+                if on[members].all():
+                    moved = frame["sprite_xy"][members].long() - before_xy[0][members]
+                    self.assertEqual(len(moved.unique(dim=0)), 1)                  # one movement for all
+
+
+    def test_a_stepped_dream_decides_every_sprite(self):
+        model = tiny(SlotLayers, frames=6).eval()
+        layers, acts = window(1, 3, 5), torch.randint(0, 256, (1, 3))
+        dreamer = model.Dreamer(model, layers, acts, keep=3, steps=4, generator=torch.Generator().manual_seed(1))
+        frame = {k: v[0] for k, v in dreamer.step(torch.zeros(1)).items() if k != "probs"}
+        on = (frame["sprite_flags"] & 1).bool()
+        self.assertTrue(set(np.unique(frame["sprite_flags"].numpy())) <= {0, 1, 3})
+        self.assertTrue((frame["sprites"][~on] == TRANSPARENT).all())
+        self.assertTrue((frame["sprite_xy"][~on] == 0).all())
+
+    def test_movement_is_scored_from_where_the_history_put_a_sprite(self):
+        model = tiny(SlotLayers)
+        layers, acts = window(1, 6, 9), torch.randint(0, 256, (1, 6))
+        mask = torch.ones(1, 6, model.tokens, dtype=torch.bool)
+        mask[:, 0] = False
+        features = model(layers, acts, mask)
+        same = model.loss(features, layers, acts, mask)
+        moved = {k: v.clone() for k, v in layers.items()}
+        moved["sprite_xy"][:, 2] += 4                                      # the history's sprites 4 px off
+        self.assertFalse(torch.allclose(model.loss(features, layers, acts, mask, seen=moved)["sprite_move"],
+                                        same["sprite_move"]))
 
 
 if __name__ == "__main__":
