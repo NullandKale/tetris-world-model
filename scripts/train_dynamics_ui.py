@@ -25,13 +25,32 @@ scored against the real ones. Every window is trained on, at the rate the game h
 events. Alongside the trained weights the checkpoint keeps an exponential
 moving average of them (EMA_DECAY), which play and the checks load.
 
+--history H: each frame attends in time to the last H frames, itself included (a banded causal mask in
+whole --frames windows; Dynamics history): a short history first, as DIAMOND conditions on 4 frames, raised
+toward the window as the run trains (a setting, not weights: time is rotary; a stacked growth keeps it).
+
 Previews roll the model out on the current batch: the first 48 frames of each
-window are context, the last 16 are generated one after another with the real
-actions, and are scored per game against the real frames; four windows, from
+window are context, the last 16 are generated one after another with the real actions, and are scored per game against the real frames; four windows, from
 the most changing to the quieter ones, are saved as animated GIFs
 (previews/). Every --long-dream-every steps (1,000) each model's averaged weights dream
-live trials 1,000 frames ahead (diagnostics/long_dream.py), 32 with no buttons and
-32 with the bot's buttons, appended to long_dream.csv with an animated GIF. Fresh live frames only; no eval set.
+live trials 1,000 frames ahead (diagnostics/long_dream.py), 16 with no buttons and
+16 with the bot's buttons, appended to long_dream.csv with an animated GIF. SMB's test is the next frames
+instead (diagnostics/next_frames.py): 4 windows from each of the 32 levels, the last 8 frames of each drawn one after
+another, scored at frames 1, 4 and 8 to next_frames.csv and pictured in next_frames.png (SMB's long dreams:
+scripts/smb_long_dream.py on the archived checkpoints), and whether Mario follows the buttons
+(diagnostics/button_follow.py, 2026-10-25): one moment from each level, the real game forked and played on 32 frames
+with the bot's presses, Right, Left, Right + A held and nothing, and the same five dreamed; buttons.csv (the held
+presses' share of the buttons' effect the dreams carry, and each one's follow) and buttons.png. Fresh live frames
+only; no eval set.
+
+Post-training (2026-10-30, post-train A): --post-train FROM continues a finished run's checkpoint (its weights,
+optimizer and averaged weights; the step carries on, no warmup) in a new run folder, at --hold-lr until the window's
+Start Cooldown (the file <run>/start_cooldown), then --final-cooldown steps to zero. --idm-loss: a frozen inverse
+dynamics model (models/idm.py) reads each window's most hidden frame as the model draws it, after the real pictures
+before it, and must find the press's effect the RAM shows (idm_press_loss): the presses' own loss, which the pixel
+loss can satisfy with a compromise between turning and not. --policy-head: a chunk policy head
+(models/policy_head.py, scripts/policy_probe.py) trains alongside on the model's features, its gradient stopped
+(head_step).
 The window (ui/run_viewer.py) reads it all back from the run folders. See
 docs/guides/dynamics.md.
 """
@@ -41,6 +60,8 @@ import argparse
 import gc
 import json
 import logging
+import math
+import multiprocessing
 import os
 import queue
 import shutil
@@ -57,7 +78,7 @@ from torch.utils.data import DataLoader
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from token_world.data.model_frames import BAND, BORDER_VERSION
+from token_world.data.model_frames import BAND, BLANK_BORDER, BORDER_VERSION
 from token_world.data.nes_palette import tetris_palette
 from token_world.data.tetris_bot import A, B, LEFT, RIGHT
 from token_world.data.world_nes_tetris import DATA_NAMES, KEEP_ALL, WORLD_MODEL, WorldNesTetrisStreams, spawn_boards
@@ -68,21 +89,28 @@ from token_world.diagnostics.coherence import score as coherence
 from token_world.diagnostics.long_dream import TrialStream, animation, dreams, score, stacked
 from token_world.diagnostics.long_dream import sheet as dream_sheet
 from token_world.diagnostics.run_outputs import (HORIZONS, append_long_dream, horizon_fields, horizon_outputs,
-                                               load_optimizer, open_metrics, optimizer_state, replace, save_gif,
+                                               MuonAdamW, load_optimizer, open_metrics, optimizer_state,
+                                               replace, save_gif,
                                                write_horizon_curve)
 from token_world.data.tetris_motion import UNKNOWN as MOTION_UNKNOWN
-from token_world.models.dynamics import (COLOURS, SIZE, Dynamics, border_pixels, build, choice_kl, deepen, incoming_actions,
-                                         stacked_source,
-                                         MOVED, TURNED, masked_loss, motion_loss, motion_tokens, own_share, patch_pixels, rollout, sample_choice,
+from token_world.models.dynamics import (COLOURS, SIZE, Dynamics, background_frames, border_pixels, build, choice_kl,
+                                         compose_frames, compose_probs, deepen, incoming_actions,
+                                         stacked_source, unpatch_pixels, weigh_changes,
+                                         MOTION_CODES, TURNED, masked_loss, motion_loss, motion_tokens, own_share, patch_pixels, rollout, sample_choice,
                                          training_mask)
 from token_world.data.live_batches import LiveBatches, data_fields
 from token_world.models.turn_critic import (TURNS_AT, TurnCritic, critic_losses, crop_pixels, crop_tokens,
                                             hard_sample, tokens_to_image, turn_crops)
 from token_world.data.tetris_events import EVENTS, NEXT_BOX, event_slug
+from token_world.data.world_nes_tetris import ACTORS
+from token_world.models.idm import CROP as IDM_CROP
+from token_world.models.idm import EFFECTS, IDM, load_idm
+from token_world.models.policy_head import ChunkHead, load_head
+from token_world.ui.check_window import crash
 
 # Tetris only: the small, fast model on the simpler game first. GameBatches supports
-# "contra" too (data/world_nes_contra.py; earlier runs and results in docs/guides/dynamics.md).
-# Adding it also needs its own --output-root: run folders are named world_model_tetris_<name>.
+# "contra" too (data/world_nes_contra.py; earlier runs and results in docs/guides/dynamics.md). --game sets it
+# (main): "smb" trains on Super Mario Bros. (data/world_nes_smb.py), run folders world_model_<game>_<name>.
 GAMES = ("tetris",)
 # recompute: keep only the patch and block inputs for backward and recompute the rest (same model and
 # gradients, less memory, one more forward): the large model needs it, the small one is 7% faster without.
@@ -93,8 +121,45 @@ MODELS = {# HorizonDrive's two stages at the small model's size (~2.0M parameter
           # a shallow model for fast experiments (2026-10-14): the colour embedding and the pixel head cost
           # the same at any depth, so it trains about twice as fast, not 8 / 3 times
           "s3": {"dim": 96, "layers": 3, "heads": 4, "recompute": False},
-          # s3 grown a layer at a time (--grow-from the one before; deepen inserts the new block), 2026-10-14
-          **{f"s{n}": {"dim": 96, "layers": n, "heads": 4, "recompute": False} for n in range(4, 13)},
+          # s3 grown a layer at a time (--grow-from the one before; deepen inserts the new block), 2026-10-14; to s15
+          # for the deep Tetris model (2026-10-25, the user: "a giant tetris model, like s15")
+          **{f"s{n}": {"dim": 96, "layers": n, "heads": 4, "recompute": False} for n in range(4, 16)},
+          # s3 as wide as s15 is big (2026-10-26, the user: "lets try an s3 but wide"): 4.35 M parameters against s15's
+          # 4.38 M, so depth against width at one size; head 44 against s15's 24
+          "s3_w176": {"dim": 176, "layers": 3, "heads": 4, "recompute": False},
+          # s3_w176 with conv ends (2026-10-26, the user: "do it at both ends, so its kinda like a tiny simple vae
+          # that we train when we are training the model"): 2 x 2 pyramids at 32 / 48 / 64 wide in and out
+          # (models/dynamics.py conv_ends) instead of its linear patch conv and heads, 50% of its weights
+          "s3_w176_conv": {"dim": 176, "layers": 3, "heads": 4, "recompute": False, "conv_ends": (32, 48, 64)},
+          # s3_w176_conv at 9 layers, from scratch: the big run to Friday (2026-10-26, the user: "I dont want to grow");
+          # recompute (39 GB without, 11 GB with: blocks compiled one by one, Model below)
+          "s9_w176_conv": {"dim": 176, "layers": 9, "heads": 4, "recompute": True, "conv_ends": (32, 48, 64)},
+          # s3_w176_conv with latent actions, Tetris and SMB from scratch (2026-10-31, the user: "a small model with
+          # the bigger width as s9 but start at s3 with the thing and train on tetris [...] and smb data"): one
+          # choice of 8 per frame beside the buttons, pulled toward the RAM's effects (--ram-codes)
+          # (no recompute: two games' windows peak at 23 GB reserved without it, no allocator retries; the 1.2 GB
+          # of Shared Usage is the loader's pinned memory, the same with it). The effect head reads the whole window
+          # (Dynamics.prior; the first run's, s3_w176_conv_lam, read the last frame and one press and never gave a
+          # J / L / T turn's code: scripts/effect_head_check.py)
+          "s3_w176_conv_lam_window": {"dim": 176, "layers": 3, "heads": 4, "recompute": False,
+                                      "conv_ends": (32, 48, 64), "latent": [1, 8]},
+          # s3_w176_conv_lam_window with one pixel pyramid for both layers, split at its last map (the user,
+          # 2026-10-31: "only split at the very last step to save params"); first run: Tetris alone, --blank-border
+          "s3_w176_conv_lamw_shared": {"dim": 176, "layers": 3, "heads": 4, "recompute": False,
+                                       "conv_ends": (32, 48, 64), "latent": [1, 8], "shared_heads": True},
+          # ViT-Tiny's blocks (Touvron et al. 2012.12877: 12 layers, 192 wide, 3 heads of 64, MLP 768) as
+          # TimeSformer's divided space-time attention (2102.05095), with s3_w176_conv_lamw_shared's measured
+          # additions (2026-10-31, the user: "Vit tiny with 48 frames of history doing a maskgit"; run it with
+          # --frames 49: 48 frames of history and the frame drawn)
+          # It dreams (tests and play) by the 2026-10-30 tests' measured settings: 4 Halton passes, patches under
+          # 0.99 sure hidden from the history (33.8 ms a frame on the 3090 with the ring cache). No recompute, --rows 8:
+          # 593 frames/s at 21 GB, against 455 with recompute at 12 rows and 479 without at 3 (2026-11-01)
+          "vit_tiny_lam": {"dim": 192, "layers": 12, "heads": 3, "recompute": False, "conv_ends": (32, 48, 64),
+                           "latent": [1, 8], "shared_heads": True,
+                           "decode": {"steps": 4, "order": "halton", "past": 0.99}},
+          # wider than s12, the largest we go (2026-10-22, the user: "we are done growing"): Tetris and SMB in one
+          # model (--game both)
+          "w128": {"dim": 128, "layers": 12, "heads": 4, "recompute": False},
           # buttons into the last block only (2026-10-15): no input add, no actnorm in blocks 1-2 (Dynamics
           # action_blocks); needs --action-norm
           "s3_late": {"dim": 96, "layers": 3, "heads": 4, "recompute": False, "action_blocks": (2,)},
@@ -114,9 +179,14 @@ MODELS = {# HorizonDrive's two stages at the small model's size (~2.0M parameter
 WINDOW_STRIDE = 16                                # a window every 16 frames: each frame in four windows
 BANK_EVERY = 16                                   # steps between additions to the coherence bank
 STOP_FILE = ROOT / "output" / "stop_training"      # create it to stop cleanly, like Stop Training
+COOLDOWN_FILE = "start_cooldown"                  # --hold-lr: <run>/start_cooldown starts the final cooldown
+HEAD_EVERY = 4                                    # --policy-head: steps between the chunk head's steps
+HEAD_LR = 3e-4                                    # its rate, held (it follows the world model's features)
+HEAD_FIRST, HEAD_CHUNK, HEAD_EXECUTE = 8, 16, 8   # as the probe: frames t >= 8, 16 presses a chunk, 8 played
+PERFECT = ACTORS.index("perfect")                 # the head learns the perfect brain's presses only
 EMA_DECAY = 0.999                                 # averaged weights: about the last 1,000 steps
 LONG_DREAM_EVERY = 2000                           # steps between long-dream tests
-LONG_DREAM_TRIALS = 32                            # trials per test: the same games at every test and in every
+LONG_DREAM_TRIALS = 16                            # trials per test (32 until 2026-10-23): the same games at every test and in every
                                                   # run with the same --seed, so tests compare like with like
 LONG_DREAM_VARIANT = "1 pass"                     # long_dream.csv's variant column: no buttons
 PRESSED_VARIANT = "buttons"                       # and the bot's buttons (since 2026-10-08)
@@ -125,16 +195,64 @@ LIVE_FIELDS = [f"live_{event_slug(n)}_{k}" for n in EVENTS for k in ("n", "exact
     "live_turn_wrong_swapped"]
 
 
-FIELDS = ["step", "seconds", "lr", "train_loss", "train_loss_game", "train_loss_border",
+PRESS_FIELDS = ("train_loss_idm", "idm_windows", "idm_right", "idm_real_right", "idm_moves", "idm_moves_right",
+                "idm_moves_real_right", "head_loss", "head_chunks", "head_first", "head_repeat", "head_new",
+                "head_whole",        # --idm-loss's reading of the drawn frames (and of the real ones); --policy-head's
+                "train_loss_ram", "ram_frames", "ram_right", "ram_moves", "ram_moves_right", "code_used_tetris",
+                "code_used_smb", "prior_right_tetris", "prior_right_smb")   # a latent's codes (code_sums)
+
+
+def metric_fields(games) -> list[str]:
+    return ["step", "seconds", "lr", "train_loss", "train_loss_game", "train_loss_border",
           "train_loss_changed", "masked_fraction", "rollout_depth", "blend_frames", "latent_kl",
           "rollout_frames", "rollout_wrong", "rollout_ghost_px", "rollout_resynced",
-          "train_loss_motion", "train_motion_moved", "train_motion_turned", "preview_motion_moved",
+          "train_loss_motion", "train_motion_moved", "train_motion_turned", "train_loss_sprite", "preview_motion_moved",
           "preview_motion_turned", "critic_loss", "critic_g", "critic_direction", "critic_turns",
-          *LIVE_FIELDS,
+          *PRESS_FIELDS, *LIVE_FIELDS,
           "data_wait_ms_mean", "data_wait_ms_max", "data_branches", "data_branch_swapped",
           "data_branch_released",
-          "stream_tick_min", "stream_tick_max", "in_game_restarts",
-          *horizon_fields(GAMES), *data_fields(DATA_NAMES)]
+          "stream_tick_min", "stream_tick_max", "in_game_restarts", *GPU_MEMORY_FIELDS,
+          *horizon_fields(games), *data_fields(data_names(games))]
+
+
+# the CUDA caching allocator since the last checkpoint (gpu_memory): flushes-and-retries (no cached block fit,
+# so every cached block was freed and the allocation retried: a full sync), segments taken from and given back
+# to the driver, and the peaks of memory in use and reserved (nvidia-smi shows the reserved)
+GPU_MEMORY_FIELDS = ("gpu_alloc_retries", "gpu_segments_allocated", "gpu_segments_freed", "gpu_peak_allocated_gb",
+                     "gpu_peak_reserved_gb")
+
+
+def gpu_memory(last: dict) -> dict[str, float]:
+    """The allocator's counters since `last` (updated in place) and its peaks since the last call."""
+    s = torch.cuda.memory_stats()
+    counts = {"gpu_alloc_retries": s.get("num_alloc_retries", 0), "gpu_segments_allocated": s.get("num_device_alloc", 0),
+              "gpu_segments_freed": s.get("num_device_free", 0)}
+    out = {k: v - last.get(k, 0) for k, v in counts.items()}
+    last.update(counts)
+    out["gpu_peak_allocated_gb"] = s.get("allocated_bytes.all.peak", 0) / 2 ** 30
+    out["gpu_peak_reserved_gb"] = s.get("reserved_bytes.all.peak", 0) / 2 ** 30
+    torch.cuda.reset_peak_memory_stats()
+    return out
+
+
+def data_names(games) -> tuple[str, ...]:
+    """What the games' training windows are labelled with (their data_* columns)."""
+    if "smb" not in games:
+        return DATA_NAMES
+    from token_world.data.world_nes_smb import DATA_NAMES as SMB_NAMES
+    if games == ("smb",):
+        return SMB_NAMES
+    return tuple(dict.fromkeys((*DATA_NAMES, *SMB_NAMES)))      # both: Tetris's, then SMB's others
+
+
+FIELDS = metric_fields(GAMES)
+
+
+def motion_codes(games) -> int:
+    """The motion vocabulary of the games' motion targets: a game's own, or both side by side
+    (data/motion_vocab.py)."""
+    from token_world.data.motion_vocab import vocabulary
+    return vocabulary(games)
 
 
 def background_priority(_worker_id: int) -> None:
@@ -149,7 +267,8 @@ def background_priority(_worker_id: int) -> None:
 
 
 class GameBatches:
-    """Each step's batch: workers_per_game live histories of every game, in GAMES order.
+    """Each step's batch: --rows live windows of every game, in GAMES order, the first ready from its
+    --workers-per-game history workers (LiveBatches any_worker: each window is a whole history).
 
     Streams come from World NES (../llm-thing23) and arrive as uint8 model index
     frames in one layout (data/model_frames.py). Every window is kept.
@@ -159,25 +278,45 @@ class GameBatches:
         """toss: the Tetris stream's (world_nes_tetris: KEEP_ALL, every window; EVENTS_TOSS, the latent trainer's
         --toss events); marked: every window comes, `kept` says which the toss kept (the latent trainer's
         streaming encoder sees every frame)."""
-        unknown = set(GAMES) - {"tetris", "contra"}
+        unknown = set(GAMES) - {"tetris", "contra", "smb"}
         if unknown:
             raise ValueError(f"no World NES stream for {sorted(unknown)}")
         self.palettes, streams = {}, {}
         if "tetris" in GAMES:
             self.palettes["tetris"] = tetris_palette()
-            streams["tetris"] = WorldNesTetrisStreams(frames, seed, args.tetris_repo, stride=WINDOW_STRIDE,
+            carry = getattr(args, "carry", False)        # --carry: each row's windows follow on, sharing a frame
+            streams["tetris"] = WorldNesTetrisStreams(frames, seed, args.tetris_repo,
+                                                       stride=frames - 1 if carry else WINDOW_STRIDE,
                                                        screens=WORLD_MODEL, toss=toss, marked=marked,
                                                        motion=getattr(args, "motion", False),
-                                                       branches=getattr(args, "branches", 0))
+                                                       branches=getattr(args, "branches", 0),
+                                                       layers=getattr(args, "two_layers", False),
+                                                       who=bool(getattr(args, "policy_head", None)),
+                                                       effects=bool(getattr(args, "idm_loss", None)
+                                                                    or getattr(args, "ram_codes", 0)),
+                                                       blank=getattr(args, "blank_border", False))
         if "contra" in GAMES:                     # imported only when used: Contra can't break a Tetris run
             from token_world.data.world_nes_contra import WorldNesContraStreams, contra_palette
             self.palettes["contra"] = contra_palette()
             streams["contra"] = WorldNesContraStreams(frames, seed + 1, stride=WINDOW_STRIDE)
+        if "smb" in GAMES:                        # imported only when used, as Contra
+            from token_world.data.world_nes_smb import WorldNesSmbStreams, smb_palette
+            self.palettes["smb"] = smb_palette()
+            if getattr(args, "copy_pretrain", False):     # synthetic windows that only copying predicts
+                from token_world.data.moving_pictures import MovingPictures
+                streams["smb"] = MovingPictures(frames, seed + 2, stride=WINDOW_STRIDE)
+            else:
+                streams["smb"] = WorldNesSmbStreams(frames, seed + 2, stride=WINDOW_STRIDE,
+                                                    motion=getattr(args, "motion", False),
+                                                    layers=getattr(args, "two_layers", False),
+                                                    level_starts=getattr(args, "level_starts", 0.5))
         self.batches = {g: LiveBatches(DataLoader(streams[g], batch_size=None,
-                                                  num_workers=args.workers_per_game, pin_memory=True,
-                                                  persistent_workers=True, worker_init_fn=background_priority,
-                                                  prefetch_factor=args.prefetch_factor),
-                                       args.workers_per_game, streams[g].new_frames,
+                                                  num_workers=args.workers_per_game,
+                                                  pin_memory=True, persistent_workers=True,
+                                                  worker_init_fn=background_priority,
+                                                  prefetch_factor=args.prefetch_factor, in_order=False),
+                                       args.rows, streams[g].new_frames,
+                                       any_worker=not getattr(args, "carry", False),
                                        novelty=Novelty(spawn_boards) if g == "tetris" else None)
                         for g in GAMES}
 
@@ -191,21 +330,39 @@ class GameBatches:
             index.append(x)
             actions.append(a)
         self.kept = torch.cat([self.batches[g].kept for g in GAMES])
+        self.continues = torch.cat([self.batches[g].continues for g in GAMES])     # --carry: each row's
+        # Tetris's event and piece bytes: zeros for another game's rows (no event: the live scores skip them)
+        filled = lambda v, x: v if v is not None else torch.zeros(x.shape[:2], dtype=torch.long, device=x.device)
         piece = [self.batches[g].piece for g in GAMES]
         events = [self.batches[g].events for g in GAMES]
-        self.events = torch.cat(events) if all(e is not None for e in events) else None   # [B, T]
-        self.piece = torch.cat(piece) if all(p is not None for p in piece) else None     # [B, T]
+        self.events = (torch.cat([filled(e, x) for e, x in zip(events, index)])
+                       if any(e is not None for e in events) else None)                    # [B, T]
+        for name in ("who", "effect"):                 # Tetris's actor and press effect; -1 for another game's rows
+            parts = [self.batches[g].extra.get(name) for g in GAMES]
+            setattr(self, name, torch.cat([p.long() if p is not None else
+                                           torch.full(x.shape[:2], -1, dtype=torch.long, device=x.device)
+                                           for p, x in zip(parts, index)]) if any(p is not None for p in parts)
+                    else None)                                                              # [B, T]
+        self.piece = (torch.cat([filled(p, x) for p, x in zip(piece, index)])
+                      if any(p is not None for p in piece) else None)                     # [B, T]
         self.branch_at = torch.cat([self.batches[g].branch_at for g in GAMES])
         motion = [self.batches[g].motion for g in GAMES]
-        self.motion = torch.cat(motion) if all(m is not None for m in motion) else None   # [B, T, 32, 32]
+        if all(m is not None for m in motion):         # each game's codes in the run's vocabulary (motion_vocab)
+            from token_world.data.motion_vocab import to_vocabulary
+            codes = motion_codes(GAMES)
+            self.motion = torch.cat([to_vocabulary(m, g, codes) for m, g in zip(motion, GAMES)])  # [B, T, 32, 32]
+        else:
+            self.motion = None
         return torch.cat(index), torch.cat(actions)
 
     def take_stats(self) -> dict[str, float]:
         """Stream counters over all games; data waits add up, since games are fetched in turn."""
         s = [b.take_stats() for b in self.batches.values()]
-        labelled = {k: v for k, v in s[0].items()
-                    if (k.startswith("data_") and not k.startswith("data_wait")) or k in NOVELTY_FIELDS}
-        return {**labelled,                       # what the windows hold: the first game's (Tetris: labelled)
+        labelled = {}                             # what the windows hold: each game's, the first's where both name it
+        for game in reversed(s):
+            labelled.update({k: v for k, v in game.items()
+                             if (k.startswith("data_") and not k.startswith("data_wait")) or k in NOVELTY_FIELDS})
+        return {**labelled,
                 "data_wait_ms_mean": sum(v["data_wait_ms_mean"] for v in s),
                 "data_wait_ms_max": sum(v["data_wait_ms_max"] for v in s),
                 "stream_tick_min": min(v["stream_tick_min"] for v in s),
@@ -262,12 +419,26 @@ def live_event_scores(model, forward, index: torch.Tensor, incoming: torch.Tenso
     well = torch.zeros(SIZE, SIZE, dtype=torch.bool, device=device)
     well[PLAYFIELD] = True
     keep, well = patch_pixels(keep[None, None], p)[0, 0], patch_pixels(well[None, None], p)[0, 0]   # [N, P*P]
-    real = patch_pixels(index[rw, rf][:, None], p)[:, 0].long()                   # [K, N, P*P]
-    before = patch_pixels(index[rw, rf - 1][:, None], p)[:, 0].long()
+    pictures = compose_frames(index)                                               # two layers: the picture
+    real = patch_pixels(pictures[rw, rf][:, None], p)[:, 0].long()                # [K, N, P*P]
+    before = patch_pixels(pictures[rw, rf - 1][:, None], p)[:, 0].long()
     changed, static = (real != before) & keep, (real == before) & well
 
+    def codes(acts):
+        """A latent's choices: the real frames' from the posterior, as in training, and the hidden frame's the
+        prior's most likely given these buttons (a swapped press reaches the frame through it, as in a dream)."""
+        if not model.latent:
+            return None
+        post = model.read_choice(index)
+        z = F.one_hot(post.argmax(-1), post.shape[-1]).flatten(-2).float()
+        z[:, 0] = 0                                                                # frame 0 has no choice
+        features = forward(index, acts, mask, z=z, motion=given)                   # causal: the hidden frame's
+        prior = model.prior(features[:, :-1], acts[:, 1:])[rw, rf - 1]             # own choice does not reach it
+        z[rw, rf] = F.one_hot(prior.argmax(-1), prior.shape[-1]).flatten(-2).to(z.dtype)
+        return z
+
     def scored(acts):
-        probs = model.logits(forward(index, acts, mask, motion=given)[rw, rf]).float().softmax(-1)
+        probs = model.picture_probs(forward(index, acts, mask, z=codes(acts), motion=given)[rw, rf])
         wrong = 1 - probs.gather(-1, real[..., None])[..., 0]                      # [K, N, P*P]
         moved = 1 - probs.gather(-1, before[..., None])[..., 0]
         has = changed.flatten(1).any(1)
@@ -348,11 +519,17 @@ def pressed_frames(incoming: torch.Tensor, branch_at: torch.Tensor | None = None
 
 def train_step(model, forward, index, actions, depth: int = 0, blend: int = 0,
                generator: torch.Generator | None = None, drawer: Dynamics | None = None, read_choice=None,
-               resync: int | None = None, hidden: float = 0.0, press_weight: float = 1.0,
+               resync: int | None = None, hidden: float = 0.0, clean_hidden: float = 0.0, press_weight: float = 1.0,
                motion: torch.Tensor | None = None, hide_presses: bool = False,
                branch_at: torch.Tensor | None = None, critic: TurnCritic | None = None,
-               critic_weight: float = 0.0, piece: torch.Tensor | None = None):
+               critic_weight: float = 0.0, piece: torch.Tensor | None = None, idm: IDM | None = None,
+               idm_weight: float = 0.0, effect: torch.Tensor | None = None, ram_codes: float = 0.0,
+               memory=None):
     """One MaskGIT step on windows index [B, T, 256, 256] -> losses (total has the graph).
+    memory (--carry, depth 0): the frames before each row's window (models/dynamics.py Memory), which every
+    window frame attends to as well.
+    idm (with effect [B, T], each press's effect, -1 for no label): idm_weight times idm_press_loss.
+    ram_codes (a latent, with effect): ram_code_loss on that share of the labelled frames.
 
     depth 0, the base model (HorizonDrive's first stage): teacher forcing. Every window is real and clean;
     each frame's tokens are hidden at a rate drawn per frame and predicted from the real frames before it
@@ -372,19 +549,22 @@ def train_step(model, forward, index, actions, depth: int = 0, blend: int = 0,
     With a latent (models/dynamics.py), every frame after the first gets the choice its posterior reads from
     the real frame and the one before (sampled, straight-through; a rollout's dreamed history keeps the
     choices it was drawn with, and its frames are left out of the KL), and the prior learns to predict it from
-    the previous frame's features and the frame's incoming buttons: DreamerV3's KL balancing (0.5 dynamics, 0.1 representation), in nats
+    every frame before it and the press after each (Dynamics.prior): DreamerV3's KL balancing (0.5 dynamics, 0.1 representation), in nats
     per pixel as the reconstruction. No free nats (DreamerV3 has 1 per step): Tetris averages well under
     0.1 nats of randomness a frame (a new piece about 2, most frames none), and with a free nat the choice
     took over gravity and Start, which the frames and buttons decide (docs/guides/recipe_attempts.md).
     """
     drawer = model if drawer is None else drawer
     b, t = index.shape[:2]
+    if memory is not None and depth:
+        raise ValueError("a carried memory is teacher forcing's: no rollouts")
     if model.motion and motion is None:
         raise ValueError("a motion model trains on windows with their motion")
     n = model.grid ** 2
     device = index.device
     incoming = incoming_actions(actions)
-    target = patch_pixels(index, model.patch)                             # [B, T, N, P*P]
+    target = patch_pixels(background_frames(index), model.patch)          # [B, T, N, P*P] (two layers: the
+    # background's; the sprite layer has its own head and loss below)
     cut = torch.zeros(b, dtype=torch.long, device=device)                 # 0: a random clean cut, half the time
     soft = unsure = wrong = resynced = own_motion = None
     k = w = 0
@@ -416,7 +596,7 @@ def train_step(model, forward, index, actions, depth: int = 0, blend: int = 0,
         turning = torch.zeros(b, t, dtype=torch.bool, device=device)
         turning[crops[0], crops[1]] = True
         hide = turning if hide is None else hide | turning
-    mask = training_mask(b, t, n, device, generator, cut=cut, hidden=hidden, hide=hide)
+    mask = training_mask(b, t, n, device, generator, cut=cut, hidden=hidden, hide=hide, clean_hidden=clean_hidden)
     z = posterior = None
     if model.latent:
         posterior = (read_choice or model.read_choice)(index)              # [B, T, groups, classes]
@@ -442,26 +622,49 @@ def train_step(model, forward, index, actions, depth: int = 0, blend: int = 0,
                 shown = shown & ~turning[:, :, None, None]
             scored = scored & ~shown
         given = torch.where(scored, torch.full_like(given, MOTION_UNKNOWN), given)
-    features = forward(index, incoming, mask, soft=soft, z=z, motion=given)
+    features = forward(index, incoming, mask, soft=soft, z=z, motion=given, memory=memory)
     weight = model.loss_weights(target)
     frames = press_weights(incoming, press_weight)
     if frames is not None:
         frames = frames[:, :, None, None].expand_as(target)
         weight = frames if weight is None else weight * frames
     total, per_pixel, where = masked_loss(model, features, target, mask, weight=weight)
+    sprite_loss = torch.tensor(float("nan"))
+    if model.two_layers:                             # the sprite layer, on the same masked tokens
+        sprites = patch_pixels(index[:, :, 1], model.patch)
+        sprite_loss, _, _ = masked_loss(model, features, sprites, mask, weight=model.loss_weights(sprites),
+                                        sprite=True)                  # (its changes weighed as the background's)
+        total = total + sprite_loss
     kl = torch.tensor(float("nan"))
+    pressed = {}
     if model.latent:
-        dynamics_kl, representation_kl = choice_kl(posterior[:, 1:], model.prior(features[:, :-1], incoming[:, 1:]))
+        prior = model.prior(features[:, :-1], incoming[:, 1:])                    # [B, T - 1, groups, classes]
+        dynamics_kl, representation_kl = choice_kl(posterior[:, 1:], prior)
         read = torch.ones(t - 1, device=device)      # frames 1..T-1 whose choice the posterior read: not the
         if depth:                                    # dreamed history's (its choices are the drawer's)
             read[s - 1:boundary - 1] = 0
         balanced = 0.5 * dynamics_kl + 0.1 * representation_kl                    # [B, T - 1]
         total = total + (balanced * read).sum() / (read.sum() * b) / SIZE ** 2
         kl = (dynamics_kl.detach() * read).sum() / (read.sum() * b)
+        if effect is not None:
+            pressed.update(code_sums(posterior.detach(), prior.detach(), effect))
+    if ram_codes:
+        if not model.latent or effect is None:
+            raise ValueError("--ram-codes pulls a latent's choice toward the batch's press effects: it needs both")
+        ram, sums = ram_code_loss(posterior, effect, ram_codes, generator)
+        total = total + ram
+        pressed.update(sums)
     moving = {}
     if model.motion:
         moving = motion_loss(model, features, real_motion, scored)
         total = total + moving["motion"]
+    if idm is not None:
+        if effect is None:
+            raise ValueError("the IDM press loss needs the batch's press effects")
+        idm_out = idm_press_loss(model, features, index, mask, effect, idm)
+        total = total + idm_weight * idm_out["train_loss_idm"]
+        pressed.update({k: v.detach() for k, v in idm_out.items() if k != "train_loss_idm"})
+        pressed["idm_loss_sum"], pressed["idm_steps"] = idm_out["train_loss_idm"].detach(), torch.ones((), device=device)
     critic_out = {}
     if crops is not None and len(crops[0]):
         cb, cf, top, left, button = crops
@@ -485,12 +688,117 @@ def train_step(model, forward, index, actions, depth: int = 0, blend: int = 0,
             "rollout_wrong": wrong.mean() if wrong is not None else nan,          # its frames' pixels expected wrong
             "rollout_ghost_px": unsure.mean() if unsure is not None else nan,     # unsure pixels per generated frame
             "rollout_resynced": resynced.mean() if resynced is not None else nan,  # its patches replaced by real
+            "sprite": sprite_loss.detach(),                                       # two layers: the sprite layer's
             "motion": moving["motion"].detach() if moving else nan,               # motion loss and the share
             "motion_moved": moving.get("motion_moved", nan),                     # of moved / turned cells
             "motion_turned": moving.get("motion_turned", nan),                   # it gets right
             "critic_loss": critic_out.get("critic_loss", nan), "critic_g": critic_out.get("critic_g", nan),
             "critic_direction": critic_out.get("critic_direction", nan),         # real beats swapped
-            "critic_turns": torch.tensor(float(len(crops[0]) if crops is not None else 0))}
+            "critic_turns": torch.tensor(float(len(crops[0]) if crops is not None else 0)), "pressed": pressed}
+
+
+def effect_labels(effect: torch.Tensor) -> torch.Tensor:
+    """Each press's effect [B, T] (-1: no label) -> the effect each frame's choice reads [B, T]: frame t's from
+    the posterior's two pictures t - 1 and t, where press t - 2's effect first shows (models/idm.py); -1 for
+    frames 0 and 1."""
+    label = torch.full_like(effect, -1)
+    label[:, 2:] = effect[:, :-2]
+    return label
+
+
+def ram_code_loss(posterior: torch.Tensor, effect: torch.Tensor, share: float,
+                  generator: torch.Generator | None) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """--ram-codes, LAOM's few labels: the posterior's logits [B, T, 1, classes] pulled by cross-entropy toward
+    the RAM's press effect (models/idm.py EFFECTS: codes 0..6) on a random `share` of the frames that have one
+    (Tetris's; another game's rows stay free). Its gradient reaches the posterior alone (read_choice stops it at
+    the tokens). -> (the loss, its detached sums with every labelled frame's reading)."""
+    label = effect_labels(effect)
+    labelled = label >= 0
+    chosen = labelled & (torch.rand(label.shape, device=label.device, generator=generator) < share)
+    logits = posterior[:, :, 0].float()
+    ce = F.cross_entropy(logits.flatten(0, 1), label.clamp_min(0).flatten(), reduction="none").view_as(label)
+    loss = (ce * chosen).sum() / chosen.sum().clamp_min(1)
+    right = (logits.argmax(-1) == label) & labelled
+    moves = labelled & (label > 0)
+    return loss, {"ram_loss_sum": loss.detach(), "ram_steps": torch.ones((), device=label.device),
+                  "ram_frames": labelled.sum(), "ram_right": right.sum(), "ram_moves": moves.sum(),
+                  "ram_moves_right": (right & moves).sum()}
+
+
+def code_sums(posterior: torch.Tensor, prior: torch.Tensor, effect: torch.Tensor) -> dict[str, torch.Tensor]:
+    """A latent's codes, per game (Tetris's rows: those with press effects; the rest SMB's): the posterior's mean
+    probabilities over frames 1.. (codes used: their perplexity, Member.press_metrics) and how often the prior's
+    most likely code is the posterior's (the effect head a dream samples from). posterior [B, T, groups, classes],
+    prior [B, T - 1, groups, classes] (frames 1..)."""
+    probs = posterior[:, 1:].float().softmax(-1).flatten(-2)                         # [B, T - 1, codes]
+    agree = (prior.argmax(-1) == posterior[:, 1:].argmax(-1)).all(-1)                # [B, T - 1]
+    out = {}
+    for game, rows in (("tetris", effect[:, 0] >= 0), ("smb", effect[:, 0] < 0)):
+        out[f"code_probs_{game}"] = (probs * rows[:, None, None]).sum((0, 1))
+        out[f"code_frames_{game}"] = rows.sum() * probs.shape[1]
+        out[f"prior_right_{game}"] = (agree * rows[:, None]).sum()
+    return out
+
+
+def idm_press_loss(model: Dynamics, features: torch.Tensor, index: torch.Tensor, mask: torch.Tensor,
+                   effect: torch.Tensor, idm: IDM) -> dict[str, torch.Tensor]:
+    """The presses' loss (post-train A, 2026-10-30): in each window the frame q with the most hidden tokens (q >= the
+    IDM's pictures - 1) is drawn as the model draws it in a dream, its hidden pixels the most likely colours after
+    the change weight is undone (FrameDecoder), its visible ones real, and the frozen IDM reads it after the real
+    pictures before it; its reading must be the effect the RAM shows for the press whose effect first shows in
+    picture q (press q - frames + 2, models/idm.py). The IDM sees the hard colours, as in its training; the gradient
+    goes through the colour probabilities (straight-through). Windows with nothing hidden in q, or no label (another
+    game's), are left out -> the mean cross-entropy (with the graph) and sums for the metrics (counts, the reading
+    right, and the IDM's reading of the real pictures for comparison)."""
+    b, t, n = mask.shape
+    device, p = index.device, model.patch
+    share = mask.float().mean(-1)                                               # [B, T]
+    share[:, :idm.frames - 1] = -1
+    q = share.argmax(1)                                                         # [B]
+    rows = torch.arange(b, device=device)
+    label = effect[rows, q - idm.frames + 2]
+    use = (share[rows, q] > 0) & (label >= 0)
+    f = features[rows, q]                                                       # [B, N, dim]
+    real = index[rows, q]                                                       # [B, (2,) 256, 256]
+    before = index[rows, q - 1]
+    undo = model.change_undo(device)                                            # [N, P*P, 1]
+    probs = model.logits(f).float().softmax(-1)                                 # [B, N, P*P, COLOURS]
+    if undo is not None:
+        probs = weigh_changes(probs, patch_pixels(before[:, 0] if model.two_layers else before, p).long(), undo)
+    if model.two_layers:                             # the sprite layer's changes undone as the background's
+        sprite = model.sprite_logits(f).float().softmax(-1)
+        if undo is not None:
+            sprite = weigh_changes(sprite, patch_pixels(before[:, 1], p).long(), undo)
+        probs = compose_probs(probs, sprite)
+    colours = probs.shape[-1]
+    hard = F.one_hot(probs.argmax(-1), colours).to(probs.dtype)
+    drawn = unpatch_pixels((hard + probs - probs.detach()).permute(0, 3, 1, 2), p).permute(0, 2, 3, 1)
+    pictures = compose_frames(index)                                            # [B, T, 256, 256]
+    hidden = unpatch_pixels(mask[rows, q][..., None].expand(-1, -1, p * p), p)  # [B, 256, 256]
+    seen = F.one_hot(pictures[rows, q].long(), colours).to(drawn.dtype)
+    drawn = torch.where(hidden[..., None], drawn, seen)[:, IDM_CROP[0], IDM_CROP[1]]
+    span = q[:, None] + torch.arange(-idm.frames + 1, 0, device=device)          # the real pictures before q
+    history = pictures[rows[:, None], span][:, :, IDM_CROP[0], IDM_CROP[1]]     # [B, frames - 1, h, w]
+    with torch.autocast(device.type, enabled=False):
+        logits = idm.soft(torch.cat([F.one_hot(history.long(), colours).float(), drawn[:, None].float()], 1))
+        with torch.no_grad():
+            real_logits = idm(torch.cat([history, pictures[rows, q][:, None, IDM_CROP[0], IDM_CROP[1]]], 1))
+    loss = F.cross_entropy(logits, label.clamp_min(0), reduction="none")
+    used = use.float()
+    right = (logits.argmax(-1) == label).float() * used
+    real_right = (real_logits.argmax(-1) == label).float() * used
+    moves = used * (label > 0).float()
+    return {"train_loss_idm": (loss * used).sum() / used.sum().clamp_min(1), "idm_windows": used.sum(),
+            "idm_right": right.sum(), "idm_real_right": real_right.sum(), "idm_moves": moves.sum(),
+            "idm_moves_right": (right * moves).sum(), "idm_moves_real_right": (real_right * moves).sum()}
+
+
+def head_chunks(action: torch.Tensor, who: torch.Tensor, ts: torch.Tensor):
+    """Windows' stream actions and actors [B, T], frames ts [n] -> each frame's next HEAD_CHUNK presses [B, n,
+    CHUNK], which of them the perfect brain chose [B, n, CHUNK] and the press that made the frame [B, n]
+    (scripts/policy_probe.py chunks)."""
+    idx = ts[:, None] + torch.arange(HEAD_CHUNK, device=ts.device)
+    return action[:, idx], who[:, idx] == PERFECT, action[:, ts - 1]
 
 
 MOTION_FIRST_SHARE = 0.5   # motion_first: the share of masked frames given their cells' real motion, all of it half
@@ -522,13 +830,14 @@ def preview(model, index, actions, palettes, out: Path, args, motion: torch.Tens
     b, t = index.shape[:2]
     start = t - max(HORIZONS)
     incoming = incoming_actions(actions)
-    real, last_context = index[:, start:], index[:, start - 1]
+    pictures = compose_frames(index)                  # two layers: scored and shown as pictures
+    real, last_context = pictures[:, start:], pictures[:, start - 1]
     model.eval()
-    decoder = model.decoder(b, index.device)
-    decoder.prefill(index[:, :start], incoming[:, :start], motion[:, :start] if model.motion else None)
-    wrong, rgb, drawn = [], [], []
+    decoder = model.decoder(b, index.device)      # the model's own, kept: one CUDA graph and memory pool for
+    decoder.prefill(index[:, :start], incoming[:, :start], motion[:, :start] if model.motion else None)  # every
+    wrong, rgb, drawn = [], [], []                # preview (a new Dreamer's took and freed ~96 segments each)
     colours = {g: palettes[g].to(index.device, torch.float32) for g in GAMES}
-    per = args.workers_per_game
+    per = args.rows
     for i, at in enumerate(range(start, t)):
         made = decoder.next(incoming[:, at:at + 1], at)
         probs = made["probs"].float()                                                # [B, 256, 256, COLOURS]
@@ -541,19 +850,24 @@ def preview(model, index, actions, palettes, out: Path, args, motion: torch.Tens
     wrong, rgb = torch.stack(wrong, 1), torch.stack(rgb, 1)                         # [B, H, 256, 256], [.., 3]
     m = {}
     drawn = torch.stack(drawn, 1) if drawn else None                               # [B, H, 32, 32] its own motion
+    from token_world.data.motion_vocab import from_vocabulary
     for g, game in enumerate(GAMES):
         rows = slice(g * per, (g + 1) * per)
+        own = (lambda codes: from_vocabulary(codes, game, model.motion_codes))     # the game's codes, its arrows
         m.update(horizon_outputs(real[rows], rgb[rows], wrong[rows], last_context[rows], palettes[game], out,
-                                 game, motion[rows, start - 1:] if drawn is not None else None,
-                                 drawn[rows] if drawn is not None else None))
+                                 game, own(motion[rows, start - 1:]) if drawn is not None else None,
+                                 own(drawn[rows]) if drawn is not None else None))
     write_horizon_curve(m, GAMES, out)
     nan = float("nan")
     m["preview_motion_moved"] = m["preview_motion_turned"] = nan
     if model.motion:                         # the motion it drew in its own frames against the real
         real_motion, drawn = motion[:, start:].long(), drawn.long()
-        code = real_motion.clamp(max=len(MOVED) - 1)
-        for key, kind in (("preview_motion_moved", MOVED), ("preview_motion_turned", TURNED)):
-            cells = kind.to(code.device)[code] & (real_motion != MOTION_UNKNOWN)
+        codes = model.motion_codes
+        code = real_motion.clamp(max=codes - 1)
+        moved = (code > 0) & (code < codes - 1)
+        turned = TURNED.to(code.device)[code] if codes == MOTION_CODES else torch.zeros_like(moved)
+        for key, kind in (("preview_motion_moved", moved), ("preview_motion_turned", turned)):
+            cells = kind & (real_motion != MOTION_UNKNOWN)
             if cells.any():
                 m[key] = (drawn == real_motion)[cells].float().mean().item()
     return m
@@ -565,40 +879,55 @@ class Member:
     def __init__(self, name: str, args):
         self.name, self.out = name, args.outputs[name]
         self.out.mkdir(parents=True, exist_ok=True)
-        self.config = {**MODELS[name], "patch": args.patch, "frames": args.frames,
-                       "colour_dim": args.colour_dim, "border": BORDER_VERSION,
+        self.config = {**MODELS[name], "patch": args.patch, "frames": args.frames, "history": args.history,
+                       "colour_dim": args.colour_dim,
+                       "border": BLANK_BORDER if getattr(args, "blank_border", False) else BORDER_VERSION,
                        "space_rope": args.space_rope, "qk_norm": args.qk_norm, "action_norm": args.action_norm,
                        "change_weight": args.change_weight, "motion": args.motion,
-                       "motion_first": args.motion_first, "local_attention": args.local_attention}
+                       "motion_first": args.motion_first, "local_attention": args.local_attention,
+                       "two_layers": args.two_layers,
+                       "motion_codes": motion_codes(GAMES)}
         self.model = build(self.config, self.config["recompute"]).cuda()
         self.path = self.out / "model_latest.pt"
         saved = torch.load(self.path, map_location="cuda", weights_only=False) if self.path.is_file() else None
-        source = None
+        source, adamw = None, False
+        if saved is None and args.post_train:             # a finished run continued in this folder
+            saved = torch.load(args.post_train, map_location="cuda", weights_only=False)
+            differ = {k: (saved["args"].get(k), v) for k, v in self.config.items()
+                      if json.dumps(saved["args"].get(k), default=str) != json.dumps(v, default=str)}
+            if differ:
+                raise ValueError(f"--post-train {args.post_train}: its model differs from this run's: {differ}")
+            saved = {k: saved[k] for k in ("step", "model", "optimizer", "ema")}   # its schedule's state stays
+            adamw = "muon" not in saved["optimizer"]
+            print(f"{name}: post-training {args.post_train} from step {saved['step']}"
+                  + (" (trained with AdamW alone: Muon's matrices start without state)" if adamw else ""), flush=True)
         if saved is None and args.grow_from:              # a new run grown from a trained one (deepen)
             source = torch.load(args.grow_from, map_location="cuda", weights_only=False)
             stack = self.config.get("stack")              # stacked: the trained weights with their optimizer
             deepen(self.model, source["model" if stack else "ema"], self.config.get("new_at"),
                    self.config.get("copy", False), stack)
             print(f"{name}: grown from {args.grow_from} (step {source['step']})", flush=True)
-        self.forward = torch.compile(self.model)          # one compiled graph per model (about a minute each)
+        if self.model.recompute:                          # whole-model compile keeps most of what the checkpoints
+            for block in self.model.blocks:               # drop (s9_w176_conv peak 22 GB against 5.5 eager,
+                block.compile()                           # 2026-10-26): compile the blocks, recompute around them
+            self.forward = self.model
+        else:
+            self.forward = torch.compile(self.model)      # one compiled graph per model (about a minute each)
+        self.allocator: dict = {}                         # gpu_memory's last counters
         self.read_choice = torch.compile(self.model.read_choice) if self.model.latent else None
-        trained = [(n, p) for n, p in self.model.named_parameters() if p.requires_grad]
-        decay = [p for n, p in trained if p.ndim >= 2 and "pos" not in n and "colour" not in n
-                 and "rope_freq" not in n]
-        rest = [p for n, p in trained if not any(p is q for q in decay)]
-        self.names = ([n for n, p in trained if any(p is q for q in decay)]
-                      + [n for n, p in trained if not any(p is q for q in decay)])     # the optimizer's order
-        self.optimizer = torch.optim.AdamW([{"params": decay, "weight_decay": args.weight_decay},
-                                            {"params": rest, "weight_decay": 0.0}],
-                                           lr=args.lr, betas=(0.9, 0.95), fused=True)
+        self.optimizer = make_optimizer(self.model, args.lr, args.weight_decay)
         self.step = 0
+        self.hours, self.cooldown_from = 0.0, None        # --stairs: training hours so far, final cooldown's start
+        self.memory = None                                # --carry: the last window's (Memory), not saved: a
+                                                          # resumed run starts each row afresh
         if saved is not None:                             # resume this run
             self.model.load_state_dict(saved["model"])
-            load_optimizer(self.optimizer, saved["optimizer"], self.names)
+            load_optimizer(self.optimizer, saved["optimizer"], from_adamw=adamw)
             self.step = int(saved["step"])
+            self.hours, self.cooldown_from = float(saved.get("hours", 0.0)), saved.get("cooldown_from")
         elif source is not None and self.config.get("stack"):   # stacked: each copy takes its source block's
             old = len(self.model.blocks) // self.config["stack"]  # AdamW state (Growing to See, 2610.16817), and
-            load_optimizer(self.optimizer, source["optimizer"], self.names,   # the schedule carries on, no
+            load_optimizer(self.optimizer, source["optimizer"],               # the schedule carries on, no
                            source_of=lambda n: stacked_source(n, old))        # warmup again (Bu, 2511.04981)
             self.step = int(source["step"])
         self.live = list(self.model.state_dict().values())
@@ -619,6 +948,17 @@ class Member:
             if saved is not None and "critic" in saved:
                 self.critic.load_state_dict(saved["critic"])
                 self.critic_optimizer.load_state_dict(saved["critic_optimizer"])
+        self.idm = load_idm(args.idm_loss, "cuda") if args.idm_loss else None   # frozen: only its inputs train
+        self.head = self.head_optimizer = None
+        if args.policy_head:                              # the chunk head, trained alongside (head_step)
+            self.head = load_head(args.policy_head, "cuda").train().requires_grad_(True)
+            if not isinstance(self.head, ChunkHead):
+                raise ValueError(f"--policy-head {args.policy_head} is not a chunk head")
+            self.head_optimizer = torch.optim.AdamW(self.head.parameters(), lr=HEAD_LR, weight_decay=0.01)
+            if saved is not None and "policy_head" in saved:
+                self.head.load_state_dict(saved["policy_head"])
+                self.head_optimizer.load_state_dict(saved["policy_head_optimizer"])
+        self.press_sums: dict[str, torch.Tensor] = {}     # the IDM's and the head's sums since the last checkpoint
 
     def archive(self, folder: Path) -> None:
         """Keep this step's checkpoint as folder/<run>/model_step<step>.pt, next to its long-dream test, so
@@ -646,6 +986,8 @@ class Member:
         {variant: mean scores}. Scored against the real game (long_dream.py) and, generically, against real
         play's patches and changes (bank, diagnostics/coherence.py)."""
         model = self.averaged_model()
+        gc.collect()                                      # training's cached blocks back first: the dreams' caches
+        torch.cuda.empty_cache()                          # and graphs go on top (2026-11-01: vit_tiny_lam, 25.8 GB)
         means, gifs, sheets = {}, [], []
         for variant, trials in sets.items():
             rows, likely = [], []
@@ -664,29 +1006,68 @@ class Member:
                               for k in rows[0] if k not in ("step", "variant", "level")}
             gc.collect()                                  # the dreams' CUDA graphs (see train)
             torch.cuda.empty_cache()
-        save_gif(stacked(*gifs), self.out / "long_dream.gif", 60)
+        save_gif(stacked(*gifs), self.out / "long_dream.gif", 60, palette)
         temporary = self.out / "long_dream.tmp.png"
         stacked(*sheets).save(temporary)
         replace(temporary, self.out / "long_dream.png")
         return means
 
+    def next_frames_test(self, data: list, palette: np.ndarray) -> dict[str, np.ndarray]:
+        """SMB's test (diagnostics/next_frames.py): the averaged weights draw each window's last frames; rows to
+        next_frames.csv, each level's to next_frames_levels.csv, a random set of windows' real and drawn frames
+        1/4/8 to next_frames.png -> the rates."""
+        from PIL import Image
+        from token_world.diagnostics import next_frames as N
+        shown = sorted(np.random.default_rng(self.step).choice(len(data), N.SHOWN, replace=False).tolist())
+        rates, pictures, levels = N.check(self.averaged_model(), data, shown)
+        append_long_dream(self.out, N.rows(self.step, rates), "next_frames.csv")
+        append_long_dream(self.out, N.level_rows(self.step, levels), "next_frames_levels.csv")
+        temporary = self.out / "next_frames.tmp.png"
+        Image.fromarray(N.strip(pictures, palette)).save(temporary, format="PNG")
+        replace(temporary, self.out / "next_frames.png")
+        return rates
+
+    def button_test(self, data: list, palette: np.ndarray) -> dict:
+        """SMB's button test (diagnostics/button_follow.py): the averaged weights dream each moment's five button
+        sequences; rows to buttons.csv, a random moment's real futures and dreams to buttons.png -> the result."""
+        from PIL import Image
+        from token_world.diagnostics import button_follow as B
+        shown = int(np.random.default_rng(self.step).integers(len(data)))
+        result = B.check(self.averaged_model(), data, shown)
+        append_long_dream(self.out, B.rows(self.step, result), "buttons.csv")
+        temporary = self.out / "buttons.tmp.png"
+        Image.fromarray(B.strip(result["picture"], palette)).save(temporary, format="PNG")
+        replace(temporary, self.out / "buttons.png")
+        return result
+
     def train_step(self, index, actions, args, motion: torch.Tensor | None = None,
                    branch_at: torch.Tensor | None = None, piece: torch.Tensor | None = None,
-                   events: torch.Tensor | None = None) -> None:
+                   events: torch.Tensor | None = None, effect: torch.Tensor | None = None,
+                   who: torch.Tensor | None = None, continues: torch.Tensor | None = None) -> None:
+        """continues [B] (--carry): each row's window follows on from its last one."""
+        if args.stairs and self.cooldown_from is None and stair_rate(self.hours, args) is None:
+            self.cooldown_from = self.step                # the stairs' hours are over: the final cooldown
+            print(f"{self.name}: {self.hours:.2f} h of stairs done at step {self.step}: cooling to zero over "
+                  f"{args.final_cooldown} steps", flush=True)
         for group in self.optimizer.param_groups:
-            group["lr"] = learning_rate(self.step, args)
+            group["lr"] = learning_rate(self.step, args, self.hours, self.cooldown_from)
         depth = rollout_depth(self.step, args)
         if depth and (self.drawer is None or self.step % args.refresh == 0):
             if self.drawer is None:                       # rollouts drawn by weights that hold still for
                 self.drawer = build(self.config).cuda().eval()   # --refresh steps (HorizonDrive's cache)
             self.drawer.load_state_dict(self.model.state_dict())  # in place: its CUDA graph stays valid
         self.optimizer.zero_grad(set_to_none=True)
+        memory = self.seen_memory(continues) if args.carry else None
         with torch.autocast("cuda", dtype=torch.bfloat16):
             self.losses = train_step(self.model, self.forward, index, actions, depth, args.blend or 0,
                                      drawer=self.drawer, read_choice=self.read_choice, resync=args.resync,
-                                     hidden=args.hidden, press_weight=args.press_weight, motion=motion,
+                                     hidden=args.hidden, clean_hidden=args.clean_hidden,
+                                     press_weight=args.press_weight, motion=motion,
                                      hide_presses=args.hide_presses, branch_at=branch_at, critic=self.critic,
-                                     critic_weight=self.critic_weight, piece=piece)
+                                     critic_weight=self.critic_weight, piece=piece, idm=self.idm,
+                                     idm_weight=args.idm_weight, effect=effect, ram_codes=args.ram_codes,
+                                     memory=memory)
+        self.add_sums(self.losses.pop("pressed"))
         self.losses["total"].backward()
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
         self.optimizer.step()
@@ -696,6 +1077,12 @@ class Member:
             self.critic_optimizer.step()
         with torch.no_grad():
             torch._foreach_lerp_(self.ema, self.live, 1 - EMA_DECAY)
+        if args.carry:
+            self.carry(index, actions, motion, continues)
+        if self.head is not None and self.step % HEAD_EVERY == 0:
+            if who is None:
+                raise ValueError("the policy head needs the batch's actors")
+            self.head_step(index, actions, motion, who)
         if events is not None and self.step % LIVE_EVERY == 0:   # the batch's own event scores, unseen data
             with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
                 scores = live_event_scores(self.model, self.forward, index, incoming_actions(actions), events,
@@ -704,14 +1091,109 @@ class Member:
                 self.live_sums[k] = self.live_sums.get(k, 0.0) + v
         self.step += 1
 
+    def seen_memory(self, continues: torch.Tensor):
+        """--carry: the last window's memory, each row that follows on from it seeing a random 0..M of its frames
+        (every history length trained, down to a dream's 3-frame start), the others none; None at the first."""
+        if self.memory is None:
+            return None
+        m = self.memory.frames()
+        follows = continues.to(self.memory.length.device)
+        length = torch.randint(0, m + 1, follows.shape, device=follows.device)
+        return self.memory.seeing(torch.where(follows, length, 0))
+
+    @torch.no_grad()
+    def carry(self, index, actions, motion, continues) -> None:
+        """--carry: the next window's memory, from a clean pass over this one after the optimizer step (every
+        token visible and its real motion, as a dream writes its history; each row seeing all of its own
+        memory), the window's frames but the last (the next window's first)."""
+        model = self.model
+        b, t = index.shape[:2]
+        full = None
+        if self.memory is not None:
+            follows = continues.to(self.memory.length.device)
+            full = self.memory.seeing(torch.where(follows, self.memory.frames(), 0))
+        visible = torch.zeros(b, t, model.grid ** 2, dtype=torch.bool, device=index.device)
+        tokens = motion_tokens(motion, model.patch) if model.motion else None
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            _, self.memory = self.forward(index, incoming_actions(actions), visible, motion=tokens, memory=full,
+                                          collect=True)
+
+    def add_sums(self, sums: dict[str, torch.Tensor]) -> None:
+        """Add this step's sums (GPU scalars: no wait for the GPU) to the ones since the last checkpoint."""
+        for k, v in sums.items():
+            self.press_sums[k] = self.press_sums[k] + v if k in self.press_sums else v.float()
+
+    def press_metrics(self) -> dict[str, float]:
+        """The IDM's, the head's and a latent's codes' scores since the last checkpoint (NaN without them), and
+        the sums reset. Codes used: the perplexity of the posterior's mean probabilities (8: all used evenly)."""
+        s = {k: v.item() if v.numel() == 1 else v.cpu() for k, v in self.press_sums.items()}
+        self.press_sums = {}
+        rate = lambda k, n: s[k] / s[n] if s.get(n) else float("nan")
+
+        def used(game: str) -> float:
+            if not s.get(f"code_frames_{game}"):
+                return float("nan")
+            p = s[f"code_probs_{game}"] / s[f"code_frames_{game}"]
+            return float(torch.exp(-(p * p.clamp_min(1e-12).log()).sum()))
+        return {"train_loss_idm": rate("idm_loss_sum", "idm_steps"), "idm_windows": s.get("idm_windows", 0.0),
+                "idm_right": rate("idm_right", "idm_windows"), "idm_real_right": rate("idm_real_right", "idm_windows"),
+                "idm_moves": s.get("idm_moves", 0.0), "idm_moves_right": rate("idm_moves_right", "idm_moves"),
+                "idm_moves_real_right": rate("idm_moves_real_right", "idm_moves"),
+                "head_loss": rate("head_loss_sum", "head_steps"), "head_chunks": s.get("head_chunks", 0.0),
+                "head_first": rate("head_first", "head_chunks"), "head_repeat": rate("head_repeat", "head_chunks"),
+                "head_new": rate("head_new", "head_new_n"), "head_whole": rate("head_whole", "head_whole_n"),
+                "train_loss_ram": rate("ram_loss_sum", "ram_steps"), "ram_frames": s.get("ram_frames", 0.0),
+                "ram_right": rate("ram_right", "ram_frames"), "ram_moves": s.get("ram_moves", 0.0),
+                "ram_moves_right": rate("ram_moves_right", "ram_moves"), "code_used_tetris": used("tetris"),
+                "code_used_smb": used("smb"), "prior_right_tetris": rate("prior_right_tetris", "code_frames_tetris"),
+                "prior_right_smb": rate("prior_right_smb", "code_frames_smb")}
+
+    def head_step(self, index, actions, motion, who) -> None:
+        """The chunk head's step on the batch, as the probe trained it (scripts/policy_probe.py): the model's
+        features of every frame with all of them visible and their real motion (no gradient into the model), each
+        frame t from HEAD_FIRST to the last whose chunk is in the window labelled with its next HEAD_CHUNK presses,
+        the ones the perfect brain chose (chunks whose first press it chose); its greedy guess scored first."""
+        model, t = self.model, index.shape[1]
+        mask = torch.zeros(*index.shape[:2], model.grid ** 2, dtype=torch.bool, device=index.device)
+        with torch.no_grad(), torch.autocast(index.device.type, dtype=torch.bfloat16):
+            features = self.forward(index, incoming_actions(actions), mask,
+                                    motion=motion_tokens(motion, model.patch) if model.motion else None)
+        ts = torch.arange(HEAD_FIRST, t - HEAD_CHUNK, device=index.device)
+        features = features[:, HEAD_FIRST:t - HEAD_CHUNK].flatten(0, 1)                  # [M, N, dim]
+        presses, valid, before = (v.flatten(0, 1) for v in head_chunks(actions, who, ts))
+        valid = valid & valid[:, :1]                     # chunks the perfect brain started
+        use = valid[:, 0]
+        with torch.no_grad():
+            guess = self.head.sample(features, before, HEAD_EXECUTE, greedy=True)
+        real = presses[:, :HEAD_EXECUTE]
+        first = guess[:, 0] == real[:, 0]
+        new = use & (real[:, 0] != before)
+        whole = use & valid[:, :HEAD_EXECUTE].all(1)
+        logits = self.head(features, before, presses)
+        loss = ((F.cross_entropy(logits.reshape(-1, 256), presses.reshape(-1), reduction="none")
+                 * valid.reshape(-1)).sum() / valid.sum().clamp_min(1))
+        self.head_optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        self.head_optimizer.step()
+        self.add_sums({"head_loss_sum": loss.detach(), "head_steps": torch.ones((), device=index.device),
+                       "head_chunks": use.sum(), "head_first": (first & use).sum(),
+                       "head_repeat": (use & (real[:, 0] == before)).sum(), "head_new_n": new.sum(),
+                       "head_new": (first & new).sum(), "head_whole_n": whole.sum(),
+                       "head_whole": ((guess == real).all(1) & whole).sum()})
+
     def checkpoint(self, index, actions, batches, stats, started, writer, args) -> dict:
         """batches.motion: the batch's motion codes (a motion model's context in the previews)."""
         losses, step = self.losses, self.step
         if not torch.isfinite(losses["total"]):          # checked here, not every step: it waits for the GPU
             raise RuntimeError(f"{self.name}: nonfinite loss at step {step}; last checkpoint is {self.saved_step}")
+        memory = gpu_memory(self.allocator)                # the training steps', before the preview's
         with torch.autocast("cuda", dtype=torch.bfloat16):
             m = preview(self.model, index, actions, batches.palettes, self.out, args, batches.motion)
-        m.update(stats)
+        gc.collect()                                       # the cache back to what training holds: a launch's
+        torch.cuda.empty_cache()                           # first steps peaked at 19 GB and kept 23.5 reserved,
+        m.update(stats)                                    # spilling until a long dream freed it (2.4 s a step
+                                                           # instead of 1.15, postC 2026-11-02)
+        m.update(memory)
         m.update({"seconds": time.monotonic() - started, "lr": self.optimizer.param_groups[0]["lr"],
                   "train_loss": losses["total"].item(), "train_loss_game": losses["game"].item(),
                   "train_loss_border": losses["border"].item(),
@@ -724,19 +1206,28 @@ class Member:
                   "rollout_ghost_px": losses["rollout_ghost_px"].item(),
                   "rollout_resynced": losses["rollout_resynced"].item(),
                   "train_loss_motion": losses["motion"].item(), "train_motion_moved": losses["motion_moved"].item(),
+                  "train_loss_sprite": losses["sprite"].item(),
                   "train_motion_turned": losses["motion_turned"].item(),
                   "critic_loss": losses["critic_loss"].item(), "critic_g": losses["critic_g"].item(),
                   "critic_direction": losses["critic_direction"].item(),
-                  "critic_turns": losses["critic_turns"].item(), **live_means(self.live_sums)})
+                  "critic_turns": losses["critic_turns"].item(), **self.press_metrics(),
+                  **live_means(self.live_sums)})
         self.live_sums = {}
         writer.writerow({"step": step, **m})
         temporary = self.out / "model_latest.pt.tmp"
-        torch.save({"step": step, "model": self.model.state_dict(), "optimizer": optimizer_state(self.optimizer, self.names),
+        torch.save({"step": step, "hours": self.hours, "cooldown_from": self.cooldown_from,
+                    "model": self.model.state_dict(), "optimizer": optimizer_state(self.optimizer),
                     "ema": dict(zip(self.model.state_dict(), self.ema)),
                     "args": {**vars(args), **self.config}, "palettes": batches.palettes, "metrics": m,
                     **({"critic": self.critic.state_dict(), "critic_optimizer": self.critic_optimizer.state_dict()}
-                       if self.critic is not None else {})}, temporary)
+                       if self.critic is not None else {}),
+                    **({"policy_head": self.head.state_dict(),
+                        "policy_head_optimizer": self.head_optimizer.state_dict()} if self.head is not None else {})},
+                   temporary)
         replace(temporary, self.path)
+        if self.head is not None:                         # the head alone, as play_world_model.py --policy loads it
+            torch.save(self.head.state_dict(), self.out / "chunk_head.tmp.pt")
+            replace(self.out / "chunk_head.tmp.pt", self.out / "chunk_head.pt")
         self.saved_step = step
         print(f"{self.name} step={step} loss={m['train_loss']:.4f} (changed {m['train_loss_changed']:.3f}) "
               "changed game pixels wrong h1/4/16 "
@@ -750,25 +1241,86 @@ class Member:
 
 
 def rollout_depth(step: int, args) -> int:
-    """--rollouts DEEPEST SHALLOWEST STEPS -> the deepest rollout at this step of the run (a new run,
-    --grow-from the base, so its steps count from its start): linear from DEEPEST to SHALLOWEST over STEPS
-    steps, then stays (HorizonDrive's boundary-decay curriculum: 10 -> 4 chunks over 8k of 10k steps, the
-    deepest drift first); 0 without --rollouts (the base model: teacher forcing)."""
-    if not args.rollouts:
+    """--rollouts DEEPEST SHALLOWEST STEPS -> the deepest rollout at this step of the run (from
+    --rollouts-from on, 0 before: teacher forcing): linear from DEEPEST to SHALLOWEST over STEPS steps, then
+    stays (HorizonDrive's boundary-decay curriculum: 10 -> 4 chunks over 8k of 10k steps, the deepest drift
+    first); 0 without --rollouts (the base model: teacher forcing)."""
+    if not args.rollouts or step < args.rollouts_from:
         return 0
     deepest, shallowest, steps = args.rollouts
-    return round(deepest + (shallowest - deepest) * min(1.0, step / max(steps, 1)))
+    return round(deepest + (shallowest - deepest) * min(1.0, (step - args.rollouts_from) / max(steps, 1)))
 
 
 
-def learning_rate(step: int, args) -> float:
-    """Linear warmup, then constant; with --cooldown START LENGTH, linear to zero from START to
-    START + LENGTH, where training ends (the warmup-stable-decay schedule). START is fixed on the
-    command line, so a relaunch after a crash continues the same schedule."""
-    lr = args.lr * min(1.0, (step + 1) / args.warmup)
+STAIR_LRS = (3e-3, 1e-3, 6.3e-4, 4e-4, 2.5e-4, 1.6e-4, 1e-4)   # --stairs: each stair's rate and its share of the
+STAIR_SHARES = (0.5, 0.1, 0.08, 0.08, 0.08, 0.08, 0.08)          # hours: half aggressive, a tenth one step down,
+                                                                 # then 5 steps (log-even) to a tenth of that
+
+
+def stair_rate(hours: float, args) -> float | None:
+    """--stairs H: the rate of the stair `hours` of training fall on (--stair-lrs over --stair-shares of H, by
+    default STAIR_LRS over STAIR_SHARES), None once the H hours are over (the final cooldown's turn)."""
+    edge = 0.0
+    for lr, share in zip(args.stair_lrs, args.stair_shares):
+        edge += share * args.stairs
+        if hours < edge:
+            return lr
+    return None
+
+
+# the first and last maps of the network stay with AdamW (make_optimizer): the press, code and button inputs, and
+# the pixel, motion and code-logit outputs
+EDGE_LINEARS = ("action", "prior_button", "choice", "pixel", "sprite_pixel", "motion_out", "posterior_out",
+                "prior_out.3")
+
+
+def make_optimizer(model: torch.nn.Module, lr: float, weight_decay: float) -> MuonAdamW:
+    """Muon (2026-10-31, the user: "we want to go with what others have found is best in general") on every
+    nn.Linear's weight inside the network, AdamW on the rest: the edge maps (EDGE_LINEARS), embeddings, the patch
+    conv, positions and biases. Weight decay on Muon's matrices and AdamW's other weights of 2+ dimensions, but
+    not on positions, colours, RoPE directions, biases or norms."""
+    linear = {f"{m}.weight" for m, mod in model.named_modules()
+              if isinstance(mod, torch.nn.Linear) and m not in EDGE_LINEARS}
+    trained = [(n, p) for n, p in model.named_parameters() if p.requires_grad]
+    muon = [(n, p) for n, p in trained if n in linear]
+    adam = [(n, p) for n, p in trained if n not in linear]
+    decay = [(n, p) for n, p in adam if p.ndim >= 2 and "pos" not in n and "colour" not in n and "rope_freq" not in n
+             and "place" not in n]
+    rest = [(n, p) for n, p in adam if not any(p is q for _, q in decay)]
+    groups = [{"names": [n for n, _ in g], "params": [p for _, p in g], "weight_decay": wd}
+              for g, wd in ((decay, weight_decay), (rest, 0.0))]
+    return MuonAdamW(muon, groups, lr, weight_decay)
+
+
+def cooled(progress: float) -> float:
+    """A cooldown's share of the learning rate at `progress` 0..1 through it: 1 - sqrt (Hägele et al.,
+    2405.18392: better than linear for warmup-stable-decay)."""
+    return 1.0 - math.sqrt(min(1.0, max(0.0, progress)))
+
+
+def learning_rate(step: int, args, hours: float = 0.0, cooldown_from: int | None = None) -> float:
+    """Linear warmup, then constant; with --cooldown START LENGTH, to zero from START to START + LENGTH as
+    1 - sqrt (cooled), where training ends (the warmup-stable-decay schedule; every cooldown below the same). START is fixed on the
+    command line, so a relaunch after a crash continues the same schedule. With --stairs H (2026-10-23, the user:
+    "start aggresive for half the training then do a step down for 1/10th and then step down 5 times for the rest
+    of the training time, then do a 12k cooldown"): the stairs by `hours` of training (stair_rate; time, not steps,
+    since the GPU's power limit moves the speed), then from step `cooldown_from` (the step the hours ran out)
+    linear from the last stair's rate to zero over --final-cooldown steps, where training ends. With --hold-lr LR
+    (post-training): LR until the window's Start Cooldown sets `cooldown_from`, then linear to zero over
+    --final-cooldown steps, where training ends."""
+    warm = min(1.0, (step + 1) / args.warmup)
+    if args.hold_lr:                                 # --hold-lr: held until Start Cooldown, then to zero
+        if cooldown_from is None:
+            return warm * args.hold_lr
+        return warm * args.hold_lr * cooled((step - cooldown_from) / args.final_cooldown)
+    if args.stairs:
+        if cooldown_from is None:
+            return warm * stair_rate(hours, args)
+        return warm * args.stair_lrs[-1] * cooled((step - cooldown_from) / args.final_cooldown)
+    lr = args.lr * warm
     if args.cooldown:
         start, length = args.cooldown
-        lr *= min(1.0, max(0.0, (start + length - step) / length))
+        lr *= cooled((step - start) / length)
     return lr
 
 
@@ -778,16 +1330,19 @@ class LongDreams:
     (diagnostics/long_dream.py); layered: with the context's layers. The first LONG_DREAM_TRIALS are kept and
     every test dreams those: a paired comparison across steps and runs."""
 
-    def __init__(self, seed: int, layered: bool = False, pressed: bool = False):
+    def __init__(self, seed: int, layered: bool = False, pressed: bool = False, two: bool = False,
+                 blank: bool = False):
+        """two: the context's two layers too (a --two-layers model's); blank: the BLANK_BORDER layout."""
         self.ready: queue.Queue = queue.Queue(maxsize=LONG_DREAM_TRIALS)
-        loader = DataLoader(TrialStream(seed, layered, pressed), batch_size=None, num_workers=1,
+        self.count = LONG_DREAM_TRIALS
+        loader = DataLoader(TrialStream(seed, layered, pressed, two, blank), batch_size=None, num_workers=1,
                             persistent_workers=True, worker_init_fn=background_priority, prefetch_factor=2)
         threading.Thread(target=self._fill, args=(iter(loader),), daemon=True, name="long-dream-trials").start()
 
     def _fill(self, trials) -> None:
         for n, trial in enumerate(trials, 1):        # the kept ones only: a trial holds 1,000 future frames
             self.ready.put(trial)
-            if n == LONG_DREAM_TRIALS:
+            if n == self.count:
                 break
 
     def take(self, n: int) -> list:
@@ -808,32 +1363,45 @@ def train(args, events: queue.Queue, stop: threading.Event) -> None:
         torch.manual_seed(args.seed + sum(steps))
         stream_seed = int(np.random.SeedSequence([args.seed, *steps]).generate_state(1)[0])
         batches = GameBatches(args.frames, stream_seed, args)
-        histories = args.workers_per_game * len(GAMES)
+        histories = args.rows * len(GAMES)
         for m in members:
             (m.out / "run_config.json").write_text(json.dumps({
                 **vars(args), **m.config, "model": m.name, "start_step": m.start_step,
                 "stream_seed": stream_seed, "parameters": m.parameters, "trained_with": list(args.models),
                 "games": GAMES, "palettes": {g: p.tolist() for g, p in batches.palettes.items()},
-                "source": "fresh continuous World NES frames (../llm-thing23), RAM-driven Tetris bot "
-                          "(data/tetris_bot.py) with pauses, soft resets and short waits (world_nes_tetris.WORLD_MODEL), every window; exact palette pixels; no archive or eval set; "
-                          "the same batches as every model in trained_with",
+                "source": ("fresh continuous World NES frames (../llm-thing23), RAM-driven Tetris bot "
+                           "(data/tetris_bot.py) with pauses, soft resets and short waits (world_nes_tetris.WORLD_MODEL), every window; exact palette pixels; no archive or eval set; "
+                           "the same batches as every model in trained_with" if GAMES == ("tetris",) else
+                           f"fresh World NES frames (../llm-thing23) of {', '.join(GAMES)}, every window; exact palette "
+                           "pixels; no archive or eval set; the same batches as every model in trained_with"),
             }, default=str, indent=2))
         events.put(("ready", {m.name: m.parameters for m in members}, histories))
         print("World models: " + ", ".join(f"{m.name} {m.parameters:,} params (resume {m.step})" for m in members)
-              + f"; {histories} histories ({args.workers_per_game} per game: {', '.join(GAMES)}) x "
+              + f"; {histories} windows a step ({args.rows} per game: {', '.join(GAMES)}, from "
+                f"{args.workers_per_game} workers each) x "
               f"{args.frames}-frame windows, shared", flush=True)
         files = {m.name: open_metrics(m.out / "metrics.csv", FIELDS) for m in members}
         # the trials depend on --seed alone (the stream seed of a launch at step 0), so a run's tests stay the
         # same games after a relaunch, and runs with the same --seed are tested on the same games
         trial_seed = int(np.random.SeedSequence([args.seed, *[0] * len(members)]).generate_state(1)[0])
-        long_dreams = {LONG_DREAM_VARIANT: LongDreams(trial_seed % 100_000),     # the same games: pressed
-                       PRESSED_VARIANT: LongDreams(trial_seed % 100_000, pressed=True)}   # ones play on
-        palette = batches.palettes["tetris"].cpu().numpy().astype(np.uint8)
+        long_dreams = {}
+        if "tetris" in GAMES:                     # Tetris's long dreams; the same games: pressed ones play on
+            two, blank = args.two_layers, args.blank_border
+            long_dreams = {LONG_DREAM_VARIANT: LongDreams(trial_seed % 100_000, two=two, blank=blank),
+                           PRESSED_VARIANT: LongDreams(trial_seed % 100_000, pressed=True, two=two, blank=blank)}
+        if "smb" in GAMES:                        # SMB's: the next frames of live windows (diagnostics/next_frames.py)
+            from token_world.diagnostics.button_follow import MomentsLater
+            from token_world.diagnostics.next_frames import Windows
+            long_dreams["smb"] = Windows(trial_seed % 100_000)
+            long_dreams["smb_buttons"] = MomentsLater(trial_seed % 100_000)   # not "buttons": Tetris's pressed dreams
+        palette = batches.palettes["tetris"].cpu().numpy().astype(np.uint8) if "tetris" in GAMES else None
         # real play's patches and changes for the coherence scores: every history's window every BANK_EVERY
         # steps (windows 256 frames apart, about 128k frames by the first test), hashed on the GPU; one wait
-        # for the GPU per BANK_EVERY steps, not one a step; kept with the run
+        # for the GPU per BANK_EVERY steps, not one a step; kept with the run. Only for Tetris's long dreams (their
+        # coherence scores): SMB's scrolling makes millions of patches, and each add re-sorts them all on this
+        # thread (1.3 s a step by 17k steps, 2026-10-19; SMB's own long dreams do not use it)
         bank_path = members[0].out / "patch_bank.npz"
-        bank = PatchBank.load(bank_path) if bank_path.is_file() else PatchBank()
+        bank = (PatchBank.load(bank_path) if bank_path.is_file() else PatchBank()) if "tetris" in GAMES else None
         started = time.monotonic()
         index = actions = None
 
@@ -842,32 +1410,71 @@ def train(args, events: queue.Queue, stop: threading.Event) -> None:
             files[member.name][0].flush()
             events.put(("preview", member.name, member.step, m))
 
+        def finished() -> bool:                          # --stairs, --hold-lr: every member's final cooldown is over
+            return bool(args.stairs or args.hold_lr) and all(m.cooldown_from is not None
+                                             and m.step >= m.cooldown_from + args.final_cooldown for m in members)
+
+        clock = time.monotonic()
         try:
-            while not stop.is_set() and (args.steps <= 0 or min(m.step for m in members) < args.steps):
+            while (not stop.is_set() and (args.steps <= 0 or min(m.step for m in members) < args.steps)
+                   and not finished()):
+                now = time.monotonic()
+                for m in members:                         # the stairs run on training time (tests included)
+                    m.hours += (now - clock) / 3600
+                clock = now
+                for m in members:                         # --hold-lr: the window's Start Cooldown
+                    flag = m.out / COOLDOWN_FILE
+                    if args.hold_lr and flag.exists():
+                        flag.unlink()
+                        if m.cooldown_from is None:
+                            m.cooldown_from = m.step
+                            print(f"{m.name}: Start Cooldown at step {m.step}: to zero over {args.final_cooldown} "
+                                  "steps", flush=True)
                 if STOP_FILE.exists():                    # a clean stop without the window: checkpoint, exit 0
                     STOP_FILE.unlink()
                     print(f"{STOP_FILE} found: stopping", flush=True)
                     break
                 index, actions = batches.next()
-                if members[0].step % BANK_EVERY == 0:
-                    for window in index:
+                if bank is not None and members[0].step % BANK_EVERY == 0:
+                    for window in compose_frames(index[:args.rows]):     # Tetris's rows (the first game's)
                         bank.add(window)
                 for member in members:
                     member.train_step(index, actions, args, batches.motion, batches.branch_at, batches.piece,
-                                      batches.events)
+                                      batches.events, batches.effect, batches.who, batches.continues)
                 due = [m for m in members if m.step == m.start_step + 1 or m.step % args.preview_every == 0]
                 if due:
                     stats = batches.take_stats()          # data waits since the last checkpoint, shared
                     for member in due:
                         checkpoint(member)
                 if members[0].step % args.long_dream_every == 0:
-                    trials = {v: d.take(LONG_DREAM_TRIALS) for v, d in long_dreams.items()}  # same for every model
-                    bank.save(bank_path)
+                    trials = {v: d.take() if v in ("smb", "smb_buttons") else d.take(d.count)  # same for every model
+                              for v, d in long_dreams.items()}
+                    if bank is not None:
+                        bank.save(bank_path)
                     for member in members:
                         if member.saved_step != member.step:
                             checkpoint(member)
                         member.archive(args.archive)
-                        summary = member.long_dream_test(trials, palette, bank)
+                        if not long_dreams:
+                            continue
+                        if "smb" in trials:
+                            from token_world.diagnostics.next_frames import line
+                            t0 = time.monotonic()
+                            rates = member.next_frames_test(trials["smb"], batches.palettes["smb"].numpy())
+                            events.put(("nextframes", member.name, member.step, rates))
+                            print(f"{member.name} step={member.step} next frames ({time.monotonic() - t0:.0f} s): "
+                                  f"{line(rates)}", flush=True)
+                        if "smb_buttons" in trials:
+                            from token_world.diagnostics import button_follow as B
+                            t0 = time.monotonic()
+                            result = member.button_test(trials["smb_buttons"], batches.palettes["smb"].numpy())
+                            events.put(("buttons", member.name, member.step, result))
+                            print(f"{member.name} step={member.step} buttons ({time.monotonic() - t0:.0f} s): "
+                                  f"{B.line(result)}", flush=True)
+                        if "tetris" not in GAMES:
+                            continue
+                        summary = member.long_dream_test({v: t for v, t in trials.items() if v not in ("smb", "smb_buttons")},
+                                                         palette, bank)
                         # each dream captured its own CUDA graph (Dreamer); give their memory back, or
                         # training allocates on top of it until the GPU spills into system memory
                         # (32 trials filled the 24 GB card and slowed training ~10x, 2026-10-01)
@@ -896,11 +1503,16 @@ def train(args, events: queue.Queue, stop: threading.Event) -> None:
             for f, _ in files.values():
                 f.close()
         events.put(("done", {m.name: m.step for m in members}))
-    except BaseException as exc:
+    except BaseException:
         import traceback
-        traceback.print_exc()
-        args.failed = True
-        events.put(("error", str(exc)))
+        text = traceback.format_exc()
+        for out in args.outputs.values():               # crash() writes one folder's error.txt; every run's
+            Path(out).mkdir(parents=True, exist_ok=True)
+            with (Path(out) / "error.txt").open("a", encoding="utf-8") as f:    # torch's messages are not
+                print(text, file=f)                                             # cp1252 (it hung, 2026-11-02)
+        for child in multiprocessing.active_children():   # the data and trial workers (os._exit skips them)
+            child.terminate()
+        crash(text, title="Training")
 
 
 def main():
@@ -910,6 +1522,10 @@ def main():
                    help="scheduled rollout recovery: every window a rollout of 1..depth of the model's own frames, "
                         "depth falling from DEEPEST to SHALLOWEST over STEPS steps (HorizonDrive); without it, "
                         "teacher forcing (the base model)")
+    p.add_argument("--rollouts-from", type=int, default=0, metavar="STEP",
+                   help="with --rollouts: teacher forcing until this step, then the rollouts (their STEPS counted "
+                        "from it): one run, the base first (2026-10-25; HorizonDrive grows a second run from the "
+                        "base)")
     p.add_argument("--refresh", type=int, default=2000,
                    help="with --rollouts: the rollouts are drawn by a frozen copy of the model, refreshed with its "
                         "weights every this many steps (HorizonDrive's rollout cache, R = 2,000)")
@@ -932,6 +1548,9 @@ def main():
     p.add_argument("--hidden", type=float, default=0.0, metavar="SHARE",
                    help="the share of masked frames hidden entirely in training, as a dream draws every frame "
                         "(models/dynamics.py training_mask): the model cannot read a change off the frame itself")
+    p.add_argument("--clean-hidden", type=float, default=0.0, metavar="SHARE",
+                   help="the share of windows trained as a dream draws: every k-th frame (2-4) hidden whole, the "
+                        "rest fully visible (models/dynamics.py training_mask)")
     p.add_argument("--change-weight", type=float, default=1.0, metavar="W",
                    help="the loss weight on game pixels that change from the frame before (models/dynamics.py "
                         "Dynamics.loss_weights); decoding undoes it (FrameDecoder). A resumed run must give the same")
@@ -947,6 +1566,28 @@ def main():
     p.add_argument("--press-weight", type=float, default=1.0, metavar="W",
                    help="the loss weight on whole frames an A, B, Left or Right press reaches (press_weights); "
                         "training only, decoding is unchanged")
+    p.add_argument("--post-train", type=Path, default=None, metavar="CHECKPOINT",
+                   help="a finished run's checkpoint a new run continues (its weights, optimizer and averaged weights; "
+                        "the step carries on, no warmup); the same model settings; ignored on resume")
+    p.add_argument("--hold-lr", type=float, default=None, metavar="LR",
+                   help="hold the rate at LR until the window's Start Cooldown (or the file <run>/start_cooldown), "
+                        "then --final-cooldown steps to zero, where training ends (post-training)")
+    p.add_argument("--carry", action="store_true",
+                   help="carry each row's last window's temporal keys and values into its next (Transformer-XL's "
+                        "memory; models/dynamics.py Memory), so training sees the history a dream's ring holds: each "
+                        "row one history worker's stream, windows 63 frames apart (sharing a frame), each frame "
+                        "attending to its own and the 63 before it; the memory from a clean pass after each step, "
+                        "each row seeing a random 0..63 of its frames; Tetris alone, no rollouts, branches or latent")
+    p.add_argument("--idm-loss", type=Path, default=None, metavar="IDM",
+                   help="a saved IDM (scripts/idm_check.py; models/idm.py) that reads each window's most hidden frame "
+                        "as the model draws it: the presses' loss (idm_press_loss)")
+    p.add_argument("--idm-weight", type=float, default=0.1, help="--idm-loss's weight against the pixel loss")
+    p.add_argument("--ram-codes", type=float, default=0.0, metavar="SHARE",
+                   help="a latent model's choice as latent actions (LAOM): pulled toward the RAM's press effects "
+                        "on this share of the Tetris frames (0.1 since 2026-10-31); SMB's stay free")
+    p.add_argument("--policy-head", type=Path, default=None, metavar="HEAD",
+                   help="a chunk head (scripts/policy_probe.py chunk_head.pt) trained alongside on the model's "
+                        "features, gradient stopped, every 4th step (head_step); saved as <run>/chunk_head.pt")
     p.add_argument("--grow-from", type=Path, default=None,
                    help="a checkpoint a new run starts from (the base, for --rollouts; deepen); ignored on resume")
     p.add_argument("--models", nargs="+", choices=list(MODELS), default=["base"],
@@ -959,7 +1600,9 @@ def main():
                    help="earlier runs drawn dashed beside these in the window (by step)")
     p.add_argument("--seconds", type=int, default=0, help="wall-clock limit; 0 trains until Stop Training")
     p.add_argument("--steps", type=int, default=0, help="optimizer-step limit; 0 has none")
-    p.add_argument("--workers-per-game", type=int, default=16, help="live histories per game per step")
+    p.add_argument("--workers-per-game", type=int, default=16, help="history worker processes per game")
+    p.add_argument("--rows", type=int, default=None,
+                   help="windows per game per step, the first ready from any worker (default: --workers-per-game)")
     p.add_argument("--prefetch-factor", type=int, default=2)
     p.add_argument("--preview-every", type=int, default=200)
     p.add_argument("--long-dream-every", type=int, default=LONG_DREAM_EVERY,
@@ -967,6 +1610,20 @@ def main():
     p.add_argument("--archive", type=Path, default=Path("D:/token_world_checkpoints"),
                    help="checkpoints kept at every long-dream test, in <archive>/<run folder>/ (D: has the space)")
     p.add_argument("--frames", type=int, default=64, help="window length: the model's context")
+    p.add_argument("--blank-border", action="store_true",
+                   help="Tetris alone: both border bands one shade in every frame (model_frames.BLANK_BORDER: no frame "
+                        "counter, fall timer or autorepeat drawn; the model reads them from its history)")
+    p.add_argument("--two-layers", action="store_true",
+                   help="SMB: each frame as the PPU's two layers, the background with no sprites and the sprites "
+                        "(nes_layers.two_layers), read and predicted apart (Dynamics two_layers): a sprite over a "
+                        "coin or a brick leaves both whole")
+    p.add_argument("--copy-pretrain", action="store_true",
+                   help="SMB, two layers, motion: train on moving pictures (data/moving_pictures.py: real SMB "
+                        "backgrounds sliding and real sprite cut-outs moving, in shuffled colours: only copying "
+                        "the frame before predicts them) instead of real play; relaunch without it to switch")
+    p.add_argument("--history", type=int, default=None,
+                   help="each frame attends in time to the last this many frames, itself included (a banded mask "
+                        "in the --frames window; raise it as the run trains; default: the whole window)")
     p.add_argument("--space-rope", action="store_true",
                    help="rotary in the spatial attention by each patch's place, instead of a learned place "
                         "(models/dynamics.py; a resumed run must give the same)")
@@ -979,9 +1636,27 @@ def main():
     p.add_argument("--warmup", type=int, default=1000, help="linear learning-rate warmup steps")
     p.add_argument("--cooldown", type=int, nargs=2, metavar=("START", "LENGTH"), default=None,
                    help="decay the learning rate linearly to zero from step START over LENGTH steps, then stop")
+    p.add_argument("--stairs", type=float, default=0.0, metavar="HOURS",
+                   help="a stair schedule over HOURS of training (STAIR_LRS over STAIR_SHARES: half at 3e-3, a tenth "
+                        "at 1e-3, then 5 steps to 1e-4; --lr is not used), then --final-cooldown steps to zero")
+    p.add_argument("--stair-lrs", type=float, nargs="+", default=list(STAIR_LRS), metavar="LR",
+                   help="with --stairs: each stair's rate (default STAIR_LRS); the last one's is where the final "
+                        "cooldown starts (2026-10-25: s15 stepped down from its own 3e-4 to finish by 8 am)")
+    p.add_argument("--stair-shares", type=float, nargs="+", default=list(STAIR_SHARES), metavar="SHARE",
+                   help="with --stairs: each stair's share of the hours, one per --stair-lrs, summing to 1")
+    p.add_argument("--level-starts", type=float, default=0.5,
+                   help="SMB: the share of new games that jump to the least-played level's start (world_nes_smb "
+                        "SmbSession; the rest start from the title at 1-1)")
+    p.add_argument("--final-cooldown", type=int, default=12000, help="--stairs: steps from the last stair to zero")
     p.add_argument("--weight-decay", type=float, default=0.05)
     p.add_argument("--seed", type=int, default=43)
     p.add_argument("--tetris-repo", type=str, default=None)
+    p.add_argument("--game", choices=("tetris", "smb", "both"), default="tetris",
+                   help="the game trained on: smb (Super Mario Bros., data/world_nes_smb.py: the bot's brains with "
+                        "retries and level starts; motion from the pictures, data/smb_motion.py); the Tetris-only "
+                        "tests (long dreams, live event scores) are skipped for smb; both: --rows windows of each "
+                        "a step, Tetris's then SMB's (each game's border colours tell them apart), motion in one "
+                        "vocabulary (data/motion_vocab.py), each game's tests")
     p.add_argument("--close-when-done", action="store_true",
                    help="close the window after training finishes or fails (unattended runs)")
     args = p.parse_args()
@@ -989,14 +1664,53 @@ def main():
         p.error("--blend blends rollouts: it needs --rollouts")
     if args.cooldown and not args.steps:
         args.steps = sum(args.cooldown)
-    args.failed, args.games = False, GAMES
+    if args.stairs and args.cooldown:
+        p.error("--stairs ends with its own cooldown (--final-cooldown): not with --cooldown")
+    if len(args.stair_lrs) != len(args.stair_shares) or abs(sum(args.stair_shares) - 1) > 1e-6:
+        p.error("--stair-shares: one per --stair-lrs, summing to 1")
+    args.rows = args.rows or args.workers_per_game
+    if args.post_train and args.grow_from:
+        p.error("--post-train continues a run as it is: not with --grow-from")
+    if args.blank_border and (args.game != "tetris" or args.post_train or args.grow_from):
+        p.error("--blank-border: Tetris alone, from scratch (its frames are another layout)")
+    if args.hold_lr and (args.stairs or args.cooldown):
+        p.error("--hold-lr is the whole schedule: not with --stairs or --cooldown")
+    if args.ram_codes and (args.game == "smb" or args.branches
+                           or any((MODELS[m].get("latent") or [0, 0])[1] < len(EFFECTS) for m in args.models)):
+        p.error(f"--ram-codes: Tetris's real windows (no branches) and latent models of at least {len(EFFECTS)} "
+                f"classes (one per effect)")
+    if (args.idm_loss or args.policy_head) and (args.game != "tetris" or args.branches):
+        p.error("--idm-loss and --policy-head: Tetris without branches (the labels are the real windows' RAM)")
+    if args.rollouts_from and not args.rollouts:
+        p.error("--rollouts-from starts the rollouts: it needs --rollouts")
+    if args.two_layers and args.resync:
+        p.error("--two-layers: no --resync (it replaces patches with real pictures)")
+    if args.carry and (args.game != "tetris" or args.rollouts or args.branches or args.rows != args.workers_per_game
+                       or any(MODELS[m].get("latent") for m in args.models)):
+        p.error("--carry: Tetris alone, no --rollouts, --branches or latent, and --rows as --workers-per-game "
+                "(each row one worker's stream)")
+    if args.two_layers and args.game != "smb" and args.branches:
+        p.error("--two-layers: no Tetris branches (they are made of pictures)")
+    if args.copy_pretrain and not (args.game == "smb" and args.two_layers and args.motion):
+        p.error("--copy-pretrain: SMB with --two-layers and --motion (the windows are two layers with motion)")
+    global GAMES, FIELDS
+    GAMES = ("tetris", "smb") if args.game == "both" else (args.game,)
+    FIELDS = metric_fields(GAMES)
+    args.games = GAMES
     if args.out and len(args.models) != 1:
         p.error("--out names one model's run folder")
-    args.outputs = {name: args.out or args.output_root / f"world_model_tetris_{name}" for name in args.models}
+    args.outputs = {name: args.out or args.output_root / f"world_model_{args.game}_{name}" for name in args.models}
     args.shapes = {name: MODELS[name] for name in args.models}
     from token_world.ui.dynamics_app import launch
     launch(args, train)
-    sys.exit(1 if args.failed else 0)
+    # Everything is saved by now (a failure never gets here: train() crashes the process, check_window.crash).
+    # Exit at once: a DataLoader worker or its pin-memory thread can block the interpreter's shutdown, and the
+    # process then keeps the GPU's memory (2026-10-19: a crashed SMB run held 18 GB until it was killed).
+    for child in multiprocessing.active_children():   # the data and trial workers: os._exit skips their shutdown,
+        child.terminate()                             # and one busy making a trial holds the log open for minutes
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)
 
 
 if __name__ == "__main__":

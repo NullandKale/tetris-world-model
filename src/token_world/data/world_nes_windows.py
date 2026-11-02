@@ -17,7 +17,7 @@ import torch
 from torch.utils.data import get_worker_info
 
 from token_world.data.model_frames import model_index_frames
-from token_world.data.nes_layers import REGIONS, SPRITE_REGIONS, LayerCanvas, sprite_mask
+from token_world.data.nes_layers import REGIONS, SPRITE_REGIONS, TWO_LAYER_REGIONS, LayerCanvas, sprite_mask, two_layers
 
 
 class Session(Protocol):
@@ -50,8 +50,8 @@ Replay = Callable[[int, np.ndarray], tuple[np.ndarray, np.ndarray]]
 
 def world_nes_windows(rom: Path, session: Session, slots: np.ndarray, state: tuple[int, ...] | None,
                       frames: int, new_frames: int, worker_id: int, toss=None, layered: bool = False,
-                      sprites: bool = False, branch: Callable[[dict, Replay], dict | None] | None = None
-                      ) -> Iterator[dict]:
+                      sprites: bool = False, branch: Callable[[dict, Replay], dict | None] | None = None,
+                      layers: bool = False, stamp: Callable[[dict], None] | None = None) -> Iterator[dict]:
     """Endless windows of `frames` consecutive observations, `new_frames` new ones each.
 
     slots: the game's three border shades (model_frames.border_slots); state:
@@ -64,6 +64,8 @@ def world_nes_windows(rom: Path, session: Session, slots: np.ndarray, state: tup
     (for event detection, not training); tick = the last frame's counter.
     layered: the window is the frames' layers instead (data/nes_layers.py, each key stacked [frames, ...])
     under "layers", and no x (compose them for the picture).
+    layers: x is each frame's two layers [frames, 2, 256, 256] (nes_layers.two_layers: the background with no
+    sprites, the sprites over TRANSPARENT; the dynamics model's --two-layers), as the SMB stream's.
     sprites: also "sprites" [frames, 256, 256] bool, the pixels the PPU drew as sprites (nes_layers.sprite_mask; a
     training signal, never a model input).
     branch: called with each window (before any toss) and a replay(start, actions) that plays `actions` [n] (button
@@ -71,16 +73,22 @@ def world_nes_windows(rom: Path, session: Session, slots: np.ndarray, state: tup
     -> (x [n, 256, 256] model indices, ram [n, 2048]) of the n observations after it: what the game would
     have shown had those buttons been pressed. Its result, if not None, goes in the window under "branch"
     (pictures only: not with layered or sprites). The pool then keeps every observation's state.
+    stamp: called with each window as it is made (before any toss, which may hand a window back later, after the
+    session has played on), to add what only the session knows now (world_nes_tetris actors).
     """
-    if branch is not None and (layered or sprites):
-        raise ValueError("branches are made of pictures alone: not with layered or sprites")
+    if branch is not None and (layered or sprites or layers):
+        raise ValueError("branches are made of pictures alone: not with layered, layers or sprites")
+    if layered and layers:
+        raise ValueError("layered (LayerCanvas) or layers (two_layers), not both")
     from world_nes import Capture, Console, RolloutPool, StreamSpec
     pool = RolloutPool([StreamSpec(rom)], workers=1, transitions=new_frames, mode="external",
                        prefetch_batches=0, capture=Capture(frames="palette", ram=True,
                                                            regions=REGIONS if layered else
+                                                           TWO_LAYER_REGIONS if layers else
                                                            SPRITE_REGIONS if sprites else (),
                                                            checkpoints="frame" if branch else "none"))
     replayer = Console(rom, capture=Capture(frames="palette", ram=True)) if branch else None
+    replayed = replayer.allocate_observation() if branch else None
     canvas = LayerCanvas() if layered else None
     buffer = pool.allocate_batch()
     addresses = list(state) if state else None
@@ -93,12 +101,18 @@ def world_nes_windows(rom: Path, session: Session, slots: np.ndarray, state: tup
     saved: list[bytes] = []                         # with branch: their consoles' states
 
     def replay(start: int, buttons: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        replayer.load_state(saved[start])
-        played = [replayer.advance_frame((int(a), 0)) for a in buttons]
+        replayer.load_state(saved[start], observe=False)
+        frames, emphasis, new_ram = [], [], []
+        for a in buttons:
+            replayer.advance_frame_into(replayed, buttons=(int(a), 0))
+            o = replayed.record
+            frames.append(o.frames.copy())
+            emphasis.append(o.emphasis.copy())
+            new_ram.append(o.ram.copy())
         after = ids[start] + 1 + np.arange(len(buttons))
-        new_ram = np.stack([o.ram for o in played])
-        return (model_index_frames(np.stack([o.frames for o in played]), np.stack([o.emphasis for o in played]),
-                                   after, slots, None if addresses is None else new_ram[:, addresses]), new_ram)
+        new_ram = np.stack(new_ram)
+        return (model_index_frames(np.stack(frames), np.stack(emphasis), after, slots,
+                                   None if addresses is None else new_ram[:, addresses]), new_ram)
     try:
         while True:
             pool.collect_into(policy, buffer, callback_views=True)
@@ -119,6 +133,9 @@ def world_nes_windows(rom: Path, session: Session, slots: np.ndarray, state: tup
                     new_x.insert(0, None)           # the held boundary's place
             else:
                 new_x = model_index_frames(record.frames[0], record.emphasis[0], new_ids, slots, states)
+                if layers:
+                    new_x = np.stack([two_layers(new_x[i], {k: record.regions[k][0][i] for k in TWO_LAYER_REGIONS})
+                                      for i in range(len(new_ids))])
             new_masks = (np.stack([sprite_mask({k: record.regions[k][0][i] for k in SPRITE_REGIONS})
                                    for i in range(len(new_ids))]) if sprites else None)
             new_actions = record.actions[0, :, 0].astype(np.int64)
@@ -144,6 +161,8 @@ def world_nes_windows(rom: Path, session: Session, slots: np.ndarray, state: tup
             window = {**pictures, "action": torch.from_numpy(np.append(actions, actions[-1])),
                       "ram": torch.from_numpy(ram), "tick": int(ids[-1]),
                       "in_game_restarts": session.in_game_restarts, "worker_id": worker_id}
+            if stamp is not None:
+                stamp(window)
             if branch is not None:                  # made now, while the states are this window's (a toss
                 made = branch(window, replay)       # may hand the window back later)
                 if made is not None:

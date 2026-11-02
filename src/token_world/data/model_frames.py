@@ -30,6 +30,7 @@ import torch
 from token_world.data.nes_palette import NES_COLOURS, NES_MASTER_PALETTE, palette_indices
 
 BORDER_VERSION = "tokens-v2"                    # runs record it; frames of another layout are refused
+BLANK_BORDER = "blank-v1"                       # the same frames with both bands one shade (blank_bands)
 SIZE, BAND, CELL = 256, 16, 8                   # frame side, border rows top and bottom, digit cell side
 OVERSCAN = 8                                    # NES lines dropped above and below the picture
 GAME_ROWS = slice(BAND, SIZE - BAND)
@@ -39,6 +40,15 @@ MAX_STATE = (_CELLS - _TICK_DIGITS) // _STATE_CELLS
 
 # PPU palette index -> model colour index (0-54).
 NES_TO_INDEX = np.array([NES_COLOURS.index(c) for c in NES_MASTER_PALETTE], dtype=np.uint8)
+
+
+def blank_bands(frames: np.ndarray | torch.Tensor, slots: np.ndarray) -> None:
+    """Frames [..., 256, 256] (model indices; two layers [..., 2, 256, 256]: the background's) in place: both
+    border bands the game's first shade, so no frame shows the counter or the state (BLANK_BORDER; the user,
+    2026-10-31: the latent-action model on Tetris without the border)."""
+    shade = int(slots[0])
+    frames[..., :BAND, :] = shade
+    frames[..., SIZE - BAND:, :] = shade
 
 
 def border_slots(palette: torch.Tensor) -> np.ndarray:

@@ -75,6 +75,37 @@ class LiveStreamTests(unittest.TestCase):
         actions = torch.cat([p["action"][:-1] for p in parts[8:]])
         self.assertGreater(len(set(actions.tolist()) - {0, 8}), 1)             # in a game, not only menus
 
+    def test_a_blank_border_is_one_shade_and_leaves_the_game_alone(self):
+        from token_world.data.model_frames import BAND, border_slots
+        from token_world.data.nes_palette import tetris_palette
+        from token_world.data.world_nes_tetris import WorldNesTetrisStreams
+        shade = int(border_slots(tetris_palette())[0])
+        drawn = [p for _, p in zip(range(6), iter(WorldNesTetrisStreams(64, seed=5, layers=True)))]
+        blank = [p for _, p in zip(range(6), iter(WorldNesTetrisStreams(64, seed=5, layers=True, blank=True)))]
+        for d, b in zip(drawn, blank):
+            bands = torch.cat((b["x"][:, 0, :BAND], b["x"][:, 0, -BAND:]), 1)
+            self.assertTrue(bool((bands == shade).all()))
+            self.assertTrue(torch.equal(d["x"][:, :, BAND:-BAND], b["x"][:, :, BAND:-BAND]))   # the game: the same
+            self.assertTrue(torch.equal(d["x"][:, 1], b["x"][:, 1]))                         # sprites: the same
+            self.assertTrue(torch.equal(d["events"], b["events"]))
+        drawn_bands = torch.cat([d["x"][:, 0, :BAND] for d in drawn])
+        self.assertGreater(len(drawn_bands.unique()), 1)                         # the drawn border changes
+
+    def test_two_layers_compose_to_the_same_pictures_with_the_same_events_and_motion(self):
+        from token_world.data.nes_layers import TRANSPARENT
+        from token_world.data.world_nes_tetris import WorldNesTetrisStreams
+        plain = [part for _, part in zip(range(12), iter(WorldNesTetrisStreams(64, seed=5, motion=True)))]
+        layered = [part for _, part in zip(range(12), iter(WorldNesTetrisStreams(64, seed=5, motion=True,
+                                                                                  layers=True)))]
+        for a, b in zip(plain, layered):
+            self.assertEqual(b["x"].shape, (64, 2, 256, 256))
+            composed = torch.where(b["x"][:, 1] != TRANSPARENT, b["x"][:, 1], b["x"][:, 0])
+            self.assertTrue(torch.equal(composed, a["x"]))
+            self.assertTrue(torch.equal(a["events"], b["events"]))
+            self.assertTrue(torch.equal(a["motion"], b["motion"]))
+        sprites = torch.cat([b["x"][:, 1] for b in layered[8:]])
+        self.assertTrue((sprites != TRANSPARENT).any())                         # the falling piece: sprites
+
 
 @unittest.skipUnless(ROM.is_file() and importlib.util.find_spec("world_nes"), "needs the Tetris ROM and world_nes")
 class BranchTests(unittest.TestCase):

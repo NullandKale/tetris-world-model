@@ -27,6 +27,9 @@ const $ = (id) => document.getElementById(id);
 const screen = $("screen");
 let held = 0, paused = false, pending = Promise.resolve(), dreamer, context, backend, gpu = "", painter;
 let keyboard = 0;                                   // buttons held on the keyboard
+let tapped = 0;                                     // buttons pressed since the last frame read them (2026-11-01:
+                                                    // a tap shorter than a frame, 250 ms at 4 frames/s, never
+                                                    // reached the model; now it gets one frame)
 const touches = new Map();                          // on-screen button held by each pointer (finger, mouse)
 
 const load = logged(async (name) => {
@@ -87,9 +90,8 @@ async function start() {
 async function check() {
   const reference = await load("reference.bin"), count = reference.length / (65536 * 3);
   let first = -1, wrong = 0, worst = 0, ms = 0;
-  const plain = [], slides = [];
+  const steps = [];
   for (let i = 0; i < count; i++) {
-    const slide = dreamer.content.length === dreamer.meta.frames;    // this step re-encodes the window first
     const began = performance.now();
     const frame = await dreamer.next(0);
     draw(frame);
@@ -97,7 +99,7 @@ async function check() {
     frame.dispose();
     const took = performance.now() - began;
     ms += took;
-    (slide ? slides : plain).push(took);
+    steps.push(took);
     let differ = 0;
     for (let j = 0; j < 65536 * 3; j++) differ += Math.abs(colours[j] - reference[i * 65536 * 3 + j]) > TOLERANCE;
     if (differ && first < 0) first = i;
@@ -107,8 +109,7 @@ async function check() {
   const result = `${count} frames: ` +
     (first < 0 ? `as PyTorch (colours within ${TOLERANCE})` : `DIFFERENT: first differs at +${first + 1}, ` +
                                           `${wrong} colour values in all, at most ${worst} in a frame`) +
-    `; ${(ms / count).toFixed(1)} ms per frame on ${backend} (median ${median(plain).toFixed(1)} ms a step, ` +
-    `${median(slides).toFixed(1)} ms with a re-encode, ${slides.length} of them)`;
+    `; ${(ms / count).toFixed(1)} ms per frame on ${backend} (median ${median(steps).toFixed(1)} ms a step)`;
   document.body.dataset.check = result;
   log(result);
   await dreamer.reset(context.start, context.actions);
@@ -123,7 +124,8 @@ async function run() {
   for (;;) {
     if (paused) { await sleep(50); last = performance.now(); timings.reset(last); continue; }
     const began = performance.now();
-    pending = dreamer.next(held);              // restart waits for it: never two runs on one cache
+    pending = dreamer.next(held | tapped);     // restart waits for it: never two runs on one cache
+    tapped = 0;
     const frame = await pending, drawing = performance.now();
     draw(frame);
     frame.dispose();
@@ -137,7 +139,7 @@ async function run() {
     if (frames % 10 === 0) {
       status(`${backend === "webgpu" ? `WebGPU${gpu ? ` (${gpu})` : ""}` : "WebAssembly (no WebGPU: slow)"}\n` +
              `${average.toFixed(1)} ms per frame, ${Math.min(fps, 60).toFixed(0)} frames/s\n` +
-             `frame ${frames}, window position ${dreamer.content.length}`, backend !== "webgpu");
+             `frame ${frames}`, backend !== "webgpu");
     }
   }
 }
@@ -158,13 +160,19 @@ function key(event, down) {
   if (bit === undefined) return;
   event.preventDefault();
   keyboard = down ? keyboard | bit : keyboard & ~bit;
+  if (down) tapped |= bit;
   update();
 }
 
 for (const button of $("pad").querySelectorAll("button")) {
   const bit = Number(button.dataset.bit);
   const release = (e) => { touches.delete(e.pointerId); update(); };
-  button.addEventListener("pointerdown", (e) => { e.preventDefault(); touches.set(e.pointerId, bit); update(); });
+  button.addEventListener("pointerdown", (e) => {
+    e.preventDefault();
+    touches.set(e.pointerId, bit);
+    tapped |= bit;
+    update();
+  });
   button.addEventListener("pointerup", release);
   button.addEventListener("pointercancel", release);
   button.addEventListener("pointerleave", release);
@@ -173,7 +181,7 @@ $("pad").addEventListener("contextmenu", (e) => e.preventDefault());   // no lon
 
 addEventListener("keydown", (e) => key(e, true));
 addEventListener("keyup", (e) => key(e, false));
-addEventListener("blur", () => { keyboard = 0; touches.clear(); update(); });
+addEventListener("blur", () => { keyboard = 0; tapped = 0; touches.clear(); update(); });
 // Start the dream again from `start` (the page's, or an image's: shot_editor.js); Restart replays the current one.
 async function restartWith(start) {
   if (!dreamer) return;

@@ -3,7 +3,7 @@
 // (vendor, architecture, whether it is a software fallback), its features and limits, or why there is no
 // WebGPU; each model file's size and load time and each graph's setup time; a lost GPU device or a GPU error
 // as it happens. While playing, every 5 s: the frame rate and the times of a step (the graph's run, the cache
-// write, the draw) and of the window re-encodes. With ?profile: after PROFILE_FRAMES frames, onnxruntime's
+// write, the draw). With ?profile: after PROFILE_FRAMES frames, onnxruntime's
 // profile of each graph summed by kind of operation and by node: GPU time per run where the adapter has
 // timestamp queries, and every node onnxruntime placed on the CPU (each one a round trip from the GPU).
 export const log = (...args) => console.log("[world-model]", ...args);
@@ -69,21 +69,20 @@ export class Timings {
   constructor() { this.reset(performance.now()); }
 
   reset(now) {
-    Object.assign(this, { since: now, frames: 0, run: [], write: [], encode: [], draw: [] });
+    Object.assign(this, { since: now, frames: 0, run: [], write: [], draw: [] });
   }
 
-  add({ run, write, encode }, draw) {
+  add({ run, write }, draw) {
     this.frames++;
     this.run.push(run);
     this.write.push(write);
     this.draw.push(draw);
-    if (encode) this.encode.push(encode);
     const now = performance.now();
     if (now - this.since < 5000) return;
     const s = (now - this.since) / 1000, f = (xs) => xs.length ? `${quantile(xs, 0.5).toFixed(1)} ms (90%: ` +
       `${quantile(xs, 0.9).toFixed(1)})` : "none";
     log(`${(this.frames / s).toFixed(1)} frames/s over ${s.toFixed(1)} s: a step's run ${f(this.run)}, cache write ` +
-        `${f(this.write)}, draw ${f(this.draw)}; ${this.encode.length} re-encodes, ${f(this.encode)}`);
+        `${f(this.write)}, draw ${f(this.draw)}`);
     this.reset(now);
   }
 }

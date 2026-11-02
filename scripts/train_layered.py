@@ -124,7 +124,7 @@ def long_dream_test(model, sets: dict[str, list], palette, bank, out: Path, step
         means[variant] = {**{k: float(np.nanmean([r[k] for r in rows]))
                              for k in rows[0] if k not in ("step", "variant", "level")},
                           **{f"bias_{k}": v for k, v in picks.items() if k not in ("step", "variant")}}
-    save_gif(stacked(*gifs), out / "long_dream.gif", 60)
+    save_gif(stacked(*gifs), out / "long_dream.gif", 60, palette)
     temporary = out / "long_dream.tmp.png"
     stacked(*sheets).save(temporary)
     replace(temporary, out / "long_dream.png")

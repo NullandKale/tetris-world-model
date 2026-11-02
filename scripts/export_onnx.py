@@ -6,8 +6,10 @@
 Writes embed.onnx, prefill.onnx, step.onnx and model.json (models/onnx_export.py), and the page's start:
 context.bin, the START model frames at the very beginning of a level-0 game (data/real_tetris.py game_start: the
 black frames after Start on the level menu, then the first frames of the playfield, board empty) as palette
-indices, uint8 (the shipped screenshot; its motion is not known: the page ships no RAM), and context.json (the
-frames' shape, their controller bytes and the palette); the model dreams the game from there. Then dreams --frames
+indices, uint8 (the shipped screenshot; a two-layer model's as its two layers, [START, 2, 256, 256]: given the
+picture alone it reads the falling piece as stack; its motion is not known: the page ships no RAM), and
+context.json (the frames' shape, their controller bytes and the palette); the model dreams the game from there.
+Then dreams --frames
 from that start with no buttons through OnnxDreamer (models/onnx_dreamer.py) and the model's own Dreamer (one
 motion step, as the graphs), both on the CPU in float32, and reports how many pixels differ and each one's frames
 per second (model/reference.bin keeps PyTorch's colours, as bytes, for web/test_dreamer.mjs and the page's ?check).
@@ -37,7 +39,7 @@ from token_world.models.onnx_export import export
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("checkpoint", type=Path, nargs="?",
-                   default=Path("D:/token_world_checkpoints/world_model_tetris_s9_cool140/model_step152000.pt"))
+                   default=ROOT / "output/world_model_tetris_s9_postC/model_latest.pt")
     p.add_argument("--out", type=Path, default=ROOT / "web/model")
     p.add_argument("--frames", type=int, default=96, help="frames dreamed by both for the check")
     p.add_argument("--threads", type=int, default=4, help="CPU threads for each runtime")
@@ -47,8 +49,8 @@ def main():
     model, palette = world.model, torch.as_tensor(world.palette)
     model.motion_steps = 1                                # as the graphs decode
     started = time.perf_counter()
-    frames, actions, _ = start_context(game_start())
-    frames = frames.astype(np.uint8)
+    pictures, actions, _, layers = start_context(game_start())
+    frames = (layers if model.two_layers else pictures).astype(np.uint8)
     export(model, args.out, palette)
     (args.out / "context.bin").write_bytes(np.ascontiguousarray(frames).tobytes())
     (args.out / "context.json").write_text(json.dumps({

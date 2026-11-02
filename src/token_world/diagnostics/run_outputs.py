@@ -48,10 +48,29 @@ def replace(temporary: Path, path: Path) -> None:
     temporary.replace(path)
 
 
-def save_gif(frames: list, path: Path, ms: int) -> None:
+def gif_palette(colours) -> Image.Image:
+    """The one palette every frame of a GIF is drawn in: the game's colours exactly ([N, 3], its frame palette),
+    the window's (panel background, labels, the WRONG panel's magenta), then a 5 x 6 x 5 cube for the generated
+    frames' blends. Left to itself PIL gives each frame its own 256 colours, and in a frame full of blends a
+    small sprite's colours lose their slots: small Mario came out one orange in the REAL panel (2026-10-31)."""
+    exact = np.asarray(colours, np.uint8).reshape(-1, 3)
+    ui = np.array([[0x18, 0x18, 0x20], [255, 255, 255], [255, 0, 255]], np.uint8)
+    cube = np.stack(np.meshgrid(*(np.linspace(0, 255, n).round() for n in (5, 6, 5)), indexing="ij"), -1)
+    table = np.concatenate([exact, ui, cube.reshape(-1, 3).astype(np.uint8)])
+    if len(table) > 256:
+        raise ValueError(f"{len(exact)} exact colours leave no room for the blends in a 256-colour GIF")
+    image = Image.new("P", (1, 1))
+    image.putpalette(np.concatenate([table, np.zeros((256 - len(table), 3), np.uint8)]).flatten().tolist())
+    return image
+
+
+def save_gif(frames: list, path: Path, ms: int, colours) -> None:
+    """RGB frames -> an animated GIF in one fixed palette (gif_palette: the game's colours exact)."""
     path.parent.mkdir(parents=True, exist_ok=True)
+    palette = gif_palette(colours)
+    frames = [f.convert("RGB").quantize(palette=palette, dither=Image.Dither.NONE) for f in frames]
     temporary = path.with_name(path.stem + ".tmp.gif")
-    frames[0].save(temporary, save_all=True, append_images=frames[1:], duration=ms, loop=0)
+    frames[0].save(temporary, save_all=True, append_images=frames[1:], duration=ms, loop=0, optimize=False)
     replace(temporary, path)
 
 
@@ -71,15 +90,16 @@ def open_metrics(path: Path, fields: list[str]):
     return f, writer
 
 
-def append_long_dream(out: Path, rows: list[dict]) -> None:
-    """Append long-dream rows to out/long_dream.csv; a file with other columns (an older score) is kept as
-    long_dream_schema_<time>.csv (the window reads those too) and a new one started."""
-    path = out / "long_dream.csv"
+def append_long_dream(out: Path, rows: list[dict], name: str = "long_dream.csv") -> None:
+    """Append long-dream rows to out/<name> (Tetris's long_dream.csv, SMB's smb_long_dream.csv); a file with other
+    columns (an older score) is kept as <stem>_schema_<time>.csv (the window reads those too) and a new one
+    started."""
+    path = out / name
     if path.exists():
         with path.open(newline="") as file:
             header = next(csv.reader(file), [])
         if header != list(rows[0]):
-            replace(path, path.with_name(f"long_dream_schema_{int(time.time())}.csv"))
+            replace(path, path.with_name(f"{path.stem}_schema_{int(time.time())}.csv"))
     new = not path.exists()
     with path.open("a", newline="") as file:
         writer = csv.DictWriter(file, fieldnames=list(rows[0]))
@@ -129,8 +149,8 @@ def save_previews(real, rgb, wrong, last_context, palette, folder: Path, game: s
             elif sprites is not None:
                 panels.append(("SPRITES", (ref * 0.3).astype(np.uint8)))
             if motion is not None:
-                panels.append(("REAL MOTION", motion_overlay(ref, motion[w, t + 1].cpu().numpy())))
-                panels.append(("DRAWN MOTION", motion_overlay(gen, drawn[w, t].cpu().numpy()) if t >= 0
+                panels.append(("REAL MOTION", motion_overlay(ref, motion[w, t + 1].cpu().numpy(), game=game)))
+                panels.append(("DRAWN MOTION", motion_overlay(gen, drawn[w, t].cpu().numpy(), game=game) if t >= 0
                                else (gen * 0.3).astype(np.uint8)))
             image = Image.new("RGB", (len(panels) * (SIZE + 8) - 8, SIZE + 18), "#181820")
             draw = ImageDraw.Draw(image)
@@ -138,7 +158,7 @@ def save_previews(real, rgb, wrong, last_context, palette, folder: Path, game: s
                 image.paste(Image.fromarray(panel, "RGB"), (c * (SIZE + 8), 18))
                 draw.text((c * (SIZE + 8) + 2, 3), f"{title} {'context' if t < 0 else f'+{t + 1}'}", fill="white")
             frames.append(image)
-        save_gif(frames, folder / f"{game}_{slot}.gif", 160)
+        save_gif(frames, folder / f"{game}_{slot}.gif", 160, palette.numpy())
 
 
 def save_sheet(real, rgb, wrong, last_context, palette, path: Path) -> None:
@@ -203,19 +223,107 @@ def write_horizon_curve(m: dict[str, float], games, out: Path) -> None:
     replace(temporary, out / "horizon_curve.csv")
 
 
-def optimizer_state(optimizer, names: list[str]) -> dict:
+class BatchedMuon(torch.optim.Muon):
+    """torch.optim.Muon with each step's Newton-Schulz run on all same-shaped matrices at once (batched matmuls):
+    torch's runs it one matrix at a time, ~70 matrices x 5 iterations x 3 matmuls and their norms (63 ms of a
+    12-row step's 1.46 s, 2026-11-02). The same math, momentum and state (its "momentum_buffer", so a run's saved
+    state loads either way): the update in bf16, each matrix wide (transposed when tall), divided by its norm,
+    then the quintic iteration with the group's coefficients; the learning rate adjusted as torch's
+    (_adjust_lr), the decoupled weight decay."""
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        if closure is not None:
+            raise ValueError("BatchedMuon takes no closure")
+        from torch.optim._muon import _adjust_lr
+        for group in self.param_groups:
+            params, grads, bufs = [], [], []
+            self._init_group(group, params, grads, bufs)
+            if not params:
+                continue
+            lr, momentum = float(group["lr"]), group["momentum"]
+            torch._foreach_lerp_(bufs, grads, 1 - momentum)
+            updates = torch._foreach_lerp(grads, bufs, momentum) if group["nesterov"] else bufs
+            a, b, c = group["ns_coefficients"]
+            shapes: dict[tuple, list[int]] = {}
+            for i, p in enumerate(params):
+                shapes.setdefault(tuple(p.shape), []).append(i)
+            for shape, members in shapes.items():
+                tall = shape[0] > shape[1]
+                x = torch.stack([updates[i] for i in members]).bfloat16()
+                x = x.transpose(1, 2) if tall else x
+                x = x / x.norm(dim=(1, 2), keepdim=True).clamp(min=group["eps"])
+                for _ in range(group["ns_steps"]):
+                    gram = torch.bmm(x, x.transpose(1, 2))
+                    x = torch.baddbmm(x, torch.baddbmm(gram, gram, gram, beta=b, alpha=c), x, beta=a)
+                x = x.transpose(1, 2) if tall else x
+                ps = [params[i] for i in members]
+                torch._foreach_mul_(ps, 1 - lr * group["weight_decay"])
+                torch._foreach_add_(ps, list(x.unbind(0)), alpha=-_adjust_lr(lr, group["adjust_lr_fn"], shape))
+
+
+class MuonAdamW:
+    """Muon on the network's hidden weight matrices and AdamW on the rest (embeddings, the first and last maps,
+    biases, norms, positions), as Muon's authors and Moonshot's "Muon is Scalable for LLM Training" (2502.16982)
+    train: torch.optim.Muon with its update scaled to AdamW's RMS (adjust_lr_fn "match_rms_adamw"), so both take
+    the same learning rate and weight decay. param_groups lists both optimizers' groups (Muon's first), so a
+    schedule sets them all; each part keeps its parameters' names for optimizer_state."""
+
+    def __init__(self, muon: list[tuple[str, torch.Tensor]], adamw_groups: list[dict], lr: float,
+                 weight_decay: float, betas=(0.9, 0.95)):
+        if any(p.ndim != 2 for _, p in muon):
+            raise ValueError("Muon takes weight matrices only")
+        self.muon_names = [n for n, _ in muon]
+        self.adamw_names = [n for g in adamw_groups for n in g["names"]]
+        self.muon = BatchedMuon([p for _, p in muon], lr=lr, weight_decay=weight_decay,
+                                adjust_lr_fn="match_rms_adamw")
+        self.adamw = torch.optim.AdamW([{"params": g["params"], "weight_decay": g["weight_decay"]}
+                                        for g in adamw_groups], lr=lr, betas=betas,
+                                       fused=all(p.is_cuda for g in adamw_groups for p in g["params"]))
+
+    @property
+    def param_groups(self) -> list[dict]:
+        return self.muon.param_groups + self.adamw.param_groups
+
+    def zero_grad(self, set_to_none: bool = True) -> None:
+        self.muon.zero_grad(set_to_none=set_to_none)
+        self.adamw.zero_grad(set_to_none=set_to_none)
+
+    def step(self) -> None:
+        self.muon.step()
+        self.adamw.step()
+
+
+def optimizer_state(optimizer, names: list[str] | None = None) -> dict:
     """The optimizer's state with each parameter's name (its order in the optimizer's groups): a resume matches
-    the state to parameters by name, so the model's code may register them in another order."""
+    the state to parameters by name, so the model's code may register them in another order. A MuonAdamW: each
+    part's, under "muon" and "adamw", with the names it keeps."""
+    if isinstance(optimizer, MuonAdamW):
+        return {"muon": optimizer_state(optimizer.muon, optimizer.muon_names),
+                "adamw": optimizer_state(optimizer.adamw, optimizer.adamw_names)}
     return {**optimizer.state_dict(), "names": names}
 
 
-def load_optimizer(optimizer, saved: dict, names: list[str], new: tuple[str, ...] = (), source_of=None) -> None:
+def load_optimizer(optimizer, saved: dict, names: list[str] | None = None, new: tuple[str, ...] = (),
+                   source_of=None, from_adamw: bool = False) -> None:
     """optimizer_state's dict -> the optimizer, each parameter's state by name (the groups' settings, as the
     learning rate, as saved). A state saved without names is matched by position (it must have the same
     order: a mismatch is an error, not a silent swap). new: name prefixes of parameters the saved state may
     lack (a warm start that adds them): they start without state. source_of: a parameter's name -> the saved
     one whose state it takes (a stacked model: each copy takes its source block's, models/dynamics.py
-    stacked_source)."""
+    stacked_source). A MuonAdamW loads each part from its own (names: the part's). from_adamw: a MuonAdamW
+    post-training a run AdamW trained alone (2026-11-01: s9 predates Muon): Muon's matrices start without state
+    (its momentum fills in ~20 steps, and match_rms_adamw keeps its steps AdamW's size), its AdamW part takes the
+    saved state of its own parameters."""
+    if isinstance(optimizer, MuonAdamW):
+        if "muon" not in saved and from_adamw:
+            load_optimizer(optimizer.adamw, saved, optimizer.adamw_names, new, source_of)
+            return
+        if "muon" not in saved:
+            raise ValueError("this optimizer state is AdamW's alone: a Muon run starts from a Muon run's state")
+        load_optimizer(optimizer.muon, saved["muon"], optimizer.muon_names, new, source_of)
+        load_optimizer(optimizer.adamw, saved["adamw"], optimizer.adamw_names, new, source_of)
+        return
     if source_of is not None:
         if "names" not in saved:
             raise ValueError("copying optimizer state by name needs a state saved with names")
@@ -236,7 +344,8 @@ def load_optimizer(optimizer, saved: dict, names: list[str], new: tuple[str, ...
                  "param_groups": groups}
     params = [q for g in optimizer.param_groups for q in g["params"]]
     for i, state in saved["state"].items():
-        if state["exp_avg"].shape != params[i].shape:
-            raise ValueError(f"optimizer state {i} is {tuple(state['exp_avg'].shape)}, its parameter "
+        held = state["exp_avg"] if "exp_avg" in state else state["momentum_buffer"]     # AdamW's or Muon's
+        if held.shape != params[i].shape:
+            raise ValueError(f"optimizer state {i} is {tuple(held.shape)}, its parameter "
                              f"{names[i]} {tuple(params[i].shape)}: saved in another parameter order")
     optimizer.load_state_dict(saved)

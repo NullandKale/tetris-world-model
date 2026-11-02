@@ -42,7 +42,7 @@ from torch.utils.checkpoint import checkpoint
 
 from token_world.data.nes_layers import BANDS, CANVAS_COLS, CANVAS_ROWS, CELL, LAYER_COLOURS, VIEW, WIDTH
 from token_world.models.dynamics import (Attention, HeadCrossEntropy, SpatialAttention, button_bits, even_share,
-                                         mixed_rotary, pixel_logits, rotary, training_mask)
+                                         mixed_rotary, pixel_logits, rotary, rotary_turns, training_mask)
 
 CELLS = BANDS * VIEW                                    # 255
 COLUMNS = WIDTH // CELL                                 # 16 tokens across the screen
@@ -135,7 +135,8 @@ class RoutedTemporal(Attention):
         if self.q_norm is not None:
             q, k = self.q_norm(q), self.k_norm(k)
         times = at + torch.arange(t, device=x.device)
-        q, k = rotary(q, times), rotary(k, times)
+        turns = rotary_turns(times, q.shape[-1] // 2)
+        q, k = rotary(q, turns), rotary(k, turns)
         if cache is not None:
             cache.write(k, v, slots, at)
             outs = []

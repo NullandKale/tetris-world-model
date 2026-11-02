@@ -111,8 +111,9 @@ original small model, are in `recipe_attempts.md`. It replaces the exact-token m
   one-hot categoricals (DreamerV3), added to the frame's tokens like the action through a
   zero-initialised layer (`choice`), so a model grown from one without it starts identical. Training
   reads the choice from the real frame and the one before (`posterior`, straight-through samples) and
-  teaches `prior` to predict it from the previous frame's features, attention-pooled (a learned query
-  per group), and the frame's incoming buttons (KL balancing 0.5 / 0.1, no
+  teaches `prior` to predict it from the whole history, as the pixel heads read it: every frame so far,
+  its features attention-pooled (a learned query, gradient stopped), with the press that followed it,
+  through two layers of causal attention over the window (KL balancing 0.5 / 0.1, no
   free nats: with DreamerV3's 1 per frame the choice took over gravity and Start); dreams sample it
   from the prior. Not in the ONNX export yet.
 - **Memory:** the 64-frame window is the only memory. It covers Tetris's
@@ -580,6 +581,27 @@ Turning with A alone had made 81% of the training stream's turns A (1,901 of
 2,348 J/L/T turns), and no model learned which way B turns
 (recipe_attempts.md, 2026-10-14); now A 1,042 and B 1,030.
 
+Since 2026-11-01 the perfect brain holds its presses (`hold`): each turn and
+shift press is held 1 to h frames, h drawn per piece from 1 to half a row's
+fall at the level (`hold_cap`: 12 at levels 0-4, 3 at 9, 1 from 16), the same
+moves to the same places (a turn acts on the press, a shift repeats only after
+16 frames held). Its presses went from 1 frame always to 1 frame 43-49%, 2
+frames 18-22%, 3 frames 10-14%, 4-12 frames the rest; 2.4 line clears per 1,000
+of its frames, no top-outs (press census, 201,600 frames).
+
+No planned brain pressed into a wall or the stack, or moved a piece near its
+landing: every shift came high up, before the soft drop, and only straight drops
+were planned. People do all three. So, also with `hold` (2026-11-01): 30% of
+pieces (`NUDGE`), once lined up beside a wall or a stack that blocks the shift on
+every row down to the landing, press into it 1-2 more times, and the piece does
+not move. 30% of the pieces with a shift to make (`LATE`) keep their last shift,
+soft-dropping, until 1-3 rows above where they land. The search also takes tucks
+(`tucks`: dropped down one column, shifted one column over under an overhang) when
+they score best, at levels where a row falls in 3 frames or more. In real games
+(levels 1-13), 176 of 176 perfect pieces landed where planned, on the planned row,
+including 14 tucks. 91 presses into walls or the stack moved nothing, and the 97
+late shifts all moved.
+
 Event census (2026-10-02, 4 games x 50,000 frames, RAM events; per 1,000
 in-game frames) and the holding brain it led to. The other brains tap and
 soft-drop, so held shifts (the game's autorepeat), landings by gravity and long
@@ -600,6 +622,33 @@ level 15 a piece falls the well in ~40 frames, faster than autorepeat moves it.
 | spawn | 13.7 | 12.8 |
 | single / double / triple / tetris | 2.45 / 0.46 / 0.10 / 0.015 | 2.14 / 0.32 / 0.06 / 0.025 |
 | top-out / game start / level up | 0.18 / 0.20 / 0.17 | 0.21 / 0.23 / 0.14 |
+
+Since 2026-11-01 a person brain (`PersonBrain`) takes 15% of short games'
+brain time (perfect 35%, holding 20%, random 20%, idle 10%), and the random
+brain presses a second button 30% of the time. Dreams broke 25-47x when Down
+was held through turns and shifts and 3x on a person's 2-3 frame taps, and no
+brain did either: every brain tapped 1 frame, 1 apart, and two buttons were
+down together on 0.03% of frames (A+B only; output/tests_2026-11-01). The
+person brain plans like the perfect one and draws a style per piece: a 0-15
+frame reaction, presses held 1-6 frames with 1-8 frame gaps, Down never / once
+lined up / held through the turns and shifts / tapped, and turns and shifts
+overlapping on their own timers 40% of the time. The game ignores Left and
+Right while Down is held (0 of 1,168 such frames moved the piece) and arms soft
+drop only on a Down press without Left or Right, so like a person it lets go of
+Down after 1-3 blocked shifts and re-presses a Down that has not dropped the
+piece in 8 frames. The aim is coverage, not a person's exact distribution.
+Press census (`scripts/press_census.py`, 201,600 frames):
+
+| brain | frames | presses / 100 frames | 2+ buttons | clears / 1,000 frames |
+|---|---|---|---|---|
+| perfect | 57% | 7.1 | 0 | 2.9 |
+| holding | 16% | 2.2 | 0 | 1.0 |
+| person | 10% | 9.4 | 2.1% (Down+L/R, A/B+Down, B+L ...) | 2.1 |
+| random | 3% | 5.9 | 27% (every pair) | 0 |
+
+The person brain's presses are held 1 frame 39-45% of the time, 2 frames 23-26%
+and 3-6 frames the rest (every other brain's taps are 1 frame), with gaps
+spread over 1-8 frames.
 
 Still never in training: SELECT during play (it hides the next piece). Spawns
 draw on screen one frame after the RAM shows them; the entry delay from lock
@@ -871,15 +920,25 @@ motion (each token's four 8 x 8 cells' codes, [256, 4]; not known for the
 start's frames, as the page ships no RAM):
 
 - `embed.onnx`: the start's frames (uint8) -> their content.
-- `prefill.onnx`: content [47, 256, 96], motion and incoming actions -> the
-  key/value cache, one keys and one values tensor a layer, positions 0..46
-  filled. The length is fixed (a shorter start is padded after its frames): a
-  dynamic length put about 190 shape nodes on the CPU in onnxruntime-web.
+- `prefill.onnx`: content [62, 256, 96], motion and incoming actions -> the
+  key/value cache, one keys and one values tensor a layer, slots 0..61 filled
+  (the longest start, 63 frames, but its last, which the first step reads).
+  The length is fixed (a shorter start is padded after its frames): a dynamic
+  length put about 190 shape nodes on the CPU in onnxruntime-web.
 - `step.onnx`: the previous frame's content and motion, actions, position and
   the cache -> the new frame (each pixel's most likely colour, through the
   palette in the graph, all in float so it stays on the GPU), its content, its
   motion, and the previous frame's keys and values [9, 256, 4, 24], which the
-  host writes into the cache.
+  host writes into the cache at slot (t - 1) mod 64.
+
+The cache is a ring, as every dream's since 2026-11-01 (`dynamics.TemporalCache`):
+frame t at slot t mod 64, its keys rotated by t itself, each frame attending to
+its own and the 63 before it. Nothing is ever re-encoded. Before, when the
+window filled, the last 48 frames were encoded again at positions 0..47, a
+whole window's work every 16 frames. Test 3 (output/tests_2026-10-30) found the
+ring scores exactly as the re-encode did, 18% faster in PyTorch. The step graph
+works out each slot's frame from the position, in float (exact to 2^24 frames,
+77 hours at 60 a second).
 
 A step decodes as `FrameDecoder` with one motion step (one step dreamed as
 well as two, recipe_attempts.md): pass 1 over the previous frame (written into
@@ -890,10 +949,10 @@ Each layer's keys are [256, 4, 24, 64], transposed as attention reads them,
 its values [256, 4, 64, 24].
 
 Checks, against the model's own Dreamer on the page's start with no buttons:
-the export script (onnxruntime, Python; 96 frames, 0 pixels differ, a window
-slide included), `web/test_dreamer.mjs` (`dreamer.js` on onnxruntime-node: as
-PyTorch), `tests/test_onnx.py` (small motion-first models, pixels and drawn
-motion, through a window slide), and `web/check_browser.mjs` (the page in
+the export script (onnxruntime, Python; 96 frames, the ring past its window),
+`web/test_dreamer.mjs` (`dreamer.js` on onnxruntime-node: as PyTorch),
+`tests/test_onnx.py` (small motion-first models, pixels and drawn motion, the
+ring round twice), and `web/check_browser.mjs` (the page in
 Chrome with `?check`, or `--firefox`: as PyTorch). Speed on the 3090
 (2026-10-18): the first export took 41 ms a step in the check (about 2,400
 kernels, 30 ms of GPU time); written out for the browser (`onnx_export.Graph`:
@@ -905,7 +964,7 @@ about 150 steps (13 frames/s): reading each frame's picture back left the GPU
 idle while the page waited, and the driver lowered its power state (P3 to P5:
 the 3090's memory clock from 5,001 to 810 MHz). So on WebGPU the dream stays on
 the GPU (`web/dreamer.js`): each frame's content and motion go to the next step
-as GPU buffers and are stacked by GPU copies for a re-encode, the picture is
+as GPU buffers (the start's stacked by GPU copies for the prefill), the picture is
 drawn from its GPU buffer (`GpuScreen`), and two steps at most run ahead of the
 GPU (Firefox tells a step's work is done only on a coarse timer, about 100 ms:
 waiting for each step held it to 10 frames/s; two in flight, 21 frames/s in
@@ -923,7 +982,7 @@ page's own border bands).
 
 Speed (2026-10-07; a laptop's integrated AMD GPU played at 4 frames/s):
 
-- Every node of a step and of the re-encode runs on the GPU: one on the CPU
+- Every node of a step and of the prefill runs on the GPU: one on the CPU
   stops the GPU for a round trip. ArgMax's int64 indices had sent the picture's
   composition to the CPU, and the dynamic prefill length its shape arithmetic.
 - The graphs never copy the cache. A step attends over the cache's earlier
@@ -942,8 +1001,8 @@ The page logs to the console (`web/diagnostics.js`, lines starting
 `[world-model]`): the browser, the WebGPU adapter (vendor, architecture,
 software fallback), its features and limits, or why it has none; each file's
 load and each graph's setup time; a lost device or GPU error; and every 5 s the
-frame rate and a step's times (the graph's run, the cache write, the draw, the
-re-encodes). `?profile` adds onnxruntime's profile of each graph after 120
+frame rate and a step's times (the graph's run, the cache write, the draw).
+`?profile` adds onnxruntime's profile of each graph after 120
 frames, summed by kind of operation and by node (GPU time from timestamp
 queries) with every node placed on the CPU; `?backend=wasm|webgpu` and
 `?verbose` (onnxruntime's own log) help on other browsers.

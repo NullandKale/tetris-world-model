@@ -38,7 +38,7 @@ import numpy as np
 import torch
 from torch.utils.data import IterableDataset
 
-from token_world.data.model_frames import border_slots
+from token_world.data.model_frames import blank_bands, border_slots
 from token_world.data.rom import tetris_rom
 from token_world.data.tetris_bot import A, B, BOARD, DOWN, EMPTY, LEFT, RIGHT, SELECT, START, UP, BrainSwitcher
 from token_world.data.tetris_events import ALONE, LOOKAHEAD, events_at, frame_events
@@ -74,12 +74,18 @@ def screens(ram: np.ndarray) -> np.ndarray:
     return out
 
 
+ACTORS = ("script", "perfect", "holding", "random", "reckless", "idle", "person")   # who chose a frame's byte (who=True)
+
+
 class TetrisSession:
-    """Chooses one controller byte per observation, for one continuous stream."""
+    """Chooses one controller byte per observation, for one continuous stream. decisions: the last bytes and who
+    chose each (ACTORS: a brain of the BrainSwitcher, or "script": menus, restarts, pauses, soft resets)."""
 
     def __init__(self, seed: int):
         self.rng = np.random.default_rng(seed)
         self.policy = None
+        self.actor = "script"
+        self.decisions: deque[tuple[str, int]] = deque(maxlen=4096)
         self.restart_phase: str | None = "seek_menu"  # boot reaches the first game like any restart
         self.restart_ticks = self.restart_total_ticks = 0
         self.restart_limit = BOOT_LIMIT
@@ -120,7 +126,13 @@ class TetrisSession:
         self.restart_count += 1
         self.restart_total_ticks = 0
         self.restart_limit = RESTART_LIMIT
-        return int(self.policy(ram, self.rng))
+        return self._brain(ram)
+
+    def _brain(self, ram: np.ndarray) -> int:
+        """The bot's byte; the brain that chose it is this observation's actor."""
+        action = int(self.policy(ram, self.rng))
+        self.actor = self.policy.current
+        return action
 
     def _record(self, same: bool, ram: np.ndarray) -> None:
         """Bookkeeping for an observation produced by the previous action."""
@@ -144,11 +156,14 @@ class TetrisSession:
         if self.observed:
             self._record(np.array_equal(current, previous), ram)
         self.observed += 1
-        return self._decide(ram)
+        self.actor = "script"
+        action = self._decide(ram)
+        self.decisions.append((self.actor, action))
+        return action
 
     def _decide(self, ram: np.ndarray) -> int:
         if self.restart_phase is None:
-            return int(self.policy(ram, self.rng))
+            return self._brain(ram)
         playing = ram[PLAY_STATE] == ACTIVE and ram[PIECE] != 0 and ram[GAME_MODE] == IN_GAME
         if self.restart_phase == "seek_menu":
             if ram[GAME_MODE] == LEVEL_MENU:
@@ -468,6 +483,26 @@ class TurnBranches:
         return self.last
 
 
+def picture(x: torch.Tensor) -> np.ndarray:
+    """A window's frames as pictures [T, 256, 256]: two layers (layers) composed, pictures as they are."""
+    x = x.numpy()
+    if x.ndim == 4:
+        from token_world.data.nes_layers import TRANSPARENT
+        return np.where(x[:, 1] != TRANSPARENT, x[:, 1], x[:, 0])
+    return x
+
+
+def actors(session: TetrisSession, action: np.ndarray) -> np.ndarray:
+    """A window's stream actions [T] (the last one padding) -> who chose each [T] (ACTORS indices), from the
+    session's record: the record's last T - 1 bytes are the window's first T - 1 (act() has not yet run for the
+    window's last observation); the padding frame takes its neighbour's actor."""
+    made = list(session.decisions)[-(len(action) - 1):]
+    if len(made) != len(action) - 1 or [a for _, a in made] != [int(a) for a in action[:-1]]:
+        raise RuntimeError("the session's record of its bytes does not match the window's actions")
+    who = [ACTORS.index(w) for w, _ in made]
+    return np.array(who + who[-1:], np.int8)
+
+
 class WorldNesTetrisStreams(IterableDataset):
     """Endless windows of `frames` consecutive observations from one World NES console per worker.
 
@@ -480,11 +515,15 @@ class WorldNesTetrisStreams(IterableDataset):
     long, where action[t] took frame t to t + 1 and the last entry repeats the
     one before it as padding; ram [frames, 2048] uint8, each frame's console RAM
     (for event detection, not training); tick = the last frame's counter. layered: the frames' layers
-    (data/nes_layers.py) under "layers" instead of x. screens: the screens around play (Screens: WORLD_MODEL
+    (data/nes_layers.py) under "layers" instead of x. layers: x is each frame's two layers [frames, 2, 256, 256]
+    (nes_layers.two_layers, as the SMB stream's; events and motion from the composed pictures). screens: the screens around play (Screens: WORLD_MODEL
     for the world models' training, VAE for the VAE's); None plays the plain bot, as the checks' fixed trials do.
     toss: which windows to keep (Toss: VAE_TOSS for the VAE's training); None keeps every window. judged: the
     toss judges only each window's last `judged` frames (None: all); marked: every window is yielded, with "keep"
-    saying what the toss chose (WindowToss). sprites: also each frame's sprite mask. motion: also each frame's
+    saying what the toss chose (WindowToss). blank: every frame in the BLANK_BORDER layout (model_frames.blank_bands:
+    no counter, no state). effects: also "effect" [frames] int8, each press's effect from the RAM
+    (models/idm.py effects: the IDM's label; the post-trains' press loss). who: also "who" [frames] int8, who chose each frame's byte (an index
+    into ACTORS), checked against the session's record of its bytes (a mismatch raises). sprites: also each frame's sprite mask. motion: also each frame's
     motion codes under "motion" [frames, 32, 32] uint8 (data/tetris_motion.py: made from the window's RAM).
     Every window also has "piece" [frames], each frame's RAM orientation byte (0x42), and "events" [frames],
     the events each picture first shows (tetris_events.frame_events). branches: workers 0 .. branches - 1 give every window a counterfactual twin under "branch" (TurnBranches;
@@ -494,8 +533,14 @@ class WorldNesTetrisStreams(IterableDataset):
     def __init__(self, frames: int = 64, seed: int = 17, repo: str | None = None, stride: int | None = None,
                  layered: bool = False, screens: Screens | None = None, toss: Toss | None = None,
                  sprites: bool = False, judged: int | None = None, marked: bool = False, motion: bool = False,
-                 branches: int = 0):
+                 branches: int = 0, layers: bool = False, who: bool = False, effects: bool = False,
+                 blank: bool = False):
         self.frames, self.seed, self.repo, self.layered, self.motion = int(frames), int(seed), repo, layered, motion
+        self.layers = layers
+        self.who, self.effects = who, effects
+        if blank and layered:
+            raise ValueError("blank: the layered frames draw their own border")
+        self.blank = blank
         self.branches = int(branches)
         self.sprites, self.judged, self.marked = sprites, judged, marked
         self.new_frames = window_stride(self.frames, stride)
@@ -512,17 +557,27 @@ class WorldNesTetrisStreams(IterableDataset):
                   else None)
         windows = world_nes_windows(rom, session, border_slots(tetris_palette()), BORDER_STATE,
                                     self.frames, self.new_frames, worker_id, toss=toss, layered=self.layered,
-                                    sprites=self.sprites, branch=branch)
+                                    sprites=self.sprites, branch=branch, layers=self.layers,
+                                    stamp=(lambda w: w.update(who=torch.from_numpy(actors(session, w["action"].numpy()))))
+                                    if self.who else None)   # who chose each press: now, before any toss
+        slots = border_slots(tetris_palette())
         for window in windows:
             if branch is not None and "branch" not in window:
                 continue                                # no twin made yet
+            if self.blank:                              # BLANK_BORDER: no counter, no state in any frame
+                for w in (window, window.get("branch")):
+                    if w is not None:
+                        blank_bands(w["x"][:, 0] if self.layers else w["x"], slots)
             for w in (window, window.get("branch")):    # each frame's piece byte (the turn critic's J / L / T)
                 if w is not None and "piece" not in w:    # and the events each picture first shows
                     w["piece"] = w["ram"][:, PIECE].clone()
-                    w["events"] = torch.from_numpy(frame_events(w["x"].numpy(), w["ram"].numpy(),
+                    w["events"] = torch.from_numpy(frame_events(picture(w["x"]), w["ram"].numpy(),
                                                                 w["action"].numpy()))
+            if self.effects:
+                from token_world.models.idm import effects        # (models imports data: here, not at the top)
+                window["effect"] = torch.from_numpy(effects(window["ram"].numpy()))
             if self.motion:
                 for w in (window, window.get("branch")):
                     if w is not None and "motion" not in w:   # a reused twin keeps the motion it was given
-                        w["motion"] = torch.from_numpy(stream_motion(w["x"].numpy(), w["ram"].numpy())[0])
+                        w["motion"] = torch.from_numpy(stream_motion(picture(w["x"]), w["ram"].numpy())[0])
             yield window

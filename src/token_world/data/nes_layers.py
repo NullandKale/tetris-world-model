@@ -130,6 +130,7 @@ def compose(frame: dict) -> np.ndarray:
 
 
 SPRITE_REGIONS = ("ppu_background", "ppu_sprites")
+TWO_LAYER_REGIONS = (*SPRITE_REGIONS, "palette_ram")      # two_layers' (the background's colours need the palette)
 
 
 def sprite_mask(regions: dict) -> np.ndarray:
@@ -141,6 +142,29 @@ def sprite_mask(regions: dict) -> np.ndarray:
     out = np.zeros((SIZE, SIZE), bool)
     out[BAND:SIZE - BAND] = shows[OVERSCAN:LINES - OVERSCAN]
     return out
+
+
+def two_layers(frame: np.ndarray, regions: dict) -> np.ndarray:
+    """A model frame [SIZE, SIZE] (model_frames.model_index_frames) and its observation's TWO_LAYER_REGIONS ->
+    [2, SIZE, SIZE] uint8: the background layer (the frame with no sprites: what is drawn under them, the
+    backdrop where the background is transparent; the border bands as in the frame) and the sprite layer (the
+    frame's colour where a sprite shows, by sprite_mask's PPU rule; TRANSPARENT elsewhere and in the border).
+    The sprite layer over the background is the frame (compose_layers), so a sprite moving over a coin or a
+    brick leaves both whole: the dynamics model's `layers` option reads and predicts the two."""
+    bg = np.asarray(regions["ppu_background"], np.uint8).reshape(LINES, WIDTH)
+    palette = np.asarray(regions["palette_ram"], np.uint8) & 0x3F
+    mask = sprite_mask(regions)
+    out = np.empty((2, SIZE, SIZE), np.uint8)
+    out[0] = frame
+    out[0, BAND:SIZE - BAND] = np.where(mask[BAND:SIZE - BAND],
+                                        NES_TO_INDEX[palette[bg[OVERSCAN:LINES - OVERSCAN]]], frame[BAND:SIZE - BAND])
+    out[1] = np.where(mask, frame, TRANSPARENT)
+    return out
+
+
+def compose_layers(layers: np.ndarray) -> np.ndarray:
+    """[..., 2, SIZE, SIZE] two_layers -> [..., SIZE, SIZE]: the sprite layer over the background."""
+    return np.where(layers[..., 1, :, :] != TRANSPARENT, layers[..., 1, :, :], layers[..., 0, :, :])
 
 
 def model_frame(picture: np.ndarray, border: np.ndarray) -> np.ndarray:

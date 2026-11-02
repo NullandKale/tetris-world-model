@@ -35,7 +35,6 @@ from token_world.ui.viewer_widgets import Explainer, FitGrid, FitImage, TextPane
 BG, AXES, GRID, TEXT = "#131316", "#181820", "#333342", "#b0b0c0"
 COLOURS = ("#72dce0", "#ff9e00", "#e0aaff", "#88d990", "#ff4d8d", "#f4d35e")
 DASHES = ("-", "--", ":", "-.")
-GAME = "tetris"
 
 
 # ---------------------------------------------------------------------------------------------- data
@@ -96,6 +95,73 @@ def load_long_dream(run: Path) -> dict[str, dict[str, np.ndarray]]:
     return out
 
 
+def load_smb_dream(run: Path) -> dict[str, dict[str, np.ndarray]]:
+    """SMB's long dreams (smb_long_dream*.csv, one row per trial) -> variant -> column -> per-test means over the
+    tested steps (with "step")."""
+    rows = [r for path in sorted(run.glob("smb_long_dream*.csv")) for r in _read_rows(path)]
+    value = lambda r, k: float(r[k]) if r.get(k) not in (None, "") else math.nan
+    out: dict[str, dict[str, np.ndarray]] = {}
+    for variant in dict.fromkeys(r["variant"] for r in rows):
+        mine = [r for r in rows if r["variant"] == variant]
+        steps = sorted({int(r["step"]) for r in mine})
+        keys = list(dict.fromkeys(k for r in mine for k in r if k not in ("step", "variant", "stage")))
+        out[variant] = {"step": np.array(steps, float)} | {
+            k: np.array([_nanmean([value(r, k) for r in mine if int(r["step"]) == s]) for s in steps]) for k in keys}
+    return out
+
+
+def load_next_frames(run: Path) -> dict[str, np.ndarray]:
+    """SMB's next-frames tests (next_frames*.csv, one row per drawn frame) -> "step" and <kind>_<frame> over the
+    tested steps."""
+    rows = [r for path in sorted([*run.glob("next_frames.csv"), *run.glob("next_frames_schema_*.csv")])
+            for r in _read_rows(path)]                  # (next_frames_levels.csv: each level's, not read here)
+    steps = sorted({int(r["step"]) for r in rows})
+    if not steps:
+        return {}
+    at = {(int(r["step"]), int(r["frame"])): r for r in rows}
+    kinds = [k for k in rows[0] if k not in ("step", "frame")]
+    value = lambda r, k: float(r[k]) if r is not None and r.get(k) not in (None, "") else math.nan
+    return {"step": np.array(steps, float)} | {
+        f"{k}_{f}": np.array([value(at.get((s, f)), k) for s in steps]) for k in kinds for f in NEXT_FRAMES_AT}
+
+
+NEXT_FRAMES_AT = (1, 4, 8)
+
+
+def load_buttons(run: Path) -> dict[str, np.ndarray]:
+    """SMB's button tests (buttons*.csv, one row per frame ahead; diagnostics/button_follow.py) -> "step" and
+    <score>_<frame> at BUTTONS_AT over the tested steps."""
+    rows = [r for path in sorted([*run.glob("buttons.csv"), *run.glob("buttons_schema_*.csv")])
+            for r in _read_rows(path)]
+    steps = sorted({int(r["step"]) for r in rows})
+    if not steps:
+        return {}
+    at = {(int(r["step"]), int(r["frame"])): r for r in rows}
+    kinds = [k for k in rows[0] if k not in ("step", "frame")]
+    value = lambda r, k: float(r[k]) if r is not None and r.get(k) not in (None, "") else math.nan
+    return {"step": np.array(steps, float)} | {
+        f"{k}_{f}": np.array([value(at.get((s, f)), k) for s in steps]) for k in kinds for f in BUTTONS_AT}
+
+
+BUTTONS_AT = (8, 16, 32)
+BUTTON_SCORES = (("held", "held presses: share of the buttons' effect carried"),
+                 ("follow_bot", "follow: the bot's own presses"), ("follow_right", "follow: Right held"),
+                 ("follow_left", "follow: Left held"), ("follow_right+jump", "follow: Right + A held"),
+                 ("follow_nothing", "follow: nothing pressed"))
+NEXT_FRAME_SCORES = (("mario", "Mario's pixels wrong"), ("mario_sure", "Mario's pixels not sharp (right, 90% sure)"),
+                     ("sprites", "sprite pixels wrong"), ("changed", "changed pixels wrong (a copy: 100%)"),
+                     ("static", "unchanged pixels wrong"), ("border", "border pixels wrong (tick, RAM digits)"))
+
+
+SMB_DREAM_SCORES = (("held_camera", "frames the camera holds (|lag| <= 8 px)"),
+                    ("held_scene", "frames the scene holds (<= 10% wrong)"),
+                    ("held_mario", "frames Mario holds (kept >= 0.5)"),
+                    ("camera_lag_64", "|camera lag|, px, +17..64"), ("camera_lag_256", "|camera lag|, px, +65..256"),
+                    ("scene_wrong_64", "scene wrong, +17..64"), ("scene_wrong_256", "scene wrong, +65..256"),
+                    ("mario_kept_16", "Mario kept, +1..16"), ("mario_kept_64", "Mario kept, +17..64"),
+                    ("sprites_kept_64", "sprites kept, +17..64"))
+
+
 def pressed(variant: str) -> bool:
     """A long-dream variant dreamed with the bot's buttons (train_dynamics_ui.py PRESSED_VARIANT,
     train_layered.py variants), not with none."""
@@ -125,14 +191,37 @@ class RunData:
         self.path, self.name, self.stamp = path, path.name, None
         self.metrics: dict[str, np.ndarray] = {}
         self.long_dream: dict[str, dict[str, np.ndarray]] = {}
+        self.smb_dream: dict[str, dict[str, np.ndarray]] = {}
+        self.next_frames: dict[str, np.ndarray] = {}
+        self.buttons: dict[str, np.ndarray] = {}
+        self._game = None
+
+    @property
+    def game(self) -> str:
+        """The game the run trains on (its first: Tetris for a run on both)."""
+        return self.games[0]
+
+    @property
+    def games(self) -> tuple[str, ...]:
+        """The games the run trains on (run_config.json games; runs before --game: tetris)."""
+        if self._game is None:
+            try:
+                self._game = tuple(json.loads((self.path / "run_config.json").read_text()).get("games") or ["tetris"])
+            except (OSError, ValueError):
+                return ("tetris",)               # not written yet: ask again later
+        return self._game
 
     def refresh(self) -> bool:
         files = [*self.path.glob("metrics*.csv"), *self.path.glob("long_dream*.csv"), *self.path.glob("bias.csv"),
+                 *self.path.glob("smb_long_dream*.csv"), *self.path.glob("next_frames*.csv"),
+                 *self.path.glob("buttons*.csv"),
                  *self.path.glob("scenarios.csv"), *self.path.glob("event_checks.csv")]
         stamp = tuple(sorted((f.name, f.stat().st_mtime) for f in files if f.exists()))
         if stamp == self.stamp:
             return False
         self.stamp, self.metrics, self.long_dream = stamp, load_metrics(self.path), load_long_dream(self.path)
+        self.smb_dream, self.next_frames = load_smb_dream(self.path), load_next_frames(self.path)
+        self.buttons = load_buttons(self.path)
         return True
 
 
@@ -165,7 +254,8 @@ def _plot(ax, run: RunData, key: str, label: str | None, colour: str, dash: str,
     ax.plot(m["step"], smooth(m[key]), color=colour, linestyle=dash, linewidth=1.4, label=label)
 
 
-CURVE_VIEWS = {"dreams": "Long dreams", "live": "Live events", "training": "Training"}   # draw_curves' views
+CURVE_VIEWS = {"dreams": "Long dreams", "next": "SMB next frames", "buttons": "SMB buttons",  # draw_curves'
+               "live": "Live events", "training": "Training"}                                  # views
 DREAM_TREND = 5                     # long-dream tests in a trend point: the last 10,000 steps (one every 2,000)
 LIVE_TREND = 10                     # metrics rows in a live trend point: the last 2,000 steps (one every 200)
 DREAM_SCORES = (("wrong_128", "pixels wrong at +128 (lower better)"),
@@ -173,6 +263,7 @@ DREAM_SCORES = (("wrong_128", "pixels wrong at +128 (lower better)"),
                 ("lost_long", "breaks: cells lost / 100 frames (lower better)"),
                 ("morph_long", "shape changes / 100 frames (lower better)"),
                 ("full_long", "full rows never cleared / 100 frames"),
+                ("floating_long", "pieces locked on nothing / 100 frames"),
                 ("spawn", "spawns on time (1 = real)"),
                 ("piece_hit_32", "piece on the real one at +32 (1 = real)"),
                 ("mass", "block mass at +128 (1 = real)"),
@@ -249,6 +340,117 @@ def _dream_panels(fig: Figure, every: list[tuple[RunData, str]]) -> None:
     _legend(axes[0, 0])
 
 
+def _smb_dream_panels(fig: Figure, every: list[tuple[RunData, str]]) -> None:
+    """SMB's long dreams: a pair of panels per score, the bot's buttons (pressed) then none (still) on one y scale;
+    each run's trend over its last DREAM_TREND tests, every test a faint dot."""
+    axes = fig.subplots(math.ceil(len(SMB_DREAM_SCORES) / 2), 4)
+    for s, (key, title) in enumerate(SMB_DREAM_SCORES):
+        pair = axes[s // 2, 2 * (s % 2):2 * (s % 2) + 2]
+        pair[1].sharey(pair[0])
+        for ax, variant in zip(pair, ("pressed", "still")):
+            for n, (run, dash) in enumerate(every):
+                d = run.smb_dream.get(variant)
+                if d is not None and key in d:
+                    _trend(ax, d["step"], d[key], smooth(d[key], DREAM_TREND), RUN_COLOURS[n % len(RUN_COLOURS)],
+                           dash, run.name if s == 0 else None)
+            _style(ax, f"{title}: {'buttons' if variant == 'pressed' else 'no buttons'}")
+            ax.title.set_fontsize(8)
+    for ax in axes.flat[2 * len(SMB_DREAM_SCORES):]:
+        ax.set_visible(False)
+    _legend(axes[0, 0])
+
+
+def _next_frame_panels(fig: Figure, every: list[tuple[RunData, str]]) -> None:
+    """SMB's next-frames tests: a panel per score, each run's drawn frames 1, 4 and 8 as three lines (darker
+    later); each test a dot."""
+    axes = fig.subplots(2, 3)
+    for ax, (key, title) in zip(axes.flat, NEXT_FRAME_SCORES):
+        for n, (run, dash) in enumerate(every):
+            d = run.next_frames
+            if not d:
+                continue
+            for f, alpha in zip(NEXT_FRAMES_AT, (1.0, 0.65, 0.35)):
+                values = d[f"{key}_{f}"]
+                ok = np.isfinite(values)
+                ax.plot(d["step"][ok], values[ok], linestyle=dash, marker=".", markersize=4, linewidth=1.3,
+                        color=RUN_COLOURS[n % len(RUN_COLOURS)], alpha=alpha, label=f"{run.name} frame {f}")
+        _style(ax, title)
+        ax.title.set_fontsize(9)
+    _legend(axes[0, 0])
+
+
+def _button_panels(fig: Figure, every: list[tuple[RunData, str]]) -> None:
+    """SMB's button tests: a panel per score, each run's frames 8, 16 and 32 ahead as three lines (darker
+    sooner); each test a dot."""
+    axes = fig.subplots(2, 3)
+    for ax, (key, title) in zip(axes.flat, BUTTON_SCORES):
+        for n, (run, dash) in enumerate(every):
+            d = run.buttons
+            if not d or f"{key}_{BUTTONS_AT[0]}" not in d:
+                continue
+            for f, alpha in zip(BUTTONS_AT, (1.0, 0.65, 0.35)):
+                values = d[f"{key}_{f}"]
+                ok = np.isfinite(values)
+                ax.plot(d["step"][ok], values[ok], linestyle=dash, marker=".", markersize=4, linewidth=1.3,
+                        color=RUN_COLOURS[n % len(RUN_COLOURS)], alpha=alpha, label=f"{run.name} frame {f}")
+        _style(ax, title)
+        ax.title.set_fontsize(9)
+    _legend(axes[0, 0])
+
+
+def buttons_table(runs: list[RunData], last: int = 8) -> str:
+    """Each run's last button tests: the held presses' share of the buttons' effect, and each variant's follow."""
+    lines = []
+    for run in runs:
+        d = run.buttons
+        if not d:
+            continue
+        lines.append(f"{run.name}: does Mario follow the buttons (one moment from each of the 32 levels, 32 frames "
+                     "dreamed five ways), at frames 8/16/32: held presses' share of the buttons' effect carried "
+                     "(1 = all), then follow for the bot, Right, Left, Right + A, nothing (0 = ignores them)")
+        g = lambda k, i, f="{:.2f}": "/".join(f.format(d[f"{k}_{a}"][i]) for a in BUTTONS_AT)
+        for i in range(max(0, len(d["step"]) - last), len(d["step"])):
+            lines.append(f"  {int(d['step'][i]):>7,}   held {g('held', i)}   bot {g('follow_bot', i, '{:+.3f}')}   "
+                         f"right {g('follow_right', i, '{:+.3f}')}   left {g('follow_left', i, '{:+.3f}')}   "
+                         f"right+A {g('follow_right+jump', i, '{:+.3f}')}   nothing {g('follow_nothing', i, '{:+.3f}')}")
+    return "\n".join(lines) or "No button tests yet (every 2,000 steps)."
+
+
+def next_frames_table(runs: list[RunData], last: int = 8) -> str:
+    """Each run's last next-frames tests: the scores at drawn frames 1/4/8."""
+    lines = []
+    for run in runs:
+        d = run.next_frames
+        if not d:
+            continue
+        lines.append(f"{run.name}: drawn frames 1/4/8 after 64 real ones, pixels wrong (4 windows from each of the 32 levels): Mario, "
+                     "Mario not sharp, sprites, changed (a copy: 100%), unchanged, border")
+        g = lambda k, i, f="{:.3f}": "/".join(f.format(d[f"{k}_{a}"][i]) for a in NEXT_FRAMES_AT)
+        for i in range(max(0, len(d["step"]) - last), len(d["step"])):
+            lines.append(f"  {int(d['step'][i]):>7,}   Mario {g('mario', i)}   not sharp {g('mario_sure', i)}   "
+                         f"sprites {g('sprites', i)}   changed {g('changed', i)}   unchanged "
+                         f"{g('static', i, '{:.4f}')}   border {g('border', i)}")
+    return "\n".join(lines) or "No next-frames tests yet (every 2,000 steps)."
+
+
+def smb_dream_table(runs: list[RunData], last: int = 6) -> str:
+    """Each run's last SMB long-dream tests: how long each part holds, and the scores by horizon."""
+    lines = []
+    for run in runs:
+        for variant, d in run.smb_dream.items():
+            lines.append(f"{run.name} {variant}: held camera / scene / Mario (frames, mean of the trials; a few long holders pull it up), |lag| px +16/+64/+256, "
+                         "scene wrong +16/+64/+256, Mario kept +16/+64, sprites kept +64, HUD wrong +64")
+            g = lambda k, i, f="{:.2f}": f.format(d[k][i]) if k in d and math.isfinite(d[k][i]) else "—"
+            for i in range(max(0, len(d["step"]) - last), len(d["step"])):
+                lines.append(f"  {int(d['step'][i]):>7,}  {g('held_camera', i, '{:.0f}'):>4} / {g('held_scene', i, '{:.0f}'):>4}"
+                             f" / {g('held_mario', i, '{:.0f}'):>4}   lag {g('camera_lag_16', i, '{:.1f}')}/"
+                             f"{g('camera_lag_64', i, '{:.1f}')}/{g('camera_lag_256', i, '{:.1f}')}   scene "
+                             f"{g('scene_wrong_16', i, '{:.3f}')}/{g('scene_wrong_64', i, '{:.3f}')}/"
+                             f"{g('scene_wrong_256', i, '{:.3f}')}   Mario {g('mario_kept_16', i)}/{g('mario_kept_64', i)}"
+                             f"   sprites {g('sprites_kept_64', i)}   HUD {g('hud_wrong_64', i, '{:.3f}')}")
+    return "\n".join(lines) or "No SMB long-dream tests yet (every 2,000 steps)."
+
+
 def _live_panels(fig: Figure, every: list[tuple[RunData, str]]) -> None:
     """The training batches' own event scores (train_dynamics_ui.py live_event_scores): one panel per event, the
     share of its frames drawn exactly and its changed pixels' wrong share; then the J / L / T turns with the real
@@ -297,9 +499,15 @@ def _live_panels(fig: Figure, every: list[tuple[RunData, str]]) -> None:
 
 
 def _training_panels(fig: Figure, every: list[tuple[RunData, str]], runs: list[RunData]) -> None:
-    """The training loss, the previews' wrong pixels and border, and the motion head's moved / turned cells."""
-    axes = fig.subplots(2, 2)
-    moving = any(np.isfinite(r.metrics.get("train_motion_moved", np.array([np.nan]))).any() for r in runs)
+    """The training loss, the previews' wrong pixels and border, and the motion head's moved / turned cells; for a
+    post-train (train_dynamics_ui.py --idm-loss, --policy-head) the IDM's reading of the drawn frames and the chunk
+    head's scores too; for latent actions (--ram-codes) the codes against the RAM's effects and their use."""
+    has = lambda key: any(np.isfinite(r.metrics.get(key, np.array([np.nan]))).any() for r in runs)
+    pressing = has("idm_right") or has("head_first")
+    coding = has("ram_right") or has("code_used_tetris")
+    axes = fig.subplots(2, 2 + pressing + coding)
+    codes = 2 + pressing                              # the codes' column
+    moving = has("train_motion_moved")
     for n, (run, dash) in enumerate(every):
         label = (lambda text: text) if n == 0 else (lambda text: None)
         _plot(axes[0, 0], run, "train_loss_changed", label("changed pixels"), COLOURS[0], dash)
@@ -308,11 +516,11 @@ def _training_panels(fig: Figure, every: list[tuple[RunData, str]], runs: list[R
         for i, part in enumerate(("cells", "sprites", "sprite_move", "sprite_place", "sprite_pixels", "camera")):
             _plot(axes[0, 0], run, f"train_loss_{part}", label(part.replace("_", " ")), COLOURS[i], dash)
         for i, h in enumerate((1, 4, 16)):
-            _plot(axes[0, 1], run, f"{GAME}_h{h}_wrong_changed", label(f"+{h}"), COLOURS[i], dash)
+            _plot(axes[0, 1], run, f"{run.game}_h{h}_wrong_changed", label(f"+{h}"), COLOURS[i], dash)
         for i, h in enumerate((1, 16)):
-            _plot(axes[1, 0], run, f"{GAME}_h{h}_border_wrong", label(f"+{h}"), COLOURS[i], dash)
+            _plot(axes[1, 0], run, f"{run.game}_h{h}_border_wrong", label(f"+{h}"), COLOURS[i], dash)
             if n < len(runs):
-                _plot(axes[1, 0], run, f"{GAME}_h{h}_border_copy", label(f"+{h} copying"), COLOURS[i], ":",
+                _plot(axes[1, 0], run, f"{run.game}_h{h}_border_copy", label(f"+{h} copying"), COLOURS[i], ":",
                       raw=False)
         if moving:                            # a motion model: the share of moved / turned cells right
             for i, (key, text) in enumerate((("train_motion_moved", "moved, masked"), ("train_motion_turned", "turned, masked"),
@@ -320,14 +528,43 @@ def _training_panels(fig: Figure, every: list[tuple[RunData, str]], runs: list[R
                                              ("preview_motion_turned", "turned, own frames"))):
                 _plot(axes[1, 1], run, key, label(text), COLOURS[i], dash)
         else:
-            _plot(axes[1, 1], run, f"{GAME}_h16_wrong_static", label("static +16"), COLOURS[3], dash)
+            _plot(axes[1, 1], run, f"{run.game}_h16_wrong_static", label("static +16"), COLOURS[3], dash)
             _plot(axes[1, 1], run, "blend_frames", label("blend radius"), COLOURS[4], dash)
+        if pressing:
+            _plot(axes[0, 0], run, "train_loss_idm", label("IDM press loss"), COLOURS[5], dash)
+            for i, (key, text) in enumerate((("idm_right", "every press, drawn"), ("idm_real_right", "every press, real"),
+                                             ("idm_moves_right", "moves, drawn"), ("idm_moves_real_right", "moves, real"))):
+                _plot(axes[0, 2], run, key, label(text), COLOURS[i], dash)
+            for i, (key, text) in enumerate((("head_first", "first press"), ("head_repeat", "repeat-last"),
+                                             ("head_new", "new presses"), ("head_whole", "first 8 all right"))):
+                _plot(axes[1, 2], run, key, label(text), COLOURS[i], dash)
+        if coding:
+            _plot(axes[0, 0], run, "train_loss_ram", label("RAM codes"), COLOURS[5], dash)
+            for i, (key, text) in enumerate((("ram_right", "code = RAM effect"), ("ram_moves_right", "moves only"),
+                                             ("prior_right_tetris", "effect head, Tetris"),
+                                             ("prior_right_smb", "effect head, SMB"))):
+                _plot(axes[0, codes], run, key, label(text), COLOURS[i], dash)
+            for i, (key, text) in enumerate((("code_used_tetris", "Tetris"), ("code_used_smb", "SMB"),
+                                             ("latent_kl", "KL, nats a frame"))):
+                _plot(axes[1, codes], run, key, label(text), COLOURS[i], dash)
     _style(axes[0, 0], "Train loss (masked pixels)", "cross-entropy", log=True)
+    if coding:
+        _style(axes[0, codes], "Latent actions: the encoder's code against the RAM's effect (moves: turns, shifts, "
+                               "drops), and the effect head's guess of the code", "fraction")
+        _style(axes[1, codes], "Codes used of 8 (perplexity) per game; the effect head's KL", "codes / nats")
+    if pressing:
+        _style(axes[0, 2], "IDM press loss: the effects it reads from the most hidden frame as drawn, and from the "
+                           "real one (moves: turns, shifts, drops)", "fraction")
+        _style(axes[1, 2], "Chunk head: its greedy guess of the perfect brain's next presses (repeat-last: "
+                           "the press before)", "fraction")
     _style(axes[0, 1], "Preview: changed game pixels wrong (copying = 100%)", "fraction")
     _style(axes[1, 0], "Preview: border pixels wrong vs copying the last frame (thin dotted)", "fraction", log=True)
-    if moving:
+    if moving and all(r.game == "tetris" for r in runs):
         _style(axes[1, 1], "Motion: the share of real moved / turned cells drawn right, masked in training and in "
                            "its own preview frames (a turned cell moves along both axes)", "fraction")
+    elif moving:
+        _style(axes[1, 1], "Motion: the share of real moved cells (scrolling, sprites; pixel moves) drawn right, "
+                           "masked in training and in its own preview frames", "fraction")
     else:
         _style(axes[1, 1], "Static pixels wrong at +16; blend radius (frames)", "fraction", log=True)
     for ax in axes.flat:
@@ -340,7 +577,19 @@ def draw_curves(fig: Figure, runs: list[RunData], compare: list[RunData], view: 
     fig.clear()
     fig.set_facecolor(BG)
     every = [(r, "-") for r in runs] + [(r, DASHES[1 + i % 3]) for i, r in enumerate(compare)]
-    if view == "dreams":
+    if view == "dreams" and all(r.game == "smb" for r, _ in every) and any(r.next_frames for r, _ in every):
+        _next_frame_panels(fig, every)
+        how = "dots: each test (4 windows from each of the 32 levels, the last 8 frames drawn); frames 1, 4, 8 darker to lighter"
+    elif view == "dreams" and all(r.game == "smb" for r, _ in every):       # runs from before next frames
+        _smb_dream_panels(fig, every)
+        how = f"line: mean of the last {DREAM_TREND} tests, dots: each test (16 trials, 512 frames each)"
+    elif view == "next":                     # SMB's next frames on their own (a run on both games)
+        _next_frame_panels(fig, every)
+        how = "dots: each test (4 windows from each of the 32 levels, the last 8 frames drawn); frames 1, 4, 8 darker to lighter"
+    elif view == "buttons":                  # SMB's button test (diagnostics/button_follow.py)
+        _button_panels(fig, every)
+        how = "dots: each test (one moment from each of the 32 levels, dreamed five ways); frames 8, 16, 32 darker to lighter"
+    elif view == "dreams":
         _dream_panels(fig, every)
         how = (f"line: mean of the last {DREAM_TREND} tests, dots: each test; dashed flat lines: "
                + ", ".join(label for label, _, _ in REFERENCES))
@@ -467,13 +716,19 @@ def vae_stats(run: RunData) -> str:
 DATA_SKIP = ("data_windows", "data_kept", "data_wait_ms_mean", "data_wait_ms_max")
 
 
-def data_columns(m: dict) -> tuple[list[str], list[str]]:
-    """A run's training-data columns (live_batches.data_fields) -> (events, screens)."""
+def data_columns(m: dict, game: str = "tetris") -> list[tuple[str, list[str]]]:
+    """A run's training-data columns (live_batches.data_fields) in groups -> [(chart title, columns)]: Tetris's
+    events and screens; SMB's world_nes_smb.DATA_GROUPS."""
     from token_world.data.live_batches import data_field
+    keys = [k for k in m if k.startswith("data_") and k not in DATA_SKIP and not k.startswith("data_branch")]
+    if game == "smb":
+        from token_world.data.world_nes_smb import DATA_GROUPS
+        return [(f"Training windows holding each: {group}", [k for k in keys if k in {data_field(n) for n in names}])
+                for group, names in DATA_GROUPS.items()]
     from token_world.data.world_nes_tetris import SCREENS
     shown = {data_field(s) for s in SCREENS}
-    keys = [k for k in m if k.startswith("data_") and k not in DATA_SKIP]
-    return [k for k in keys if k not in shown], [k for k in keys if k in shown]
+    return [("Training windows holding each event", [k for k in keys if k not in shown]),
+            ("Training windows showing each screen other than play", [k for k in keys if k in shown])]
 
 
 def draw_data(fig: Figure, runs: list[RunData]) -> None:
@@ -481,20 +736,25 @@ def draw_data(fig: Figure, runs: list[RunData]) -> None:
     each event, on each screen, and the share of the stream's windows kept (tossing)."""
     fig.clear()
     fig.set_facecolor(BG)
-    events_ax, screens_ax, novel_ax, kept_ax = fig.subplots(4, 1, gridspec_kw={"height_ratios": (2, 2, 2, 1)})
+    tetris = all(r.game == "tetris" for r in runs)
+    titles = [title for title, _ in data_columns({}, "tetris" if tetris else runs[0].game)] if runs else []
+    extra = ["novelty", "kept"] if tetris else ["kept"]
+    axes = fig.subplots(len(titles) + len(extra), 1,
+                        gridspec_kw={"height_ratios": (2,) * len(titles) + (2, 1)[-len(extra):]})
     for r, (run, dash) in enumerate(zip(runs, DASHES)):
-        events, shown = data_columns(run.metrics)
-        for ax, keys in ((events_ax, events), (screens_ax, shown)):
+        for ax, (_, keys) in zip(axes, data_columns(run.metrics, run.game)):
             for i, key in enumerate(keys):
-                _plot(ax, run, key, key[5:].replace("_", " ") if r == 0 else None, COLOURS[i % len(COLOURS)], dash,
-                      raw=False)
-        _plot(novel_ax, run, "novel_boards", run.name, COLOURS[r % len(COLOURS)], dash, raw=False)
-        _plot(kept_ax, run, "data_kept", run.name, COLOURS[r % len(COLOURS)], dash, raw=False)
-    _style(events_ax, "Training windows holding each event (smoothed; one line style per run)", "share", log=True)
-    _style(screens_ax, "Training windows showing each screen other than play", "share", log=True)
-    _style(novel_ax, "Piece spawns on a board never seen before in the run", "share")
-    _style(kept_ax, "Share of the stream's windows kept (tossing; 1 = every window)", "share")
-    for ax in (events_ax, screens_ax, novel_ax, kept_ax):
+                _plot(ax, run, key, key[5:].replace("_", " ") if r == 0 else None,
+                      COLOURS[i % len(COLOURS)], DASHES[(i // len(COLOURS) + r) % len(DASHES)], raw=False)
+        if tetris:
+            _plot(axes[-2], run, "novel_boards", run.name, COLOURS[r % len(COLOURS)], dash, raw=False)
+        _plot(axes[-1], run, "data_kept", run.name, COLOURS[r % len(COLOURS)], dash, raw=False)
+    for ax, title in zip(axes, titles):
+        _style(ax, title + " (smoothed)", "share", log=True)
+    if tetris:
+        _style(axes[-2], "Piece spawns on a board never seen before in the run", "share")
+    _style(axes[-1], "Share of the stream's windows kept (tossing; 1 = every window)", "share")
+    for ax in axes:
         _legend(ax)
 
 
@@ -507,14 +767,14 @@ def data_table(runs: list[RunData]) -> str:
             continue
         n = np.nan_to_num(m["data_windows"])
         total = n.sum()
-        events, shown = data_columns(m)
+        groups = data_columns(m, run.game)
         share = lambda k: float((np.nan_to_num(m[k]) * n).sum() / max(total, 1))
         kept = float((np.nan_to_num(m["data_kept"]) * n).sum() / max(total, 1)) if "data_kept" in m else math.nan
         lines.append(f"{run.name}: {total:,.0f} windows trained on so far (kept {kept:.0%} of the stream's)")
         boards = m["distinct_boards"][np.isfinite(m["distinct_boards"])] if "distinct_boards" in m else []
         if len(boards):
             lines.append(f"    {int(boards[-1]):,} distinct boards at spawns so far")
-        for keys in (events, shown):
+        for _, keys in groups:
             lines.append("    " + "   ".join(f"{k[5:].replace('_', ' ')} {share(k):.2%}" for k in keys))
     return "\n".join(lines) or "No training-data columns yet (runs from 2026-10-10 on log them)."
 
@@ -552,20 +812,20 @@ def draw_horizons(fig: Figure, run: RunData) -> None:
     fig.clear()
     fig.set_facecolor(BG)
     heat_ax, curve_ax = fig.subplots(2, 1, gridspec_kw={"height_ratios": (2, 1)})
-    m = run.metrics
-    horizons = [h for h in (1, 2, 4, 8, 16) if f"{GAME}_h{h}_wrong_changed" in m]
+    m, game = run.metrics, run.game
+    horizons = [h for h in (1, 2, 4, 8, 16) if f"{game}_h{h}_wrong_changed" in m]
     if horizons:
-        grid = np.stack([smooth(m[f"{GAME}_h{h}_wrong_changed"]) for h in horizons])
+        grid = np.stack([smooth(m[f"{game}_h{h}_wrong_changed"]) for h in horizons])
         mesh = heat_ax.pcolormesh(m["step"], np.arange(len(horizons)), grid, cmap="magma", vmin=0, vmax=1,
                                   shading="nearest")
         heat_ax.set_yticks(range(len(horizons)), [f"+{h}" for h in horizons])
         fig.colorbar(mesh, ax=heat_ax).ax.tick_params(colors=TEXT, labelsize=7)
-        last = [m[f"{GAME}_h{h}_{k}"][-1] for h in horizons for k in ("wrong_changed",)]
+        last = [m[f"{game}_h{h}_{k}"][-1] for h in horizons for k in ("wrong_changed",)]
         curve_ax.plot(horizons, last, marker="o", color=COLOURS[0], label="wrong on changed")
         for kind, colour in (("wrong_static", COLOURS[3]), ("border_wrong", COLOURS[4]),
                              ("border_copy", COLOURS[1])):
-            if f"{GAME}_h1_{kind}" in m:
-                curve_ax.plot(horizons, [m[f"{GAME}_h{h}_{kind}"][-1] for h in horizons], marker="o",
+            if f"{game}_h1_{kind}" in m:
+                curve_ax.plot(horizons, [m[f"{game}_h{h}_{kind}"][-1] for h in horizons], marker="o",
                               color=colour, label=kind.replace("_", " "))
         curve_ax.set_xscale("log", base=2)
     _style(heat_ax, f"{run.name}: changed game pixels wrong by horizon over training (smoothed)", "horizon")
@@ -633,6 +893,29 @@ EXPLAIN = {
     "stats": "The latest checkpoint's numbers, as the trainer wrote them.",
 }
 WORLD_ONLY = ("Long dream", "Compare", "Scenarios", "Horizons")
+TETRIS_ONLY = ("Compare", "Scenarios")                  # tests made of Tetris games (scenarios, compared dreams)
+TETRIS_VIEWS = ("live",)                                 # Tetris's live events (SMB has its own long dreams)
+EXPLAIN["curves_game"] = ("How the model is learning, by training step. Next frames (SMB, every 2,000 steps: 4 windows from "
+                          "each of the 32 levels, the last 8 frames drawn one after another from 64 real ones): pixels wrong at "
+                          "frame 1 (one step), 4 and 8 (its own rollout), for Mario, Mario drawn sharp, the sprites, "
+                          "the changed and unchanged pixels and the border (runs from before 2026-10-22: their long "
+                          "dreams). SMB buttons (every 2,000 steps from 2026-10-25: one moment from each level, the "
+                          "real game and the dream each played five ways: the bot's presses, Right, Left, Right + A "
+                          "held, nothing): the held presses' share of the buttons' effect the dreams carry, and how "
+                          "much better each dream matches its own buttons' game than the others' (0: buttons "
+                          "ignored). Training: the loss, the previews "
+                          "(changed game pixels wrong 1, 4 and 16 frames ahead; copying gets 100%), the border, and "
+                          "the motion head. The live-event view is Tetris's. Compared runs are dashed.")
+EXPLAIN["dream_game"] = ("Every 2,000 steps the model is given 64 real frames of 4 windows from each of the 32 SMB levels "
+                         "and draws the next 8 one after another, with the real buttons, its own frames going back "
+                         "in. Picture: four of them (a random set each test), the real frames 1, 4 and 8 on the left, "
+                         "the drawn ones on the right. Table: pixels wrong at frames 1 (one step), 4 and 8 (its own "
+                         "rollout): Mario's, Mario's not drawn sharp (right and 90% sure), every sprite's, the pixels "
+                         "that changed (a copy gets all wrong), the unchanged ones, and the border's. Runs from "
+                         "before 2026-10-22: their long dreams.")
+EXPLAIN["data_game"] = ("What the training windows held, from the live streams: the share holding each event, "
+                        "showing each screen other than play and each world, and played by each brain; and the share "
+                        "of the stream's windows kept. The table sums every window trained on so far.")
 
 
 def run_kind(run: RunData) -> str:
@@ -664,9 +947,11 @@ class RunViewer:
         self.curve_view = tk.StringVar(value="dreams")
         bar = ttk.Frame(tab)
         bar.pack(fill="x", padx=10)
+        self.view_buttons = {}
         for value, text in CURVE_VIEWS.items():
-            ttk.Radiobutton(bar, text=text, value=value, variable=self.curve_view,
-                            command=lambda: self.refresh(force=True)).pack(side="left", padx=(0, 12))
+            self.view_buttons[value] = ttk.Radiobutton(bar, text=text, value=value, variable=self.curve_view,
+                                                       command=lambda: self.refresh(force=True))
+            self.view_buttons[value].pack(side="left", padx=(0, 12))
         if self.compare:
             ttk.Checkbutton(bar, text="show compared runs (dashed): " + ", ".join(r.name for r in self.compare),
                             variable=self.show_compare, command=lambda: self.refresh(force=True)).pack(side="left")
@@ -686,15 +971,15 @@ class RunViewer:
         box.bind("<<ComboboxSelected>>", lambda e: self.refresh(force=True))
         ttk.Label(bar, text="Show", style="Legend.TLabel").pack(side="left", padx=(20, 6))
         self.preview_pick = tk.StringVar(value="all")
-        for text, value in (("all four", "all"), ("1", "0"), ("2", "1"), ("3", "2"), ("4", "3")):
+        for text, value in (("all", "all"), ("1", "0"), ("2", "1"), ("3", "2"), ("4", "3")):   # of each game
             ttk.Radiobutton(bar, text=text, value=value, variable=self.preview_pick,
                             command=lambda: self.refresh()).pack(side="left", padx=(0, 8))
         self.previews_text = self._explain(tab, EXPLAIN["previews"])
-        self.previews = FitGrid(tab, 4, empty="no preview yet (one every 200 steps)")
+        self.previews = FitGrid(tab, 8, empty="no preview yet (one every 200 steps)")   # 4 of each of two games
         self.previews.pack(fill="both", expand=True, padx=6, pady=6)
 
         tab = self._tab("Long dream")
-        self._explain(tab, EXPLAIN["dream"])
+        self.dream_text = self._explain(tab, EXPLAIN["dream"])
         bar = ttk.Frame(tab)
         bar.pack(fill="x", padx=10)
         self.dream_view = tk.StringVar(value="gif")
@@ -721,7 +1006,7 @@ class RunViewer:
         self.scenario_table.pack(fill="both", expand=True, padx=6, pady=6)
 
         tab = self._tab("Data")
-        self._explain(tab, EXPLAIN["data"])
+        self.data_text = self._explain(tab, EXPLAIN["data"])
         panes = ttk.PanedWindow(tab, orient="vertical")
         panes.pack(fill="both", expand=True, padx=6, pady=6)
         self.data_table = TextPanel(panes, font=("Consolas", 9), height=6)
@@ -769,30 +1054,41 @@ class RunViewer:
         return next((r for r in self.runs if r.name == self.selected.get()), self.runs[0])
 
     def _set_kind(self, kind: str) -> None:
-        """Show the tabs and words for a tokenizer's runs or a world model's."""
+        """Show the tabs and words for a tokenizer's runs, a Tetris world model's ("world") or another game's
+        ("game": no long dreams, scenarios or live events, which are made of Tetris games)."""
         if kind == self.kind:
             return
         self.kind = kind
         for name in WORLD_ONLY:
             if name in self.tabs:
-                if kind == "vae":
+                if kind == "vae" or kind == "game" and name in TETRIS_ONLY:
                     self.notebook.hide(self.tabs[name])
                 else:
                     self.notebook.add(self.tabs[name])
-        self.curves_text.configure(text=EXPLAIN["curves_vae" if kind == "vae" else "curves"])
+        for value, button in self.view_buttons.items():          # next: a run with SMB (kind game's is dreams)
+            off = ((kind == "game" and value in TETRIS_VIEWS) or (value == "next" and kind != "world")
+                   or (value == "buttons" and kind == "vae"))
+            button.configure(state="disabled" if off else "normal")
+        if kind == "game" and self.curve_view.get() in TETRIS_VIEWS:
+            self.curve_view.set("training")
+        self.curves_text.configure(text=EXPLAIN[{"vae": "curves_vae", "game": "curves_game"}.get(kind, "curves")])
         self.previews_text.configure(text=EXPLAIN["previews_vae" if kind == "vae" else "previews"])
+        self.data_text.configure(text=EXPLAIN["data_game" if kind == "game" else "data"])
+        self.dream_text.configure(text=EXPLAIN["dream_game" if kind == "game" else "dream"])
 
     def refresh(self, force: bool = False) -> None:
         if self.job is not None:
             self.master.after_cancel(self.job)
         changed = any([r.refresh() for r in self.runs + self.compare]) or force
         run = self.run()
-        kind = "vae" if self.runs and all(run_kind(r) == "vae" for r in self.runs) else "world"
+        kind = ("vae" if self.runs and all(run_kind(r) == "vae" for r in self.runs) else
+                "game" if self.runs and all(r.game != "tetris" for r in self.runs) else "world")
         self._set_kind(kind)
         pick = self.preview_pick.get()
-        self.previews.show([run.path / "previews" / f"{GAME}_{i}.gif"
-                            for i in (range(4) if pick == "all" else [int(pick)])])
-        self.dream_image.show(run.path / f"long_dream.{self.dream_view.get()}")
+        self.previews.show([run.path / "previews" / f"{game}_{i}.gif"     # the same number of each game's
+                            for game in run.games for i in (range(4) if pick == "all" else [int(pick)])])
+        self.dream_image.show(run.path / "next_frames.png" if kind == "game" and run.next_frames else
+                              run.path / f"long_dream.{self.dream_view.get()}")
         if changed:
             compare = self.compare if self.show_compare.get() else []
             if kind == "vae":
@@ -809,8 +1105,17 @@ class RunViewer:
             draw_data(self.data_fig, self.runs)
             self.data_canvas.draw_idle()
             self.data_table.set(data_table(self.runs))
-            self.dream_table.set("\n\n".join([long_dream_table(self.runs + self.compare)]
-                                             + [plateau.report(r.name, plateau.read(r.path)) for r in self.runs]))
+            if kind == "game":                    # the buttons first (judge by buttons)
+                self.dream_table.set("\n\n".join(t for t in (buttons_table(self.runs), next_frames_table(self.runs),
+                                                              smb_dream_table(self.runs))
+                                                   if not t.startswith("No ")) or next_frames_table(self.runs))
+            else:
+                self.dream_table.set("\n\n".join([long_dream_table(self.runs + self.compare)]
+                                                 + ([buttons_table(self.runs)]              # a run on both games
+                                                    if any(r.buttons for r in self.runs) else [])
+                                                 + ([next_frames_table(self.runs)]
+                                                    if any(r.next_frames for r in self.runs) else [])
+                                                 + [plateau.report(r.name, plateau.read(r.path)) for r in self.runs]))
             self.stats_table.set(stats_text(run))
             self.scenario_table.set(scenario_table([run] + self.compare) + "\n\n" + event_table([run] + self.compare))
             if self.compare:
@@ -985,7 +1290,7 @@ def stats_text(run: RunData) -> str:
              f"  blend radius {last.get('blend_frames', math.nan):.0f}; last training rollout "
              f"{last.get('rollout_frames', math.nan):.0f} frames, pixels wrong {last.get('rollout_wrong', math.nan):.3%}"]
     for h in (1, 2, 4, 8, 16):
-        k = f"{GAME}_h{h}_"
+        k = f"{run.game}_h{h}_"
         if k + "wrong" in last:
             lines.append(f"  +{h:>2}: changed {last[k + 'changed']:.2%}; wrong: all {last[k + 'wrong']:.2%}, on "
                          f"changed {last[k + 'wrong_changed']:.1%}, on static {last[k + 'wrong_static']:.3%}; border "

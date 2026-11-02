@@ -12,6 +12,7 @@ import threading
 import tkinter as tk
 from tkinter import ttk
 
+from token_world.ui.check_window import tk_catch_callbacks
 from token_world.ui.run_viewer import RunViewer
 from token_world.ui.theme import setup_dark_theme
 
@@ -42,12 +43,20 @@ def launch(args, train_fn) -> None:
     root.geometry(f"{width}x{height}")
     root.minsize(900, 600)
     setup_dark_theme(root)
+    tk_catch_callbacks(root)
     status = tk.StringVar(value="Starting live histories...")
     header = ttk.Frame(root)
     header.pack(fill="x", padx=8, pady=5)
     events: queue.Queue = queue.Queue()
     stop = threading.Event()
     ttk.Button(header, text="Stop Training", command=stop.set, style="Stop.TButton").pack(side="right", anchor="n")
+    if getattr(args, "hold_lr", None):            # post-training: the held rate's end (train_dynamics_ui.py)
+        def start_cooldown() -> None:
+            for out in args.outputs.values():
+                (Path(out) / "start_cooldown").touch()
+            cooldown.configure(state="disabled", text="Cooling down")
+        cooldown = ttk.Button(header, text="Start Cooldown", command=start_cooldown)
+        cooldown.pack(side="right", anchor="n", padx=(0, 8))
     line = ttk.Label(header, textvariable=status, style="Header.TLabel", justify="left")
     line.pack(side="left", fill="x", expand=True)
     line.bind("<Configure>", lambda e: line.configure(wraplength=max(300, e.width - 10)))
@@ -76,8 +85,9 @@ def launch(args, train_fn) -> None:
                     f"{name} {n:,} parameters" for name, n in event[1].items()) + "; compiling, then training")
             elif event[0] == "preview":
                 name, step, m = event[1:]
-                latest[name] = (f"{name} @ {step:,}: changed pixels wrong +1/+4/+16 " + " / ".join(
-                    f"{m[f'tetris_h{h}_wrong_changed']:.0%}" for h in (1, 4, 16)))
+                latest[name] = (f"{name} @ {step:,}: changed pixels wrong +1/+4/+16 " + ", ".join(
+                    f"{game} " + " / ".join(f"{m[f'{game}_h{h}_wrong_changed']:.0%}" for h in (1, 4, 16))
+                    for game in args.games))
                 status.set("   |   ".join(latest.values()))
                 viewer.refresh()
             elif event[0] == "progress":                             # a trainer's own status line
@@ -85,21 +95,33 @@ def launch(args, train_fn) -> None:
                 latest[name] = f"{name} @ {step:,}: {text}"
                 status.set("   |   ".join(latest.values()))
                 viewer.refresh()
+            elif event[0] == "nextframes":                           # SMB's test (diagnostics/next_frames.py)
+                name, step, r = event[1:]
+                latest[name + " dream"] = (f"{name} next frames @ {step:,}: Mario wrong 1/4/8 "
+                                           + "/".join(f"{r['mario'][h - 1]:.0%}" for h in (1, 4, 8))
+                                           + ", changed wrong " + "/".join(f"{r['changed'][h - 1]:.0%}"
+                                                                           for h in (1, 4, 8)))
+                status.set("   |   ".join(latest.values()))
+                viewer.refresh()
+            elif event[0] == "buttons":                              # SMB's button test (diagnostics/button_follow.py)
+                name, step, r = event[1:]
+                latest[name + " buttons"] = (f"{name} buttons @ {step:,}: held presses' effect carried at 8/16/32 "
+                                             + "/".join(f"{r['held'][h - 1]:.0%}" for h in (8, 16, 32)))
+                status.set("   |   ".join(latest.values()))
+                viewer.refresh()
             elif event[0] == "longdream":
                 name, step, summary = event[1:]
                 latest[name + " dream"] = f"{name} long dream @ {step:,}: " + "; ".join(
-                    f"{v} +128 {r['wrong_128']:.1%} mass {r['mass']:.2f} hit {r['piece_hit_32']:.2f} "
-                    f"presence {r['presence']:.2f}"
-                    + stalling(presence.get((name, v)), r) for v, r in summary.items())
+                    (f"{v} holds camera / scene / Mario {r['held_camera']:.0f} / {r['held_scene']:.0f} / "
+                     f"{r['held_mario']:.0f} frames" if "held_camera" in r else              # SMB's
+                     f"{v} +128 {r['wrong_128']:.1%} mass {r['mass']:.2f} hit {r['piece_hit_32']:.2f} "
+                     f"presence {r['presence']:.2f}" + stalling(presence.get((name, v)), r))
+                    for v, r in summary.items())
                 presence.update({(name, v): r for v, r in summary.items()})
                 status.set("   |   ".join(latest.values()))
                 viewer.refresh()
             elif event[0] == "done":
                 status.set("Finished at " + ", ".join(f"{name} step {s:,}" for name, s in event[1].items()))
-                if args.close_when_done:
-                    root.after(3000, close)
-            elif event[0] == "error":
-                status.set(f"Training error: {event[1]}")
                 if args.close_when_done:
                     root.after(3000, close)
         if root.winfo_exists():

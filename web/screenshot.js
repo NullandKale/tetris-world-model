@@ -3,12 +3,15 @@
 //
 // A model frame (src/token_world/data/nes_layers.py model_frame) is the tick border's top band (BAND rows), NES
 // lines 8-231 and the border's bottom band. A picture becomes that frame with the page's own start's border
-// bands; the start is the frame three times, with no buttons. Any picture works: the model reads pixels, so a
-// Tetris screenshot needs nothing marked (the layered model needed its falling piece as sprites).
+// bands; the start is the frame three times, with no buttons. A two-layer model's start (shape [frames, 2, 256,
+// 256]: each frame's background and sprite layers) gets the picture as its background and no sprites
+// (TRANSPARENT): a picture can't tell the falling piece from the stack, so the model reads it as stack
+// (2026-11-02, s9_postC: a piece at the spawn tops the board out within 40 frames).
 
 export const LINES = 240, WIDTH = 256, SIZE = 256, BAND = 16, OVERSCAN = 8;
 export const NES_COLOURS = 55, BACKDROP = 0;
 export const FRAMES = 3;
+export const TRANSPARENT = 58;                                          // nothing drawn in a layer (nes_layers.py)
 const INNER = 0.6, EDGE = (1 - INNER) / 2;                              // where in a pixel its samples fall
 
 // The quad's corners, clockwise from top left, around what differs from the image's edge colour (a
@@ -163,19 +166,32 @@ function stretch(points, palette) {
 }
 
 // The picture as the model's start: FRAMES copies of one model frame, NES lines 8-231 from the picture and the
-// border bands from base's last frame (the page's own start). -> { start, actions }.
+// border bands from base's last frame (the page's own start; two layers: the picture the background, the sprite
+// layer TRANSPARENT there). -> { start, actions }.
 export function toStart(picture, base) {
-  const size = SIZE * SIZE, frame = Uint8Array.from(base.data.subarray(base.data.length - size));
+  const layers = base.shape.length === 4 ? base.shape[1] : 1, size = SIZE * SIZE * layers;
+  const frame = Uint8Array.from(base.data.subarray(base.data.length - size));
   frame.set(picture.subarray(OVERSCAN * WIDTH, (LINES - OVERSCAN) * WIDTH), BAND * SIZE);
+  if (layers === 2) frame.fill(TRANSPARENT, SIZE * SIZE + BAND * SIZE, SIZE * SIZE + (SIZE - BAND) * SIZE);
   const data = new Uint8Array(size * FRAMES);
   for (let f = 0; f < FRAMES; f++) data.set(frame, f * size);
-  return { start: { data, shape: [FRAMES, SIZE, SIZE] }, actions: new Array(FRAMES).fill(0) };
+  return { start: { data, shape: [FRAMES, ...base.shape.slice(1)] }, actions: new Array(FRAMES).fill(0) };
 }
 
-// A start's last frame as a picture: [LINES * WIDTH] colour indices, NES lines 8-231 from the frame and the
-// overscan lines BACKDROP, for the round-trip test and the editor's colours.
+// A start's last frame as the screen shows it, [SIZE * SIZE] colour indices (two layers: the sprites over the
+// background).
+export function lastFrame(start) {
+  const layers = start.shape.length === 4 ? start.shape[1] : 1, size = SIZE * SIZE;
+  const at = start.data.length - layers * size, frame = Uint8Array.from(start.data.subarray(at, at + size));
+  if (layers === 2)
+    for (let p = 0; p < size; p++) if (start.data[at + size + p] !== TRANSPARENT) frame[p] = start.data[at + size + p];
+  return frame;
+}
+
+// A start's last frame as a picture: [LINES * WIDTH] colour indices, NES lines 8-231 from the frame (lastFrame) and
+// the overscan lines BACKDROP, for the round-trip test and the editor's colours.
 export function startPicture(start) {
-  const size = SIZE * SIZE, frame = start.data.subarray(start.data.length - size);
+  const frame = lastFrame(start);
   const picture = new Uint8Array(LINES * WIDTH).fill(BACKDROP);
   picture.set(frame.subarray(BAND * SIZE, (SIZE - BAND) * SIZE), OVERSCAN * WIDTH);
   return picture;

@@ -1,6 +1,7 @@
-"""Motion drawn on a frame (data/tetris_motion.py codes): an arrow from each moved cell's source to it, coloured by
-direction as optical flow's colour wheel, and NEW cells outlined, on the frame dimmed (2026-10-15). The training
-previews (diagnostics/run_outputs.py save_previews) and scripts/motion_check.py draw with it."""
+"""Motion drawn on a frame (data/tetris_motion.py or, for SMB, data/smb_motion.py codes): an arrow from each moved
+cell's source to it, coloured by direction as optical flow's colour wheel, and NEW cells outlined, on the frame
+dimmed (2026-10-15). Tetris's moves are in cells, SMB's in pixels (arrows SMB_ARROW times longer, to be seen).
+The training previews (diagnostics/run_outputs.py save_previews) and scripts/motion_check.py draw with it."""
 from __future__ import annotations
 
 import colorsys
@@ -8,7 +9,15 @@ import colorsys
 import numpy as np
 from PIL import Image, ImageDraw
 
-import token_world.data.tetris_motion as M
+import token_world.data.smb_motion as SMB
+import token_world.data.tetris_motion as TETRIS
+
+SMB_ARROW = 3                          # SMB's arrows: pixels drawn per pixel moved
+
+
+def scheme(game: str):
+    """The game's motion codes: its module, and the pixels an arrow is drawn per step of a move (at zoom 1)."""
+    return (SMB, SMB_ARROW) if game == "smb" else (TETRIS, TETRIS.CELL)
 
 
 def direction_colour(dy: int, dx: int) -> tuple[int, int, int]:
@@ -18,9 +27,10 @@ def direction_colour(dy: int, dx: int) -> tuple[int, int, int]:
 
 
 def motion_overlay(rgb: np.ndarray, codes: np.ndarray, zoom: int = 1, top: int = 0, left: int = 0,
-                   dim: float = 0.45) -> np.ndarray:
+                   dim: float = 0.45, game: str = "tetris") -> np.ndarray:
     """A frame's colours [H, W, 3] uint8 (cells of 8 * zoom pixels, its top-left at model cell (top, left)) and
     the motion codes of the whole frame [32, 32] -> the frame dimmed with the motion drawn on it [H, W, 3]."""
+    M, step = scheme(game)
     img = Image.fromarray((rgb * dim).astype(np.uint8))
     draw = ImageDraw.Draw(img)
     cell = M.CELL * zoom
@@ -35,7 +45,7 @@ def motion_overlay(rgb: np.ndarray, codes: np.ndarray, zoom: int = 1, top: int =
             elif v not in (M.STILL, M.UNKNOWN):
                 dy, dx = M.offset_of(v)
                 end = (x + cell // 2, y + cell // 2)
-                start = (end[0] - dx * cell, end[1] - dy * cell)
+                start = (end[0] - dx * step * zoom, end[1] - dy * step * zoom)
                 colour = direction_colour(dy, dx)
                 draw.line((start, end), fill=colour, width=width + zoom // 2)
                 dot = 1 + zoom

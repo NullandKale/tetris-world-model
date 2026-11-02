@@ -4,14 +4,14 @@
   "keys": [
    256,
    4,
-   24,
+   44,
    64
   ],
   "values": [
    256,
    4,
    64,
-   24
+   44
   ],
   "names": [
    "keys_0",
@@ -37,14 +37,24 @@
  "frames": 64,
  "content": [
   256,
-  96
+  176
  ],
  "motion": [
   256,
   4
  ],
+ "last": [
+  2,
+  256,
+  256
+ ],
+ "frame": [
+  2,
+  256,
+  256
+ ],
+ "transparent": 58,
  "unknown": 255,
- "keep": 48,
- "prefill": 47,
- "parameters": 2728294
+ "prefill": 62,
+ "parameters": 6510073
 }

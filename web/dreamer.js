@@ -5,17 +5,21 @@
 // is kept as context in the form the model reads, its content (its patch tokens, soft: each pixel's colour
 // probabilities through the model's colour table, [tokens, dim] float32) and its motion (each token's 8 x 8
 // cells' codes, [tokens, cells] float32; meta.unknown where not known, as for the start's real frames), and shown
-// as each pixel's most likely colour. The start's real frames are embedded (embed.onnx) and fill the key/value
-// cache (prefill.onnx); each step decodes the next frame for a controller byte, its motion first and then its
-// pixels, and returns its colours, its content, its motion and the previous frame's keys and values
-// (step.onnx), which go into the cache in place; when the window is full the last `keep` frames are encoded
-// again at positions 0..keep-1. A step reads the previous frame and the new one, so the cache holds every frame
-// but the last.
+// as each pixel's most likely colour. The start's real frames (a two-layer model's: each frame's background and
+// sprite layers, meta.frame [2, 256, 256]) are embedded (embed.onnx) and fill the key/value cache (prefill.onnx);
+// each step decodes the next frame for a controller byte, its motion first and then its pixels, and returns its
+// colours, its content, its motion, its most likely colours (each layer's, meta.last: the next step weighs the
+// changes from them) and the previous frame's keys and values (step.onnx), which go into the cache in place at
+// slot (t - 1) mod frames. The cache is a ring (frame t at slot
+// t mod frames, as the PyTorch Dreamer's, models/dynamics.py TemporalCache): nothing is ever re-encoded, and a
+// dream goes on for as long as it is played (2026-11-01: test 3 found the ring scores as the re-encode it
+// replaced, 18% faster in PyTorch; the re-encode was a whole window's work every 16 frames). A step reads the
+// previous frame and the new one, so the cache holds every frame but the last.
 //
 // On WebGPU the dream stays on the GPU: the cache (one keys and one values tensor a layer, model.json's cache:
 // keys [tokens, heads, head_dim, frames], values [tokens, heads, frames, head_dim]) is written in place by a
-// compute shader (WRITE below), each frame's content and motion go from one step to the next as GPU buffers and
-// are stacked by GPU copies for a re-encode, and next() returns the frame's colours as a GPU tensor, which
+// compute shader (WRITE below), each frame's content and motion go from one step to the next as GPU buffers (the
+// start's stacked by GPU copies for the prefill), and next() returns the frame's colours as a GPU tensor, which
 // GpuScreen draws: nothing comes back to the CPU. Reading the picture back each frame left the GPU idle while
 // the page waited, and the driver then lowered its clocks (an RTX 3090 fell to its 810 MHz memory clock after
 // about 150 steps: 70 ms a step instead of 24, 2026-10-18). At most IN_FLIGHT steps are queued ahead of the GPU,
@@ -24,10 +28,10 @@
 //
 // `ort` is passed in, so the same class runs on onnxruntime-web (browser) and onnxruntime-node (tests):
 // Dreamer.create(ort, load, start, actions, options), where load(name) resolves a model file's bytes and
-// start holds the start's frames: { data: Uint8Array of palette indices, shape: [frames, 256, 256] }.
+// start holds the start's frames: { data: Uint8Array of palette indices, shape: [frames, ...meta.frame] }.
 // next(action) returns the frame's colours as an ort.Tensor [256, 256, 3] float32 (getData() reads them).
 // dreamer.timing holds the last step's times (ms): run (the graph's run, with the wait for the step before on
-// WebGPU), write (the cache write) and encode (a window slide's re-encode, 0 when none); dreamer.runs counts each
+// WebGPU) and write (the cache write); dreamer.runs counts each
 // graph's runs and dreamer.sessions holds them (diagnostics.js profile). options.log(text) hears each graph's
 // setup time.
 
@@ -35,14 +39,14 @@
 // (waiting for each one: 103 ms a step on a 3090 against 42 with two in flight), Chrome at once (25 against 23);
 // a third gained nothing in either (2026-10-18).
 const IN_FLIGHT = 2;
+const STATE = 3;                                          // tensors a step hands the next: content, motion, last
 
 export class Dreamer {
-  static async create(ort, load, start, actions, { keep = null, executionProviders = ["webgpu"], sessionOptions = {},
+  static async create(ort, load, start, actions, { executionProviders = ["webgpu"], sessionOptions = {},
                                                    log = () => {} } = {}) {
     const meta = JSON.parse(new TextDecoder().decode(await load("model.json")));
-    keep ??= meta.keep;
-    if (keep < 3 || keep > meta.prefill + 1 || actions.length < 3 || actions.length > meta.prefill + 1)
-      throw new Error(`keep and the start: 3..${meta.prefill + 1} frames`);
+    if (actions.length < 3 || actions.length > meta.prefill + 1)
+      throw new Error(`the start: 3..${meta.prefill + 1} frames`);
     const onGpu = executionProviders.includes("webgpu");
     const session = async (name, gpuOutputs = []) => {
       const bytes = await load(name), began = performance.now();
@@ -56,67 +60,61 @@ export class Dreamer {
     };
     const embed = await session("embed.onnx");
     const prefill = await session("prefill.onnx", meta.cache.names);
-    const step = await session("step.onnx", ["rgb", "content", "motion", "new_keys", "new_values"]);
+    const step = await session("step.onnx", ["rgb", "content", "motion", "last_out", "new_keys", "new_values"]);
     const device = onGpu ? await ort.env.webgpu.device : null;
     const writer = onGpu ? new GpuWriter(device, meta) : new CpuWriter(meta);
-    const dreamer = new Dreamer(ort, meta, embed, prefill, step, keep, writer, device);
+    const dreamer = new Dreamer(ort, meta, embed, prefill, step, writer, device);
     await dreamer.reset(start, actions);
     return dreamer;
   }
 
-  constructor(ort, meta, embed, prefill, step, keep, writer, device) {
-    Object.assign(this, { ort, meta, embed, prefill, step, keep, writer, device, cache: null, flight: [] });
+  constructor(ort, meta, embed, prefill, step, writer, device) {
+    Object.assign(this, { ort, meta, embed, prefill, step, writer, device, cache: null, flight: [] });
     [this.n, this.dim] = meta.content;
     this.cells = meta.motion[1];
     this.sessions = { embed, prefill, step };
     this.runs = { embed: 0, prefill: 0, step: 0 };
-    this.timing = { run: 0, write: 0, encode: 0 };
-    this.content = [];
-    this.motion = [];
-    if (device) {                                          // the re-encode's inputs, stacked on the GPU
+    this.timing = { run: 0, write: 0 };
+    this.content = this.motion = this.last = null;         // the newest frame's, which the next step reads
+    this.spent = [];                                       // older frames' tensors, freed once no step reads them
+    if (device) {                                          // the prefill's inputs, stacked on the GPU
       const usage = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC;
       this.stacked = { content: device.createBuffer({ size: meta.prefill * this.n * this.dim * 4, usage }),
                        motion: device.createBuffer({ size: meta.prefill * this.n * this.cells * 4, usage }) };
     }
   }
 
-  // Start again from the start's real frames and their incoming controller bytes (their motion not known).
+  // Start again from the start's real frames and their incoming controller bytes (their motion not known): the
+  // start but its last frame into the cache (prefill takes a fixed meta.prefill frames, these padded after them:
+  // no real frame sees a later one, and the steps write over them); the last goes in with the first step.
   async reset(start, actions) {
     await Promise.all(this.flight.splice(0));
-    const { content } = await this.embed.run({ frames: new this.ort.Tensor("uint8", start.data, start.shape) });
+    const { content, last } = await this.embed.run({ frames: new this.ort.Tensor("uint8", start.data, start.shape) });
     this.runs.embed++;
     const size = this.n * this.dim, cells = this.n * this.cells;
-    this.drop(this.content.concat(this.motion));
-    this.content = Array.from(actions, (_, i) =>
+    this.drop([this.content, this.motion, this.last, ...this.spent].filter(Boolean));
+    this.spent = [];
+    const frames = Array.from(actions, (_, i) =>
       new this.ort.Tensor("float32", content.data.slice(i * size, (i + 1) * size), [this.n, this.dim]));
-    this.motion = Array.from(actions, () =>
+    const motion = Array.from(actions, () =>
       new this.ort.Tensor("float32", new Float32Array(cells).fill(this.meta.unknown), [this.n, this.cells]));
-    this.actions = Array.from(actions, Number);
-    await this.encode();
-  }
-
-  drop(tensors) {
-    for (const t of tensors) if (t.location === "gpu-buffer") t.dispose();
-  }
-
-  async encode() {
-    this.drop(this.content.slice(0, -this.keep).concat(this.motion.slice(0, -this.keep)));
-    this.content = this.content.slice(-this.keep);
-    this.motion = this.motion.slice(-this.keep);
-    this.actions = this.actions.slice(-this.keep);
-    // the last frame goes in with the next step; prefill takes a fixed meta.prefill frames, these padded after
-    // them (no real frame sees a later one, and the steps write over them)
-    const t = this.content.length - 1, p = this.meta.prefill;
-    const actions = new Int32Array(p).fill(-1);
-    actions.set(this.actions.slice(0, t));
+    const t = frames.length - 1, p = this.meta.prefill;
+    const incoming = new Int32Array(p).fill(-1);
+    incoming.set(Array.from(actions, Number).slice(0, t));
     const out = await this.prefill.run({
-      content: this.stack("content", this.content.slice(0, t), [p, this.n, this.dim]),
-      motion: this.stack("motion", this.motion.slice(0, t), [p, this.n, this.cells]),
-      actions: new this.ort.Tensor("int32", actions, [p]),
+      content: this.stack("content", frames.slice(0, t), [p, this.n, this.dim]),
+      motion: this.stack("motion", motion.slice(0, t), [p, this.n, this.cells]),
+      actions: new this.ort.Tensor("int32", incoming, [p]),
     });
     this.runs.prefill++;
     this.drop(this.cache ?? []);
     this.cache = this.meta.cache.names.map((name) => out[name]);
+    [this.content, this.motion, this.last, this.action] = [frames[t], motion[t], last, Number(actions[t])];
+    this.t = frames.length;                                // frames so far: the next one's number
+  }
+
+  drop(tensors) {
+    for (const t of tensors) if (t.location === "gpu-buffer") t.dispose();
   }
 
   // Frames' tensors (each [n, k], on the GPU or the CPU) one after another and zero after them, as one tensor
@@ -141,27 +139,22 @@ export class Dreamer {
   // The frame that controller byte `action` produces: its colours, an ort.Tensor [256, 256, 3] (on the GPU on
   // WebGPU: GpuScreen draws it; getData() reads it; dispose() it when drawn).
   async next(action) {
-    let began = performance.now();
-    this.timing.encode = 0;
-    if (this.content.length === this.meta.frames) {
-      await this.encode();
-      this.timing.encode = performance.now() - began;
-      began = performance.now();
-    }
+    const began = performance.now();
     if (this.flight.length >= IN_FLIGHT) await this.flight.shift();     // IN_FLIGHT steps ahead of the GPU at most
-    const at = this.content.length;
+    const at = this.t;
     const int32 = (values) => new this.ort.Tensor("int32", Int32Array.from(values), [values.length]);
     const out = await this.step.run({
-      previous: this.content.at(-1), previous_motion: this.motion.at(-1),
-      actions: int32([this.actions.at(-1), action]), at: int32([at]),
+      previous: this.content, previous_motion: this.motion,
+      actions: int32([this.action, action]), at: int32([at]), last: this.last,
       ...Object.fromEntries(this.meta.cache.names.map((name, i) => [name, this.cache[i]])) });
     const ran = performance.now();
     this.runs.step++;
-    this.writer.write(this.cache, out.new_keys, out.new_values, at - 1);     // the previous frame, at at - 1
+    this.writer.write(this.cache, out.new_keys, out.new_values, (at - 1) % this.meta.frames);   // the previous frame
     this.drop([out.new_keys, out.new_values]);
-    this.content.push(out.content);
-    this.motion.push(out.motion);
-    this.actions.push(action);
+    this.spent.push(this.content, this.motion, this.last); // queued steps may still read them: freed later
+    if (this.spent.length > STATE * (IN_FLIGHT + 1)) this.drop(this.spent.splice(0, STATE));
+    [this.content, this.motion, this.last, this.action] = [out.content, out.motion, out.last_out, action];
+    this.t++;
     if (this.device) this.flight.push(this.device.queue.onSubmittedWorkDone());
     this.timing.run = ran - began;
     this.timing.write = performance.now() - ran;
@@ -170,7 +163,8 @@ export class Dreamer {
 }
 
 // The cache write: a step's new_keys, new_values [layers, tokens, heads, head_dim] into each layer's keys
-// [tokens, heads, head_dim, frames] and values [tokens, heads, frames, head_dim] at frame `at`.
+// [tokens, heads, head_dim, frames] and values [tokens, heads, frames, head_dim] at slot `at` (the frame's mod
+// frames).
 const WRITE = /* wgsl */ `
 struct Write { at: u32, base: u32, frames: u32, hd: u32, count: u32, keys: u32 }
 @group(0) @binding(0) var<storage, read> source: array<f32>;

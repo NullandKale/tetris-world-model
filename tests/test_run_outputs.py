@@ -70,6 +70,37 @@ class RunOutputTests(unittest.TestCase):
             self.assertEqual(kept[0].read_text().splitlines()[0], "step,old")
 
 
+class GifTests(unittest.TestCase):
+    def test_the_real_panel_keeps_a_small_sprite_s_exact_colours(self):
+        # 2026-10-31: PIL gave each preview frame its own 256 colours, and beside the generated panel's blends
+        # small Mario (red, brown, skin) came out one orange in the REAL panel (28% of his pixels exact)
+        import numpy as np
+        from PIL import Image
+        from PIL import ImageSequence
+        try:
+            from token_world.data.world_nes_smb import smb_palette
+        except ImportError:                                  # the public repository ships no SMB code
+            self.skipTest("needs data/world_nes_smb.py")
+        palette = smb_palette()
+        g = torch.Generator().manual_seed(0)
+        real = torch.zeros(1, max(HORIZONS), 256, 256, dtype=torch.uint8)               # night sky
+        real[:, :, 200:] = 40                                                            # bricks ($17)
+        for t in range(real.shape[1]):                                                   # Mario: $16, $18, $27
+            real[0, t, 180:196, 100 + t:112 + t] = torch.tensor([42, 30, 52])[
+                torch.randint(0, 3, (16, 12), generator=g)].to(torch.uint8)
+        last = real[:, 0].clone()
+        probs = torch.softmax(torch.randn(*real.shape, 58, generator=g) * 0.5, -1)
+        probs = 0.5 * probs + 0.5 * torch.nn.functional.one_hot(real.long(), 58).float()   # an early model
+        rgb = (probs @ palette.float()).round().clamp(0, 255).byte()
+        wrong = 1 - probs.gather(-1, real[..., None].long())[..., 0]
+        want = palette.numpy()[real[0].numpy()]
+        with tempfile.TemporaryDirectory() as d:
+            horizon_outputs(real, rgb, wrong, last, palette, Path(d), "smb")
+            back = [np.asarray(f.convert("RGB")) for f in ImageSequence.Iterator(Image.open(Path(d) / "previews/smb_0.gif"))]
+        for t, frame in enumerate(back[1:]):                                             # REAL +1 ..
+            self.assertTrue(np.array_equal(frame[18:274, :256], want[t]), t)
+
+
 class LayeredPreviewTests(unittest.TestCase):
     def test_the_layered_trainer_writes_the_window_s_previews(self):
         import train_layered
@@ -173,6 +204,84 @@ class OptimizerStateTests(unittest.TestCase):
         positional = {k: v for k, v in saved.items() if k != "names"}      # saved before names: by position
         with self.assertRaises(ValueError):
             load_optimizer(torch.optim.AdamW([b, a]), positional, ["b", "a"])
+
+    def test_batched_muon_is_torchs_muon(self):
+        """Newton-Schulz on same-shaped matrices at once: torch's Muon's steps (tall, wide and square, several of
+        a shape), within bf16's rounding of its one-matrix matmuls."""
+        from token_world.diagnostics.run_outputs import BatchedMuon
+        torch.manual_seed(0)
+        shapes = [(48, 16), (48, 16), (16, 48), (16, 16), (16, 16), (16, 16), (32, 24)]
+        start = [torch.randn(*s) for s in shapes]
+        runs = []
+        for kind in (torch.optim.Muon, BatchedMuon):
+            ps = [torch.nn.Parameter(t.clone()) for t in start]
+            opt = kind(ps, lr=0.02, weight_decay=0.1, adjust_lr_fn="match_rms_adamw")
+            g = torch.Generator().manual_seed(1)
+            for _ in range(3):
+                for p in ps:
+                    p.grad = torch.randn(p.shape, generator=g)
+                opt.step()
+            runs.append((ps, opt))
+        (want, torch_opt), (got, ours) = runs
+        for a, b in zip(got, want):
+            self.assertLess((a - b).abs().max().item(), 2e-3)
+            self.assertTrue(torch.equal(ours.state[a]["momentum_buffer"], torch_opt.state[b]["momentum_buffer"]))
+
+    def test_muon_and_adamw_resume_each_part_by_name(self):
+        from token_world.diagnostics.run_outputs import MuonAdamW
+        torch.manual_seed(0)
+        w, e, bias = (torch.nn.Parameter(torch.randn(*s)) for s in ((6, 4), (3, 4), (6,)))
+
+        def made(order):
+            groups = [{"names": ["e"], "params": [e], "weight_decay": 0.1},
+                      {"names": ["bias"], "params": [bias], "weight_decay": 0.0}][::order]
+            return MuonAdamW([("w", w)], groups, 1e-3, 0.1)
+        first = made(1)
+        (w.sum() + e.sum() + bias.sum()).backward()
+        first.step()
+        self.assertIn("momentum_buffer", first.muon.state[w])
+        self.assertEqual(len(first.param_groups), 3)                       # a schedule sets all of them
+        saved = optimizer_state(first)
+        again = made(-1)
+        load_optimizer(again, saved)
+        self.assertTrue(torch.equal(again.muon.state[w]["momentum_buffer"], first.muon.state[w]["momentum_buffer"]))
+        self.assertTrue(torch.equal(again.adamw.state[e]["exp_avg"], first.adamw.state[e]["exp_avg"]))
+        with self.assertRaises(ValueError):                                # an AdamW-only state: refused
+            load_optimizer(made(1), optimizer_state(torch.optim.AdamW([w]), ["w"]))
+        adamw = torch.optim.AdamW([{"params": [w, e], "weight_decay": 0.1}, {"params": [bias], "weight_decay": 0.0}])
+        adamw.step()                                                       # an AdamW-only run, post-trained:
+        post = made(1)
+        load_optimizer(post, optimizer_state(adamw, ["w", "e", "bias"]), from_adamw=True)
+        self.assertEqual(len(post.muon.state), 0)                          # Muon's matrix starts fresh,
+        self.assertTrue(torch.equal(post.adamw.state[e]["exp_avg"], adamw.state[e]["exp_avg"]))   # the rest kept
+        self.assertTrue(torch.equal(post.adamw.state[bias]["exp_avg_sq"], adamw.state[bias]["exp_avg_sq"]))
+        with self.assertRaises(ValueError):
+            MuonAdamW([("bias", bias)], [], 1e-3, 0.1)                      # Muon: matrices only
+
+
+class ScheduleTests(unittest.TestCase):
+    def test_the_cooldown_falls_as_one_minus_sqrt_to_zero(self):
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+        import train_dynamics_ui as D
+        from types import SimpleNamespace
+        args = SimpleNamespace(lr=3e-4, warmup=1000, cooldown=(88000, 12000), hold_lr=None, stairs=0)
+        self.assertAlmostEqual(D.learning_rate(50_000, args), 3e-4)
+        self.assertAlmostEqual(D.learning_rate(91_000, args), 1.5e-4)          # a quarter through: 1 - 0.5
+        self.assertEqual(D.learning_rate(100_000, args), 0.0)
+
+    def test_muon_takes_the_hidden_matrices_and_adamw_the_edges(self):
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+        import train_dynamics_ui as D
+        from token_world.models.dynamics import Dynamics
+        model = Dynamics(dim=32, layers=2, heads=2, patch=16, frames=6, colour_dim=8, two_layers=True,
+                         conv_ends=(8, 12, 16), shared_heads=True, latent=(1, 8))
+        o = D.make_optimizer(model, 3e-4, 0.05)
+        self.assertIn("blocks.0.mlp.0.weight", o.muon_names)
+        self.assertIn("prior_blocks.1.qkv.weight", o.muon_names)
+        for edge in ("action.weight", "pixel.weight", "sprite_pixel.weight", "choice.weight", "prior_out.3.weight",
+                     "posterior_out.weight", "colour.weight", "space_pos", "patchify.weight"):
+            self.assertIn(edge, o.adamw_names)
+        self.assertEqual(len(o.muon_names) + len(o.adamw_names), len(list(model.parameters())))
 
 
 if __name__ == "__main__":

@@ -96,6 +96,7 @@ class Trial:
     buttons: np.ndarray | None = None   # [FUTURE] the button byte that produced each future frame; None: none
     pictures: np.ndarray | None = None  # [FUTURE // EVERY, 256, 256] every EVERY-th real frame (sheet,
                                         # animation); None: from future
+    two: np.ndarray | None = None       # [CONTEXT, 2, 256, 256] the context's two layers (a --two-layers model's)
 
     def __post_init__(self):
         if self.buttons is None:
@@ -113,13 +114,15 @@ class Trial:
         return f"the bot's buttons for {frames} frames" if self.pressed else f"no buttons for {frames} frames"
 
 
-def trials(seed: int, per_band: int | None = None, layered: bool = False, pressed: bool = False) -> Iterator[Trial]:
+def trials(seed: int, per_band: int | None = None, layered: bool = False, pressed: bool = False,
+           two: bool = False, blank: bool = False) -> Iterator[Trial]:
     """Real games paused at a fresh piece, then FUTURE frames with no buttons (pressed: the bot plays on, and
     its presses are the trial's buttons). per_band: that many from each level band in BANDS, then stop; None:
-    endless, whatever levels the bot's games reach. layered: the context's layers too (Trial.layers)."""
+    endless, whatever levels the bot's games reach. layered: the context's layers too (Trial.layers); two: its
+    two layers (Trial.two); blank: frames in the BLANK_BORDER layout (data/model_frames.py)."""
     found = {band: 0 for band in BANDS}
     while per_band is None or any(n < per_band for n in found.values()):
-        real = RealTetris(seed, layered)
+        real = RealTetris(seed, layered, two, blank)
         seed += 1
         for played in range(20_000):
             real.step(None)
@@ -133,21 +136,24 @@ def trials(seed: int, per_band: int | None = None, layered: bool = False, presse
                     found[band] += 1
                 context, actions = np.stack(real.frames), np.array(real.actions, np.int64)
                 layers = {k: np.stack([f[k] for f in real.layers]) for k in real.layers[0]} if layered else None
+                both = np.stack(real.twos) if two else None
                 future, buttons = zip(*(real.step(None if pressed else 0) for _ in range(FUTURE)))
                 yield Trial(context, actions, np.stack(future[:FIRST]), level, layers, np.array(buttons, np.int64),
-                            np.stack(future[EVERY - 1::EVERY]))
+                            np.stack(future[EVERY - 1::EVERY]), both)
                 break
 
 
 class TrialStream(IterableDataset):
     """Endless live trials, one console per DataLoader worker (training keeps one worker filling it)."""
 
-    def __init__(self, seed: int, layered: bool = False, pressed: bool = False):
-        self.seed, self.layered, self.pressed = seed, layered, pressed
+    def __init__(self, seed: int, layered: bool = False, pressed: bool = False, two: bool = False,
+                 blank: bool = False):
+        self.seed, self.layered, self.pressed, self.two, self.blank = seed, layered, pressed, two, blank
 
     def __iter__(self):
         info = get_worker_info()
-        yield from trials(self.seed * 1000 + (info.id if info else 0), layered=self.layered, pressed=self.pressed)
+        yield from trials(self.seed * 1000 + (info.id if info else 0), layered=self.layered, pressed=self.pressed,
+                          two=self.two, blank=self.blank)
 
 
 @dataclass
@@ -183,7 +189,8 @@ def dreams(model, trials: list[Trial], palette: np.ndarray, keep: int | None = N
            pictures: int = 0, batch: int = BATCH) -> Iterator[Dream]:
     """Each trial's FUTURE frames from its context, given its buttons (change_weight: Dreamer's), BATCH trials
     dreamed side by side (models/dynamics.py Dreamer) -> its Dream, in order; the first `pictures` trials keep
-    their pictures (Dream.seen)."""
+    their pictures (Dream.seen). keep: the latent model's, whose window slides (the pixel model's history is a
+    ring: dynamics.TemporalCache)."""
     device = next(model.parameters()).device
     colours = torch.as_tensor(palette, dtype=torch.float32, device=device)
     for lo in range(0, len(trials), batch):
@@ -194,9 +201,17 @@ def dreams(model, trials: list[Trial], palette: np.ndarray, keep: int | None = N
         shown = torch.tensor([i for i in range(b) if lo + i < pictures], dtype=torch.long, device=device)
         rgb, filled, likely, sure, cells, seen, right = [], [], [], [], [], [], {}
         with torch.autocast(device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
-            make = getattr(model, "Dreamer", Dreamer)    # the latent model's own (models/latent_dynamics.py)
-            dreamer = make(model, torch.from_numpy(np.stack([t.context for t in group])).to(device),
-                           torch.from_numpy(np.stack([t.actions for t in group])).to(device), keep, change_weight)
+            if hasattr(model, "Dreamer"):                 # the latent model's own (models/latent_dynamics.py)
+                make = lambda *a: model.Dreamer(*a, keep, change_weight)
+            elif getattr(model, "decode", None):          # the pixel model's own decoding (Dynamics.decode)
+                from token_world.models.decoding import OptionDreamer
+                make = lambda *a: OptionDreamer(*a, change_weight=change_weight, **model.decode)
+            else:
+                make = lambda *a: Dreamer(*a, change_weight=change_weight)
+            context = [t.two if getattr(model, "two_layers", False) and t.two is not None else t.context
+                       for t in group]                       # a two-layer model: the context's layers
+            dreamer = make(model, torch.from_numpy(np.stack(context)).to(device),
+                           torch.from_numpy(np.stack([t.actions for t in group])).to(device))
             for h in range(1, FUTURE + 1):
                 probs = dreamer.step(buttons[:, h - 1]).float()                  # [b, 256, 256, COLOURS]
                 top = probs.max(-1)

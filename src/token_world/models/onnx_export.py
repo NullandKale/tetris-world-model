@@ -5,19 +5,23 @@ frame's soft: its colour probabilities through the colour table, Dynamics.soft_t
 motion, each token's 8 x 8 cells' codes (data/tetris_motion.py) [N, cells] float32, 255 where not known (a start's
 real frames: the page ships no RAM, the motion's source).
 
-    embed.onnx    real frames [T, 256, 256] uint8 (palette indices) -> content [T, N, dim]
+    embed.onnx    real frames [T, 256, 256] uint8 (palette indices; a two-layer model's [T, 2, 256, 256], each
+                  frame's background and sprite layers) -> content [T, N, dim], and last [layers, N, P*P] float32,
+                  the last frame's colours (each layer's), which the first step reads
     prefill.onnx  content [P, N, dim], motion [P, N, cells], actions [P] int32 (incoming, -1 = none) -> the cache,
                   each layer's keys_i [tokens, heads, head_dim, frames] (transposed, as attention reads them) and
-                  values_i [tokens, heads, frames, head_dim], at positions 0..P-1, the rest zero. P is fixed, keep - 1
-                  (the frames a window slide encodes): a start with fewer frames is padded after them, which no real
-                  frame sees (causal) and the steps write over (a dynamic length put its shape arithmetic on the CPU
-                  in onnxruntime-web)
+                  values_i [tokens, heads, frames, head_dim], frames 0..P-1 at slots 0..P-1, the rest zero. P is
+                  fixed, frames - 2 (the longest start, frames - 1, but its last frame, which the first step reads
+                  as `previous`): a start with fewer frames is padded after them, which no real frame sees (causal)
+                  and the steps write over (a dynamic length put its shape arithmetic on the CPU in onnxruntime-web)
     step.onnx     previous [N, dim] and previous_motion [N, cells] (the last frame's), actions [2] int32 (the
-                  previous frame's, the new one's), at [1] int32 (the new frame's position), the cache (keys_i,
-                  values_i: positions before at - 1 are read) -> rgb [256, 256, 3] float32 (the new frame, each
-                  pixel's most likely colour through the palette in the graph), content [N, dim] and motion [N,
-                  cells] (the new frame's), new_keys, new_values [layers, tokens, heads, head_dim]: the previous
-                  frame's, which the host writes into the cache at at - 1
+                  previous frame's, the new one's), at [1] int32 (the new frame: frames since the start's first),
+                  last [layers, N, P*P] (the previous frame's colours, each layer's), the cache (keys_i,
+                  values_i: a ring, frame t at slot t mod frames, holding the frames up to at - 2) -> rgb
+                  [256, 256, 3] float32 (the new frame, each pixel's most likely colour through the palette in the
+                  graph), content [N, dim], motion [N, cells] and last_out (the new frame's), new_keys, new_values
+                  [layers, tokens, heads, head_dim]: the previous frame's, which the host writes into the cache at
+                  slot (at - 1) mod frames
 
 A step is FrameDecoder's frame with one motion step (Dynamics.motion_steps = 1: at s9_cool140 152k one step dreamed
 as two, 2026-10-18, docs/guides/recipe_attempts.md): pass 1 is over two frames, the previous one with its motion
@@ -26,8 +30,18 @@ frame's cells its most likely motion (the border's token rows STILL, Dynamics.dr
 frame alone, hidden with that motion added, attending to the cache and to the previous frame's keys and values from
 pass 1 (a frame never sees a later one, so its keys are the same in both), and gives each pixel's colour
 probabilities: the picture (most likely colours) and the soft content. Three frames' work a step, as the decoder's
-three passes. A model trained with a change weight other than 1 is refused (its decoding reweighs changes from the
-last frame, which the graphs leave out).
+three passes. A model trained with a change weight w has the odds of each game pixel's change from `last` times
+1 / w (FrameDecoder's weigh_changes, undoing the weighted loss; a two-layer model's sprite layer weighed as its
+background). A two-layer model (two_layers) has two pixel heads, the background's and the sprite layer's: the
+picture is their composite (compose_probs) and the content the sum of both layers' soft pixels, as FrameDecoder.
+
+With conv ends (conv_ends) both pixel ends are pyramids of 2 x 2 steps: a token's pixels are kept in the
+pyramids' nested order (nested_order: each 2 x 2 group's four together, then each group of groups'), so the
+head's output goes into the content's pyramid with no reordering, and only the picture is put back in rows.
+
+The cache is the Dreamer's ring (models/dynamics.py TemporalCache): nothing is ever re-encoded, and each frame
+attends to its own and the frames - 1 before it, exactly as there (the previous frame one older slot than the new
+one; each slot's frame worked out from `at`, in float: exact to 2^24 frames, 77 hours at 60 a second).
 
 A step attends over the cache's earlier frames and its own together (one softmax over all) and never copies the
 cache: the host writes the previous frame's keys and values in place (web/dreamer.js: a compute shader on the GPU
@@ -47,7 +61,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from token_world.models.dynamics import (COLOURS, MOTION_CODES, MOTION_STILL, MOTION_UNKNOWN, ROPE_BASE, SIZE,
-                                         Dynamics, button_bits)
+                                         TRANSPARENT, Dynamics, button_bits, patch_pixels, pixel_logits)
 
 
 def first_max(scores: torch.Tensor) -> torch.Tensor:
@@ -88,13 +102,77 @@ def norm_eps(norm) -> float:
     return norm.eps if norm.eps is not None else torch.finfo(torch.float32).eps
 
 
+def rms(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+    """RMSNorm over the last axis as Pow, ReduceMean, Add, Sqrt, Div and Mul by the weight, which fuse_norms makes
+    one kernel. ONNX before opset 23 has no RMSNorm, and torch's (or an rsqrt) exports as seven kernels: the
+    QK-norms and the conv ends' norms were 315 of a step's 1,680 (s9_postC, 2026-11-02)."""
+    return x / torch.sqrt(x.pow(2).mean(-1, keepdim=True) + eps) * weight
+
+
+def fuse_norms(path: Path) -> int:
+    """Each `rms` in the ONNX graph at `path` -> one SimplifiedLayerNormalization (onnxruntime's RMSNorm, which its
+    WebGPU provider runs as one LayerNorm kernel, as the training's fused norm, models/norm_kernel.py). Its
+    optimiser makes the same fusion on the CPU but not on WebGPU (the browser ran all six ops, 2026-11-02).
+    Rewrites the file; -> the norms fused."""
+    import onnx
+    from onnx import helper, numpy_helper
+
+    graph_path = str(path)
+    proto = onnx.load(graph_path)
+    graph = proto.graph
+    values = {i.name: numpy_helper.to_array(i) for i in graph.initializer}
+    users: dict[str, list] = {}
+    for node in graph.node:
+        for name in node.input:
+            users.setdefault(name, []).append(node)
+
+    def only(node, op: str):
+        after = users.get(node.output[0], [])
+        return after[0] if len(after) == 1 and after[0].op_type == op else None
+
+    gone, fused = set(), []
+    for pow_ in graph.node:
+        if pow_.op_type != "Pow" or values.get(pow_.input[1]) is None or float(values[pow_.input[1]]) != 2.0:
+            continue
+        mean = only(pow_, "ReduceMean")
+        add = mean and only(mean, "Add")
+        sqrt = add and only(add, "Sqrt")
+        div = sqrt and only(sqrt, "Div")
+        mul = div and only(div, "Mul")
+        if not mul or div.input[0] != pow_.input[0] or list(values.get(mean.input[1], [])) != [-1]:
+            continue
+        eps = values.get(add.input[1])
+        weight = next((name for name in mul.input if name != div.output[0]), None)
+        if eps is None or eps.size != 1 or weight not in values:
+            continue
+        gone.update(id(n) for n in (pow_, mean, add, sqrt, div, mul))
+        fused.append((mul, helper.make_node("SimplifiedLayerNormalization", [pow_.input[0], weight], [mul.output[0]],
+                                            name=f"{mul.name}_rms", axis=-1, epsilon=float(eps), stash_type=1)))
+    at_mul = {id(mul): node for mul, node in fused}
+    nodes = [at_mul.get(id(n), n) for n in graph.node if id(n) not in gone or id(n) in at_mul]
+    del graph.node[:]
+    graph.node.extend(nodes)
+    used = {name for node in nodes for name in node.input}           # the fused ops' constants go too
+    kept = [i for i in graph.initializer if i.name in used or i.name in {o.name for o in graph.output}]
+    del graph.initializer[:]
+    graph.initializer.extend(kept)
+    onnx.save(proto, graph_path)
+    return len(fused)
+
+
+def rms_gelu(x: torch.Tensor, norm) -> torch.Tensor:
+    """F.gelu(norm(x)) for an RMSNorm module, the conv ends' step between maps (dynamics.norm_gelu): two kernels."""
+    return F.gelu(rms(x, norm.weight, norm_eps(norm)))
+
+
 class Graph(nn.Module):
     """What the three graphs share: a frame's tokens from its content, motion and buttons, and the blocks.
 
     The attentions are the model's, written out for the browser's kernel count (each kernel costs a dispatch in
-    onnxruntime-web, which bounded a step at about 2,800 of them): queries and keys normalised together (QK-norm)
-    and rotated together (pairing: by frame in the temporal attention, by place in the spatial one, RoPE-Mixed's
-    angles fixed for the graph), and each layer's local bias gathered once for both of a step's passes."""
+    onnxruntime-web, which bounded a step at about 2,800 of them): queries and keys normalised together (QK-norm,
+    one fused norm with unit weights, then each one's weights) and rotated together (pairing: by frame in the
+    temporal attention, by place in the spatial one, RoPE-Mixed's angles fixed for the graph), and each layer's
+    local bias gathered once for both of a step's passes. The RMSNorms are `rms`, which onnxruntime fuses."""
 
     def __init__(self, model: Dynamics):
         super().__init__()
@@ -106,8 +184,18 @@ class Graph(nn.Module):
         self.register_buffer("still", F.one_hot(torch.tensor(MOTION_STILL), MOTION_CODES).float())
         first = model.blocks[0]
         self.heads_, self.head_dim = first.temporal.heads, first.temporal.qkv.in_features // first.temporal.heads
+        self.register_buffer("unit", torch.ones(self.head_dim))                         # the QK-norms' fused part
         self.register_buffer("temporal_pairs", pairing(self.head_dim, self.head_dim // 2))
         self.locals = first.spatial.local
+        p = model.patch
+        nest = model.nest if model.conv_ends else torch.arange(p * p)          # the graph's order of a token's pixels
+        self.register_buffer("unnest", nest.argsort())                          # each row-major place's
+        undo = model.change_undo("cpu")                                          # [N, P*P, 1] or None
+        self.weighs = undo is not None
+        if self.weighs:
+            self.register_buffer("undo", undo[:, nest])
+        if model.conv_ends:                       # the first step, 2 x 2 pixels (ky, kx, colour) -> its width
+            self.register_buffer("patch_weight", model.patchify.weight.permute(0, 2, 3, 1).flatten(1).clone())
         if self.locals:                                   # one offsets table for every layer
             self.register_buffer("offsets", first.spatial.offsets.clone())
         for i, block in enumerate(model.blocks):
@@ -136,7 +224,7 @@ class Graph(nn.Module):
         t, n, d = x.shape
         qk, v = attn.qkv(x).view(t, n, 3, self.heads_, self.head_dim).split([2, 1], 2)
         if attn.q_norm is not None:
-            qk = qk * torch.rsqrt(qk.pow(2).mean(-1, keepdim=True) + norm_eps(attn.q_norm)) * getattr(self, f"qk_{kind}{i}")
+            qk = rms(qk, self.unit, norm_eps(attn.q_norm)) * getattr(self, f"qk_{kind}{i}")
         return qk, v.squeeze(2)
 
     def heads(self, i: int, layer, h: torch.Tensor, turn: tuple[torch.Tensor, torch.Tensor]):
@@ -159,6 +247,44 @@ class Graph(nn.Module):
             scores = scores + bias
         y = scores.softmax(-1) @ v.transpose(1, 2)                                        # [T, heads, N, hd]
         return attn.out(y.transpose(1, 2).reshape(t, n, d))
+
+    def content(self, pixels: torch.Tensor) -> torch.Tensor:
+        """Each pixel's colour embedding [N, P*P, colour_dim] in the graph's order -> the tokens [N, dim] (the
+        patch conv; with conv ends its pyramid, Dynamics._steps)."""
+        model, n = self.model, pixels.shape[0]
+        if model.conv_ends is None:
+            return F.linear(pixels.transpose(1, 2).flatten(1), model.patchify.weight.flatten(1), model.patchify.bias)
+        x = F.linear(pixels.reshape(n, -1, 4 * pixels.shape[-1]), self.patch_weight, model.patchify.bias)
+        for norm, step in zip(model.patch_norms, model.patch_steps):
+            x = step(rms_gelu(x, norm).reshape(n, -1, 4 * x.shape[-1]))
+        return x[:, 0]
+
+    def pixel_probs(self, f: torch.Tensor, sprite: bool = False) -> torch.Tensor:
+        """Features [N, dim] -> each pixel's colour probabilities [N, P*P, colours] in the graph's order (sprite:
+        the sprite layer's head and colours)."""
+        model = self.model
+        head = model.sprite_pixel if sprite else model.pixel
+        if model.conv_ends is None:
+            vectors = head(f).unflatten(-1, (model.patch ** 2, -1))
+        else:                                     # down the head's steps (Dynamics.pixel_groups)
+            steps, norms = ((model.sprite_pixel_steps, model.sprite_pixel_norms) if sprite and not model.shared_heads
+                            else (model.pixel_steps, model.pixel_norms))
+            h = f[:, None]
+            for step, norm in zip(steps, norms):
+                h = rms_gelu(step(h).unflatten(-1, (4, -1)).flatten(-3, -2), norm)
+            vectors = head(h).unflatten(-1, (4, -1)).flatten(-3, -2)
+        table, bias = (model.sprite_table(), model.sprite_bias) if sprite else (model.colour_table(), model.colour_bias)
+        return pixel_logits(vectors, table, bias).softmax(-1)
+
+    def weigh(self, probs: torch.Tensor, last: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """A layer's probabilities [N, P*P, C] and its last colours [N, P*P] -> the probabilities with the odds of
+        each change from `last` times the model's undo (weigh_changes; as they are without a change weight), and
+        their most likely colours [N, P*P] (the next step's last)."""
+        if self.weighs:
+            seen = (last[..., None] == torch.arange(probs.shape[-1], dtype=torch.float32)).float()
+            probs = probs * (self.undo + (1 - self.undo) * seen)
+            probs = probs / probs.sum(-1, keepdim=True)
+        return probs, (first_max(probs) * torch.arange(probs.shape[-1], dtype=torch.float32)).sum(-1)
 
     def motion(self, picks: torch.Tensor) -> torch.Tensor:
         """Motion one-hots [..., N, cells, CODES] (all zero: not known) -> what they add to each token [..., N, dim]
@@ -198,9 +324,17 @@ class EmbedGraph(nn.Module):
         self.model = model
 
     def forward(self, frames):
-        model = self.model
-        pixels = F.embedding(frames.int(), model.colour.weight)                         # [T, 256, 256, colour_dim]
-        return model.patchify(pixels.permute(0, 3, 1, 2)).flatten(2).transpose(1, 2)
+        model, p = self.model, self.model.patch
+        if model.two_layers:                      # the conv is linear: both layers' embeddings, summed
+            pixels = (F.embedding(frames[:, 0].int(), model.colour.weight)
+                      + F.embedding(frames[:, 1].int(), model.sprite_colour.weight))
+            last = torch.stack([patch_pixels(frames[-1, i].float(), p) for i in range(2)])
+        else:
+            pixels = F.embedding(frames.int(), model.colour.weight)                     # [T, 256, 256, colour_dim]
+            last = patch_pixels(frames[-1].float(), p)[None]
+        first = model.patchify(pixels.permute(0, 3, 1, 2)).flatten(2).transpose(1, 2)
+        nest = model.nest if model.conv_ends else torch.arange(p * p)
+        return model._steps(first), last[:, :, nest]
 
 
 class PrefillGraph(Graph):
@@ -230,12 +364,17 @@ class StepGraph(Graph):
         super().__init__(model)
         self.register_buffer("colours", palette.float()[:COLOURS])                     # [COLOURS, 3]
 
-    def forward(self, previous, previous_motion, actions, at, *cache):
+    def forward(self, previous, previous_motion, actions, at, last, *cache):
         model = self.model
         keys, values = cache[:len(model.blocks)], cache[len(model.blocks):]
         hidden = model.mask_token.expand_as(previous)
-        positions = torch.arange(model.frames, dtype=at.dtype)
-        earlier = torch.zeros(model.frames).masked_fill(positions >= at.view(()) - 1, float("-inf"))   # the cache's
+        window = model.frames
+        newest = at.view(()).float() - 2                                                # the cache's newest frame
+        behind = newest - torch.arange(window, dtype=torch.float32)
+        stamp = newest - (behind - torch.floor(behind / window) * window)                # each slot's frame
+        rows = at.view(()).float() - 1 + torch.arange(2, dtype=torch.float32)            # the previous frame, the new
+        seen = (stamp[None] > rows[:, None] - window) & (stamp[None] >= 0)               # its last frames - 1 before
+        earlier = torch.zeros(2, window).masked_fill(~seen, float("-inf"))               # [2, frames]
         head_dim, biases = self.head_dim, self.biases()
         scale = head_dim ** -0.5
         new_keys, new_values = [], []
@@ -265,22 +404,28 @@ class StepGraph(Graph):
         def second(i, layer, h):
             q, k, v = self.heads(i, layer, h, now)                                              # [n, heads, 1, hd]
             before_k, before_v = new_keys[i][:, :, None], new_values[i][:, :, None]       # [n, heads, 1, hd]
-            weights = torch.cat((q @ keys[i] * scale + earlier, q @ before_k.transpose(-1, -2) * scale,
+            weights = torch.cat((q @ keys[i] * scale + earlier[1:], q @ before_k.transpose(-1, -2) * scale,
                                  q @ k.transpose(-1, -2) * scale), -1).softmax(-1)
-            f = model.frames
-            return merge(layer, weights[..., :f] @ values[i] + weights[..., f:f + 1] @ before_v
-                         + weights[..., f + 1:] @ v)
+            return merge(layer, weights[..., :window] @ values[i] + weights[..., window:window + 1] @ before_v
+                         + weights[..., window + 1:] @ v)
 
         f = self.run(x, action[1:], second, biases)[0]
-        probs = model.logits(f).float().softmax(-1)                                       # [N, P*P, COLOURS]
+        probs, drawn = self.weigh(self.pixel_probs(f), last[0])                          # [N, P*P, COLOURS]
+        # its content from the same probabilities (FrameDecoder): each pixel's expected colour embedding (both
+        # layers'), through the patch conv
+        pixels = probs @ model.colour.weight
+        if model.two_layers:
+            sprite, sprite_drawn = self.weigh(self.pixel_probs(f, sprite=True), last[1])
+            pixels = pixels + sprite @ model.sprite_colour.weight
+            probs = sprite[..., :TRANSPARENT] + sprite[..., TRANSPARENT:] * probs         # compose_probs
+            drawn = torch.stack((drawn, sprite_drawn))
+        else:
+            drawn = drawn[None]
         g, p = model.grid, model.patch
-        rgb = (first_max(probs) @ self.colours).view(g, g, p, p, 3).permute(0, 2, 1, 3, 4).reshape(SIZE, SIZE, 3)
-        # its content from the same probabilities (Dynamics.soft_tokens): each pixel's expected colour embedding,
-        # through the patch conv
-        pixels = (probs @ model.colour.weight).transpose(1, 2).flatten(1)                 # [N, colour_dim * P * P]
-        content = F.linear(pixels, model.patchify.weight.flatten(1), model.patchify.bias)
+        rgb = (first_max(probs) @ self.colours)[:, self.unnest]                          # [N, P*P, 3] in rows
+        rgb = rgb.view(g, g, p, p, 3).permute(0, 2, 1, 3, 4).reshape(SIZE, SIZE, 3)
         motion = (picks * self.codes).sum(-1)                                            # [N, cells] the codes
-        return rgb, content, motion, torch.stack(new_keys), torch.stack(new_values)
+        return rgb, self.content(pixels), motion, drawn, torch.stack(new_keys), torch.stack(new_values)
 
 
 def cache_layout(model: Dynamics) -> dict:
@@ -300,17 +445,19 @@ def export(model: Dynamics, folder: Path, palette: torch.Tensor) -> None:
     palette [COLOURS, 3] is the game's."""
     if not isinstance(model, Dynamics) or not model.motion_first:
         raise NotImplementedError("the export is for the pixel model with motion first (models/dynamics.py)")
-    if model.latent or model.change_weight != 1.0:
-        raise NotImplementedError("the export has no latent choice and no change weight")
+    if model.latent:
+        raise NotImplementedError("the export has no latent choice")
     model = copy.deepcopy(model).float().cpu().eval()
     folder.mkdir(parents=True, exist_ok=True)
     cache = cache_layout(model)
     n, dim = model.grid ** 2, model.blocks[0].temporal.qkv.in_features
     t = torch.export.Dim("frames", min=2, max=model.frames - 1)
-    torch.onnx.export(EmbedGraph(model).eval(), (torch.zeros(model.frames // 2, SIZE, SIZE, dtype=torch.uint8),),
-                      folder / "embed.onnx", input_names=["frames"], output_names=["content"],
+    layers, p = (2 if model.two_layers else 1), model.patch
+    frame = (2, SIZE, SIZE) if model.two_layers else (SIZE, SIZE)
+    torch.onnx.export(EmbedGraph(model).eval(), (torch.zeros(model.frames // 2, *frame, dtype=torch.uint8),),
+                      folder / "embed.onnx", input_names=["frames"], output_names=["content", "last"],
                       dynamic_shapes={"frames": {0: t}}, dynamo=True, external_data=False, verbose=False)
-    prefill = model.frames * 3 // 4 - 1                   # keep - 1
+    prefill = model.frames - 2                            # the longest start but its last frame
     torch.onnx.export(PrefillGraph(model).eval(),
                       (torch.zeros(prefill, n, dim), torch.full((prefill, n, model.motion_cells), float(MOTION_UNKNOWN)),
                        torch.zeros(prefill, dtype=torch.int32)),
@@ -319,11 +466,15 @@ def export(model: Dynamics, folder: Path, palette: torch.Tensor) -> None:
     empty = [torch.zeros(cache[name.split("_")[0]]) for name in cache["names"]]
     torch.onnx.export(StepGraph(model, palette).eval(),
                       (torch.zeros(n, dim), torch.zeros(n, model.motion_cells), torch.zeros(2, dtype=torch.int32),
-                       torch.tensor([model.frames // 2], dtype=torch.int32), *empty), folder / "step.onnx",
-                      input_names=["previous", "previous_motion", "actions", "at", *cache["names"]],
-                      output_names=["rgb", "content", "motion", "new_keys", "new_values"], dynamo=True,
+                       torch.tensor([model.frames // 2], dtype=torch.int32), torch.zeros(layers, n, p * p), *empty),
+                      folder / "step.onnx",
+                      input_names=["previous", "previous_motion", "actions", "at", "last", *cache["names"]],
+                      output_names=["rgb", "content", "motion", "last_out", "new_keys", "new_values"], dynamo=True,
                       external_data=False, verbose=False)
+    for name in ("prefill.onnx", "step.onnx"):
+        fuse_norms(folder / name)
     (folder / "model.json").write_text(json.dumps({
         "cache": cache, "frames": model.frames, "content": [n, dim], "motion": [n, model.motion_cells],
-        "unknown": MOTION_UNKNOWN, "keep": model.frames * 3 // 4, "prefill": prefill,
+        "last": [layers, n, p * p], "frame": list(frame), "transparent": TRANSPARENT if model.two_layers else None,
+        "unknown": MOTION_UNKNOWN, "prefill": prefill,
         "parameters": sum(p.numel() for p in model.parameters())}, indent=1))

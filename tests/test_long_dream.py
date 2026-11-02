@@ -167,8 +167,8 @@ class ThousandFrameTests(unittest.TestCase):
         palette = np.random.default_rng(0).integers(0, 256, (58, 3)).astype(np.uint8)
         made = [trial_with_piece(), trial_with_tetromino()]
         made[1].buttons = np.random.default_rng(1).integers(0, 256, FUTURE)
-        together = list(dreams(model, made, palette, keep=3, pictures=1, batch=2))
-        alone = [next(dreams(model, [t], palette, keep=3, pictures=1, batch=1)) for t in made]
+        together = list(dreams(model, made, palette, pictures=1, batch=2))
+        alone = [next(dreams(model, [t], palette, pictures=1, batch=1)) for t in made]
         self.assertEqual(together[0].cells.shape, (FUTURE, 20, 10))
         self.assertEqual(together[0].seen.shape, (FUTURE // EVERY, 256, 256, 3))
         self.assertIsNone(together[1].seen)                                 # pictures for the first only

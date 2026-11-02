@@ -1,6 +1,11 @@
-"""Tetris next to its world models: the real game and every model's dream, frame by frame in lockstep.
+"""A game next to its world models: the real game and every model's dream, frame by frame in lockstep.
 
     python scripts/play_world_model.py [--runs output/world_model_tetris_base D:/.../model_step58000.pt ...]
+    python scripts/play_world_model.py --game smb [--stage 1-1] [--runs output/scale_ab/world_model_smb_s6_stairs]
+
+--game smb (2026-10-25): Super Mario Bros. from a level's start (--stage), the training bot (or you) playing
+WARMUP frames before the dreams take over from the last frames' two layers, buttons and motion codes (a two-game
+model gets them in its own vocabulary); X jumps (A), Z runs (B).
 
 The real game runs in World NES. Every frame one controller byte (the bot's, by
 default, or your keys) goes to the console and to every model alike, any model:
@@ -23,8 +28,17 @@ each pixel is to be wrong. A layered model's dream is committed: its layers
 composed, and its difference shows the wrong pixels. The toolbar sets the pixel
 models' change weight (the odds of every pixel change times it,
 models/dynamics.py weigh_changes, so an unsure piece is drawn with too many
-cells instead of thin ones) and --keep how many frames are kept when a window
-slides (default three quarters of each model's window).
+cells instead of thin ones) and --keep how many frames a layered or latent
+model keeps when its window slides (default three quarters of each model's
+window; the pixel model's history is a ring, never re-encoded:
+models/dynamics.py TemporalCache).
+
+Inference (the toolbar's second row; a change starts the game and the dreams again): the pixel models'
+settings measured by the 2026-10-30 tests (models/decoding.py): 4 Halton passes a frame (slow, accurate: lost and
+morphed pieces cut 3-4x) and unsure patches (< 0.99) hidden from the history. --policy: a policy head (models/policy_head.py, scripts/policy_probe.py) trained
+on the --runs model; the controller Head then has each dream play itself, from the head reading that dream's
+newest frame: a chunk head's chunk, its first presses played before the next; a per-frame head's press each frame
+(the real game goes on with the bot, for reference).
 
 Keys: arrows move and soft-drop, X / Z rotate, Enter is Start, Right Shift is
 Select (with the controller on You). S taps Start into the dreams alone: a dream that has topped out before
@@ -41,7 +55,6 @@ import sys
 import threading
 import time
 import tkinter as tk
-import traceback
 from pathlib import Path
 from tkinter import ttk
 
@@ -52,11 +65,13 @@ from PIL import Image, ImageTk
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from token_world.data.model_frames import BORDER_VERSION, GAME_ROWS
+from token_world.data.model_frames import BORDER_VERSION, GAME_ROWS, border_slots
 from token_world.data.tetris_bot import A, B, DOWN, LEFT, RIGHT, SELECT, START, UP
 from token_world.data.nes_palette import tetris_palette
 from token_world.data.real_tetris import game_start, start_context
 from token_world.diagnostics.worlds import World, load
+from token_world.models.policy_head import Player, load_head
+from token_world.ui.check_window import crash, tk_catch_callbacks
 
 KEYS = {"Left": LEFT, "Right": RIGHT, "Down": DOWN, "Up": UP, "x": A, "X": A, "z": B, "Z": B,
         "Return": START, "Shift_R": SELECT}
@@ -66,25 +81,73 @@ BG = "#15151c"
 
 
 MIN_STEPS = 20_000                              # long-trained runs only
+WARMUP = 64                                     # SMB: frames the bot plays from the level's start before dreaming
 
 
-def runs_with_checkpoints() -> list[Path]:
-    """Long-trained Tetris world-model runs (train_dynamics_ui.py, train_layered.py) on the current frame
+def runs_with_checkpoints(game: str = "tetris") -> list[Path]:
+    """Long-trained world-model runs of `game` (train_dynamics_ui.py, train_layered.py) on the current frame
     layout: a checkpoint, a run config naming the game and BORDER_VERSION (or a layered model's), and at
-    least MIN_STEPS steps."""
+    least MIN_STEPS steps; the most recently saved last."""
     runs = []
-    for checkpoint in (ROOT / "output").glob("*/model_latest.pt"):
+    for checkpoint in [*(ROOT / "output").glob("*/model_latest.pt"), *(ROOT / "output").glob("*/*/model_latest.pt")]:
         run = checkpoint.parent
         config, metrics = run / "run_config.json", run / "metrics.csv"
         if not (config.is_file() and metrics.is_file()):
             continue
         c = json.loads(config.read_text())
-        if (c.get("border") != BORDER_VERSION and c.get("kind") != "layered") or "tetris" not in c.get("games", []):
+        if (c.get("border") != BORDER_VERSION and c.get("kind") != "layered") or game not in c.get("games", []):
             continue
         last = metrics.read_text().strip().splitlines()[-1].split(",")[0]
         if last.isdigit() and int(last) >= MIN_STEPS:
             runs.append(run)
-    return sorted(runs)
+    return sorted(runs, key=lambda r: (r / "model_latest.pt").stat().st_mtime)
+
+
+class RealSmb:
+    """Super Mario Bros. in World NES for the app: a game of the training bot (or you) from a level's start, with
+    the last frames' pictures, two layers, incoming buttons and motion codes (what a dream starts from)."""
+
+    def __init__(self, seed: int, stage: tuple[int, int], context: int):
+        from collections import deque
+        from token_world.data.world_nes_smb import SmbGame, smb_palette
+        self.game = SmbGame(seed, sprites=True)
+        self.game.start_level(*stage)
+        self.slots = border_slots(smb_palette())
+        self.pictures, self.layers, self.actions, self.motion = (deque(maxlen=context) for _ in range(4))
+        self.game.step()                                  # loads the level's start
+        self._observe(0)
+        for _ in range(WARMUP):
+            self.step(None)
+
+    def _observe(self, action: int) -> np.ndarray:
+        from token_world.data.nes_layers import TWO_LAYER_REGIONS, two_layers
+        from token_world.data.smb_motion import GRID, UNKNOWN, frame_motion
+        from token_world.data.world_nes_smb import smb_model_frame
+        o = self.game.observation
+        x = smb_model_frame(o, self.game.tick, self.slots)
+        self.motion.append(frame_motion(self.pictures[-1], x) if self.pictures
+                           else np.full((GRID, GRID), UNKNOWN, np.uint8))
+        self.pictures.append(x)
+        self.layers.append(two_layers(x, {k: o.regions[k] for k in TWO_LAYER_REGIONS}))
+        self.actions.append(action)
+        return x
+
+    def step(self, action: int | None) -> tuple[np.ndarray, int]:
+        """One frame with `action` (None: the bot's) -> (model frame [256, 256], the action)."""
+        action, jumped = self.game.step(action)
+        if jumped:                                        # a retry or level start: a new history
+            for history in (self.pictures, self.layers, self.actions, self.motion):
+                history.clear()
+        return self._observe(action), action
+
+    def new_bot(self) -> None:
+        """The bot takes over again (its session carries on)."""
+
+    def context(self) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """The last frames: pictures [T, 256, 256], layers [T, 2, 256, 256], incoming buttons [T], motion [T, 32, 32]
+        (SMB's codes)."""
+        return (np.stack(self.pictures), np.stack(self.layers), np.array(self.actions, np.int64),
+                np.stack(self.motion))
 
 
 def run_label(run: Path) -> str:
@@ -92,15 +155,21 @@ def run_label(run: Path) -> str:
     return run.name if run.is_dir() else f"{run.parent.name} @ {run.stem.removeprefix('model_step')}"
 
 
+def run_args(run: Path) -> dict:
+    """A run's (folder or checkpoint file) saved args."""
+    if run.is_dir():
+        return json.loads((run / "run_config.json").read_text())
+    return torch.load(run, map_location="cpu", weights_only=False)["args"]
+
+
 def window(run: Path) -> int:
     """The frames a run (folder or checkpoint file) was trained on."""
-    if run.is_dir():
-        return json.loads((run / "run_config.json").read_text())["frames"]
-    return torch.load(run, map_location="cpu", weights_only=False)["args"]["frames"]
+    return run_args(run)["frames"]
 
 
-def load_model(run: Path) -> tuple[World, str]:
+def load_model(run: Path, motion_steps: int) -> tuple[World, str]:
     world = load(run)
+    world.model.motion_steps = motion_steps               # a motion-first model's decoding (as the browser: 1)
     params = sum(p.numel() for p in world.model.parameters()) / 1e6
     kind = "layered, committed" if world.layered else "latent, sampled" if world.latent else "soft"
     where = f"{run.name} @ {world.step}" if run.is_dir() else run_label(run)
@@ -142,19 +211,31 @@ class Dream:
     def __init__(self, run: Path, world: World, name: str, keep: int):
         self.run, self.world, self.name, self.keep = run, world, name, keep
         self.dreamer, self.dreamed, self.wrong, self.wrong_sum = None, 0, 0.0, 0.0
+        self.pressed = 0                                   # its last press (the Head controller)
+        self.player = None                                 # the head's presses for this dream (policy_head.Player)
 
 
 class Engine(threading.Thread):
     """Runs the real game and every dream in lockstep; publishes one composed image per frame."""
 
-    def __init__(self, runs: list[Path], keep: int | None, palette: np.ndarray, scale: int, seed: int):
+    def __init__(self, runs: list[Path], keep: int | None, palette: np.ndarray, scale: int, seed: int,
+                 motion_steps: int = 1, game: str = "tetris", stage: tuple[int, int] = (0, 0),
+                 policy: Path | None = None):
         super().__init__(daemon=True)
-        self.runs, self.keep, self.seed = runs, keep, seed
+        self.policy, self.head = policy, None
+        self.options = {"steps": 1, "past": None}                       # models/decoding.py OptionDreamer
+        decode = run_args(runs[0]).get("decode") if runs else None
+        if decode:                                     # the first model's own (Dynamics.decode): its tests' way
+            self.options = {"steps": decode.get("steps", 1), "past": decode.get("past")}
+        self.choices = torch.Generator(device="cuda").manual_seed(seed)
+        self.runs, self.keep, self.seed, self.motion_steps = runs, keep, seed, motion_steps
+        self.game, self.stage = game, stage
         self.palette = palette
         self.colours = torch.as_tensor(palette, dtype=torch.float32, device="cuda")
         self.composer = Composer(palette, scale, 1 + len(runs))
         self.commands: queue.Queue = queue.Queue()
         self.keys: set[int] = set()
+        self.tapped: set[int] = set()                      # pressed since the last frame read the keys
         self.keys_lock = threading.Lock()
         self.lock = threading.Lock()
         self.version, self.image, self.stats = 0, None, {"status": "starting"}
@@ -165,12 +246,18 @@ class Engine(threading.Thread):
 
     # -- called from the UI thread ------------------------------------------------------------
     def buttons(self) -> int:
+        """The next frame's byte: the keys held, and any pressed since the last frame read them (2026-11-01: a
+        tap shorter than a frame never reached the game or the model; now it gets one frame)."""
         with self.keys_lock:
-            return sum(self.keys)
+            byte = sum(self.keys | self.tapped)
+            self.tapped.clear()
+            return byte
 
     def press(self, button: int, down: bool) -> None:
         with self.keys_lock:
             (self.keys.add if down else self.keys.discard)(button)
+            if down:
+                self.tapped.add(button)
 
     def latest(self):
         with self.lock:
@@ -185,32 +272,45 @@ class Engine(threading.Thread):
             self.stats.update(stats)
 
     def load(self) -> None:
-        """Every model in --runs; one that fails to load is left out, and the status says why."""
-        failed = []
+        """Every model in --runs (one that fails to load crashes the app, check_window.crash)."""
         for run in self.runs:
             self.publish(None, status=f"loading {run_label(run)} ...")
-            try:
-                world, name = load_model(run)
-            except Exception as exc:
-                failed.append(f"{run_label(run)}: {exc}")
-                continue
+            world, name = load_model(run, self.motion_steps)
             self.dreams.append(Dream(run, world, name, self.keep or window(run) * 3 // 4))
-        if not self.dreams:
-            raise RuntimeError("no model loaded: " + "; ".join(failed))
-        self.publish(None, failed="; ".join(failed))
+        if self.policy is not None:
+            self.head = load_head(self.policy, "cuda")
 
     def restart(self) -> None:
         """The real game back at its start (game_start, the same one every time) and every dream anew from its
         frames, as the browser starts."""
-        self.publish(None, status="starting a new game (the bot plays the menus) ...")
-        self.real = game_start(self.seed)
-        frames, actions, layers = start_context(self.real)
         for d in self.dreams:
             d.dreamer = None
         torch.cuda.empty_cache()
-        for d in self.dreams:
-            d.dreamer = d.world.dreaming(frames, actions, layers if d.world.layered else None, d.keep,
-                                         change_weight=self.change_weight)
+        if self.game == "smb":
+            from token_world.data.motion_vocab import to_vocabulary
+            w, l = self.stage
+            self.publish(None, status=f"starting {w + 1}-{l + 1} (the bot plays {WARMUP} frames) ...")
+            self.real = RealSmb(self.seed, self.stage, max(d.keep for d in self.dreams))
+            pictures, layers, actions, motion = self.real.context()
+            for d in self.dreams:
+                model = d.world.model
+                codes = (to_vocabulary(torch.from_numpy(motion), "smb", model.motion_codes).numpy()
+                         if getattr(model, "motion", False) else None)
+                d.dreamer = d.world.dreaming(layers if getattr(model, "two_layers", False) else pictures, actions,
+                                             None, d.keep, change_weight=self.change_weight, motion=codes,
+                                             options=self.options)
+                d.dreamed, d.wrong, d.wrong_sum = 0, 0.0, 0.0
+            self.publish(None, status="dreaming")
+            return
+        self.publish(None, status="starting a new game (the bot plays the menus) ...")
+        self.real = game_start(self.seed)
+        frames, actions, layers, twos = start_context(self.real)
+        for d in self.dreams:                              # a two-layer model starts from the two layers
+            start = twos if getattr(d.world.model, "two_layers", False) else frames
+            d.dreamer = d.world.dreaming(start, actions, layers if d.world.layered else None, d.keep,
+                                         change_weight=self.change_weight, options=self.options)
+            d.pressed = int(actions[-1])                   # the press that made the start's last frame
+            d.player = Player(self.head, generator=self.choices) if self.head is not None else None
             d.dreamed, d.wrong, d.wrong_sum = 0, 0.0, 0.0
         self.publish(None, status="dreaming")
 
@@ -223,6 +323,9 @@ class Engine(threading.Thread):
             self.controller = value
             if value == "bot":
                 self.real.new_bot()
+        elif name == "options":                           # the inference settings: the game starts again
+            self.options = dict(value)
+            self.restart()
         elif name == "differences":
             self.differences = not self.differences
         elif name == "dream_start":
@@ -263,32 +366,32 @@ class Engine(threading.Thread):
                     time.sleep(0.02)
                     continue
                 started = time.monotonic()
-                frame, action = self.real.step(None if self.controller == "bot" else self.buttons())
-                if self.dream_start:                       # the dreams get Start, the real game does not
-                    self.dream_start -= 1
-                    action_dreamed = action | START
-                else:
-                    action_dreamed = action
-                image = self.composer.compose(frame, [self.step(d, frame, action_dreamed) for d in self.dreams],
+                frame, action = self.real.step(None if self.controller in ("bot", "head") else self.buttons())
+                start = START if self.dream_start else 0  # the dreams get Start, the real game does not
+                self.dream_start = max(self.dream_start - 1, 0)
+                for d in self.dreams:                      # each dream's press: the real game's, or its head's
+                    d.pressed = (int(d.player.press(d.dreamer.newest(), torch.tensor([d.pressed], device="cuda"))[0])
+                                 if self.controller == "head" else action) | start
+                image = self.composer.compose(frame, [self.step(d, frame, d.pressed) for d in self.dreams],
                                               self.differences)
                 fps_frames += 1
                 if time.monotonic() - fps_since >= 1:
                     fps, fps_frames, fps_since = fps_frames / (time.monotonic() - fps_since), 0, time.monotonic()
                 self.publish(image, fps=fps, action=action, controller=self.controller,
-                             scores=[(d.dreamed, d.wrong, d.wrong_sum / max(d.dreamed, 1)) for d in self.dreams])
+                             scores=[(d.dreamed, d.wrong, d.wrong_sum / max(d.dreamed, 1), d.pressed)
+                                     for d in self.dreams])
                 spare = 1 / self.fps_cap - (time.monotonic() - started)
                 if spare > 0:
                     time.sleep(spare)
-        except Exception as exc:
-            traceback.print_exc()
-            self.publish(None, status=f"error: {exc}")
+        except BaseException:
+            crash(title="play_world_model")
 
 
 class App:
     def __init__(self, root: tk.Tk, engine: Engine):
         self.root, self.engine = root, engine
         self.shown = 0
-        root.title("Tetris: real game vs world models")
+        root.title(f"{'Super Mario Bros.' if engine.game == 'smb' else 'Tetris'}: real game vs world models")
         root.configure(bg=BG)
         style = ttk.Style(root)
         style.theme_use("clam")
@@ -310,7 +413,7 @@ class App:
                     command=lambda: self.send("fps", self.fps.get())).pack(side="left", padx=(6, 16))
         ttk.Label(bar, text="Controller").pack(side="left")
         self.controller = tk.StringVar(value=engine.controller)
-        for text, value in (("Bot", "bot"), ("You", "you")):
+        for text, value in (("Bot", "bot"), ("You", "you")) + ((("Head", "head"),) if engine.policy else ()):
             ttk.Radiobutton(bar, text=text, value=value, variable=self.controller, takefocus=False,
                             command=lambda: self.send("controller", self.controller.get())).pack(side="left", padx=4)
         ttk.Button(bar, text="Restart (R)", takefocus=False,
@@ -320,6 +423,17 @@ class App:
         ttk.Button(bar, text="Dreams / differences (D)", takefocus=False,
                    command=lambda: self.send("differences")).pack(side="left", padx=4)
         ttk.Button(bar, text="Pause (Space)", takefocus=False, command=lambda: self.send("pause")).pack(side="left", padx=4)
+
+        inference = ttk.Frame(root, padding=(10, 0, 10, 6))
+        inference.pack(fill="x")
+        ttk.Label(inference, text="Inference (restarts the game):").pack(side="left")
+        self.steps = tk.IntVar(value=engine.options["steps"])
+        for text, value in (("1 pass (browser)", 1), ("4 Halton passes (slow, accurate)", 4)):
+            ttk.Radiobutton(inference, text=text, value=value, variable=self.steps, takefocus=False,
+                            command=self.send_options).pack(side="left", padx=4)
+        self.hide = tk.BooleanVar(value=engine.options["past"] is not None)
+        ttk.Checkbutton(inference, text="Hide unsure patches (< 0.99) from the history", variable=self.hide,
+                        takefocus=False, command=self.send_options).pack(side="left", padx=(12, 4))
 
         c = engine.composer
         titles = ["Real game (World NES)"] + [run_label(r) for r in engine.runs]
@@ -335,14 +449,19 @@ class App:
         ttk.Label(root, textvariable=self.status, style="Status.TLabel", padding=(10, 6), font=("Consolas", 10),
                   justify="left").pack(fill="x")
         ttk.Label(root, style="Status.TLabel", padding=(10, 0, 10, 8),
-                  text="Arrows move / soft-drop, X / Z rotate, Enter = Start, Right Shift = Select (controller You)"
+                  text=("Arrows move, X jump (A), Z run (B)" if engine.game == "smb" else
+                        "Arrows move / soft-drop, X / Z rotate") + ", Enter = Start, Right Shift = Select (controller You)"
                        "   |   S Start into the dreams, R restart, D dreams / differences, Space pause, Esc quit").pack(fill="x")
 
         root.bind("<KeyPress>", lambda e: self.key(e, True))
         root.bind("<KeyRelease>", lambda e: self.key(e, False))
         root.protocol("WM_DELETE_WINDOW", self.quit)
+        tk_catch_callbacks(root)
         self.canvas.focus_set()
         self.poll()
+
+    def send_options(self) -> None:
+        self.send("options", {"steps": self.steps.get(), "past": 0.99 if self.hide.get() else None})
 
     def send(self, *command) -> None:
         self.engine.commands.put(command)
@@ -376,9 +495,9 @@ class App:
                      + (f"   |   {stats['status']}" if stats.get("status") not in (None, "dreaming") else "")]
             width = max(len(d.name) for d in self.engine.dreams)
             lines += [f"{d.name:{width}s}   {dreamed:>6,} frames   pixels wrong now {wrong:6.2%}   mean {mean:6.2%}"
-                      for d, (dreamed, wrong, mean) in zip(self.engine.dreams, stats["scores"])]
-            if stats.get("failed"):
-                lines.append("not loaded: " + stats["failed"])
+                      + (f"   head presses: {' '.join(n for n, b in BUTTON_NAMES if pressed & b) or '-'}"
+                         if stats["controller"] == "head" else "")
+                      for d, (dreamed, wrong, mean, pressed) in zip(self.engine.dreams, stats["scores"])]
             self.status.set("\n".join(lines))
         else:
             self.status.set(stats.get("status", ""))
@@ -395,18 +514,32 @@ def main():
                    help="the models, run folders or checkpoint files, any steps; all dream at once "
                         "(default: the latest run with MIN_STEPS steps)")
     p.add_argument("--keep", type=int, default=None,
-                   help="frames kept when a window slides (default: three quarters of each model's window)")
+                   help="frames a layered or latent model keeps when its window slides (default: three quarters "
+                        "of each model's window; the pixel model's history is a ring)")
     p.add_argument("--scale", type=int, default=None, help="pixels per NES pixel (default: what fits the screen)")
     p.add_argument("--seed", type=int, default=0, help="the game start (0: the browser's, scripts/export_onnx.py)")
+    p.add_argument("--motion-steps", type=int, choices=(1, 2), default=1,
+                   help="a motion-first model's motion decoding: 1 step (as the browser) or 2")
+    p.add_argument("--game", choices=("tetris", "smb"), default="tetris")
+    p.add_argument("--stage", default="1-1", help="smb: the level the game starts at (world-level)")
+    p.add_argument("--policy", type=Path, default=None,
+                   help="a policy head trained on the --runs model (scripts/policy_probe.py policy_head.pt): adds "
+                        "the controller Head, each dream playing itself")
     args = p.parse_args()
-    runs = [r.resolve() for r in args.runs] if args.runs else runs_with_checkpoints()[-1:]
+    runs = [r.resolve() for r in args.runs] if args.runs else runs_with_checkpoints(args.game)[-1:]
     if not runs:
-        p.error(f"no run on this frame layout has {MIN_STEPS:,} steps yet; pass --runs")
-    palette = tetris_palette().cpu().numpy().astype(np.uint8)
+        p.error(f"no {args.game} run on this frame layout has {MIN_STEPS:,} steps yet; pass --runs")
+    world, level = (int(v) - 1 for v in args.stage.split("-"))
+    if args.game == "smb":
+        from token_world.data.world_nes_smb import smb_palette
+        palette = smb_palette().cpu().numpy().astype(np.uint8)
+    else:
+        palette = tetris_palette().cpu().numpy().astype(np.uint8)
     root = tk.Tk()
     panels = 1 + len(runs)
     scale = args.scale or max(1, min(3, (root.winfo_screenwidth() - 40) // (panels * (256 + 12))))
-    engine = Engine(runs, args.keep, palette, scale, args.seed)
+    engine = Engine(runs, args.keep, palette, scale, args.seed, args.motion_steps, args.game, (world, level),
+                    args.policy)
     App(root, engine)
     engine.start()
     root.mainloop()

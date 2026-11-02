@@ -2065,3 +2065,904 @@ PyTorch in onnxruntime (Python and node) and within 2 per colour value in Chrome
 41 ms a step in the check, 44-76 ms while playing (12-18 frames/s); a step is about 2,400 kernels (two passes
 of nine layers), onnxruntime-web's dispatch the limit. Files 37.7 MB (the local bias folded into a constant
 table in each graph). The image start now builds model frames (web/screenshot.js), with no piece marking.
+
+## Pieces that lock in the air (2026-10-18)
+
+**What the user saw (the website, s9_cool140 152k):** "the model frequently will snap the piece to the ground"
+and a piece "snapped to another piece on the side like 1 block from the ground and stopped": a lock with
+nothing under the piece.
+
+**The data (scratchpad landing_census.py, 3,000 windows of the training stream):** at levels 0-4 1% of
+landings come by gravity (6 of 562; 0.1 per 1,000 play frames against 9.7 soft-dropped), 7% of rows fallen;
+levels 5-9 11%, levels 10-18 36%. The patient perfect brain waits 30-180 frames and then soft-drops (at level
+0 a row is 48 frames: a hover of 0-3 rows, then a snap to the floor: 36 such pieces); the holding brain, the one
+that never presses Down, plays only short games, a quarter of their time, a quarter of them at levels 0-4. So
+the model has hardly seen a lined-up piece pass a stack's side slowly and land by gravity at a slow level.
+
+**The score:** `floating` (diagnostics/play.py locks, `floating_long` in the long dreams from the next run): a
+piece followed from its spawn through its moves; at the next spawn or a clear it has locked, and rested on
+something if a cell is on the floor or on a block directly below that is not its own. Real play: 337 locks
+judged in 63,000 stream frames, 0 floating (resets, where the board empties mid-fall, are not judged).
+
+**s9_cool140 152k:** 0 floating in the trainer's trials (108 locks judged without buttons, 166 with the bot's;
+s9 140k 1 of 143); 0 in 48 trials at levels 0-4 where the holding brain lines each piece up and lets gravity
+take it (16 locks judged with one motion step, 15 with two; the real futures 20). Not reproduced by the bot:
+the user's case needs what a person does that the bot does not, or is rarer than these trials can show.
+
+## Super Mario Bros. at s9's size, from scratch (`world_model_smb_s9`, 2026-10-18)
+
+**Why:** the user, 2026-10-18: Tetris is good enough for now. Build and train an SMB model with the SMB bot,
+then come back to Tetris with what we learn. Use the model we just trained, s9, at its size from the start,
+with no s3 stage first.
+
+**Model:** s9's shape and flags, the same as `world_model_tetris_s9_stack`: dim 96, 9 layers, 4 heads, patch 16,
+colour 16, 64 frames. Motion in and out with motion first, local bias, rotary space, QK-norm and actnorm.
+Learning rate 3e-4 with 1,000 warm-up steps, weight decay 0.05, 16 histories, a window every 16 frames. Fresh
+weights.
+
+The motion vocabulary is SMB's (data/smb_motion.py). For each 8 x 8 cell, the code is the pixel offset its
+picture came from in the frame before: dy up to 6, dx up to 4, 118 codes. Tetris's are 46 cell moves.
+
+**Data:** `WorldNesSmbStreams` with the bot as of tonight:
+- the perfect brain is the beam-search planner, picking at random among near-best plans, and now chasing ? blocks
+  and power-ups;
+- after a death has been shown, it retries from a save state 2-5 s back (at most 3 times per spot);
+- half of new games start at the level the worker has played least;
+- the walker, collector, random and idle brains are mixed in.
+
+The planner clears 17 of 32 levels cold, but with level starts every level is played.
+
+There are no long dreams and no live event scores: those tests are Tetris's. The curves, previews, horizon
+errors and archive at every 2,000 steps run as usual.
+
+**Predictions (before launch):**
+1. Data keeps up: one worker makes about 67 new frames/s, 16 make about 1,000; s9 trains at about 1.35 steps/s,
+   256 new frames a step. Mean data wait under 20 ms.
+2. Scrolling first. Moved cells are 13% of picture cells, and most of them are the screen scrolling 1-3 pixels
+   left. Right-on-moved at or above 0.8 by 10k steps; error on changed pixels at h1 falls fastest early.
+3. Mario's own motion and the enemies (a few cells a frame) come after the scroll: h4 and h16 changed-pixel
+   errors keep falling past 20k.
+4. Rare things are last: deaths, pipes, power-ups growing Mario, level starts after an intermission.
+
+**s9 result (stopped at 17,148 steps, 07:14 on 2026-10-19; resumable).** Changed pixels wrong at +1 / +4 / +16
+fell from 0.90 / 0.88 / 0.87 (0-1k) to 0.25 / 0.37 / 0.57 (16-17k). The last 4k steps were the best stretch,
+and it was still falling. Moved cells right: 0.94 in training (masked), 0.42 in its own preview frames (0.12 at
+10k). Border wrong at +16: 0.0003.
+
+The data covered every world: world 1 in 24% of windows, the others 5-15% each. 50% of windows were the perfect
+brain's and 11% reckless; deaths in about 3%, power-ups in about 1%.
+
+Predictions:
+1. Data keeps up: failed. Each step waited about 550 ms.
+2. Scroll first: held, 0.85 moved right by 4k.
+3. Later horizons still falling: held.
+
+Speed fell from 1.19 to 0.45 steps/s. Two causes, both fixed:
+- **The motion target** cost 12.7 ms a frame: a cell nothing matched cost the whole frame for each of the 116
+  offsets. Only changed cells are searched now; the same codes on 630 live frames, 1.3 ms. One worker went from
+  49 to 124 new frames/s.
+- **The coherence patch bank** re-sorted 1.1M patches and 2.4M changes every 16 steps on the training thread:
+  1.3 s a step by 17k. It only serves the long dreams, which are Tetris's, so SMB runs keep none now.
+
+## SMB at s3's size (`world_model_smb_s3`, 2026-10-19)
+
+**Why:** the user, after the s9 trends: s9 learns but slowly; try s3 and make it faster. The same flags and data
+as s9 with 3 layers (Tetris s3: 1.67 steps/s, 426 new frames/s), with the two speed fixes above.
+
+**Predictions (before launch):**
+1. Data wait under 50 ms a step, and steps/s flat over the run (no growing per-step cost): 16 workers at about
+   124 frames/s against 426 needed.
+2. At the same step, s3 is behind s9 on +16 (fewer layers) but ahead per hour of training. s9 reached +1 0.50 /
+   +16 0.76 at 8-10k: s3 gets there by 10k too, in under half the time.
+3. Moved cells right in training above 0.9 by 6k, as s9.
+
+## SMB s3 stacked 3x (`world_model_smb_s9_stack`, from smb_s3 44k, 2026-10-19)
+
+**Why:** the user, 2026-10-19: start s9 now, from 44k. s3's long-dream rungs were flat across its first four
+tests (44-52k):
+- the camera holds about 55 frames with buttons;
+- Mario holds about 4 frames;
+- Mario kept at +64 is 0.09-0.14;
+- the scene holds all 512 frames.
+
+The previews are still improving slowly. The standing rule: grow from a checkpoint before the flat stretch, not
+the plateau one (G_stack: earlier growth does better). 44k is the first long-dream test; there is none before it.
+
+**Recipe:** as Tetris s9_stack:
+- G_stack, [b0 b1 b2] x 3;
+- the trained weights with each block's AdamW state;
+- the learning rate 3e-4 and the step count carried on, no new warmup.
+
+The same flags and data as smb_s3: motion first, local bias, rotary space, QK-norm, actnorm; 8 spare workers,
+prefetch 8. The SMB long dreams run every 2,000 steps.
+
+**Predictions (before launch):**
+1. A loss spike at the growth that recovers within about 1k steps (stacking breaks function preservation).
+2. By 56k (12k after the growth), Mario holds longer than s3 at the same steps: Mario kept at +64 above 0.2, held
+   Mario above 4 frames. The camera holds past s3's 56 frames.
+3. The scene still holds all 512 frames.
+4. About 1.2-1.5 steps/s (Tetris s9: 1.35), the data keeping up.
+
+**Result (stopped at 70.6k, 2026-10-19):**
+1. The spike recovered by 46k: confirmed.
+2. Wrong on Mario, wrong on the camera:
+   - Mario still holds a median of 4 frames;
+   - Mario kept at +64 is 0.16-0.18 (s3 at 54k: 0.15);
+   - the camera holds 56 frames with buttons, as s3 at every test. That is likely the moment the real camera
+     has moved 8 px, so the dream camera never scrolls.
+3. Confirmed, and better than s3: scene wrong at +64 is 0.012-0.013 against 0.017-0.018.
+4. 1.5-1.6 steps/s: confirmed.
+
+Stopped for the short-history run below.
+
+## SMB s3 on a 4-frame history (`world_model_smb_s3_h4`, 2026-10-19)
+
+**Why:** the user, 2026-10-19: the scrolling will make copying hard for a long time, so pretrain on a short
+history first ("like 4 frames"). What failed in the long dreams is short-range:
+- the camera following the buttons;
+- Mario staying whole from one frame to the next.
+
+Short context is standard: DIAMOND conditions on 4 frames, and sequence-length warmup speeds early language-model
+training. Time is rotary, so the history can grow to 64 frames afterwards.
+
+**Recipe:** smb_s3 from scratch, every flag the same, with `--frames 65 --history 5`:
+- each 65-frame window is cut into 16 five-frame pieces that share a frame (`pieces()` in train_dynamics_ui.py);
+- every frame but a window's first is predicted once, from 1-4 frames before it: 4 frames of history, as DIAMOND;
+- the model's own window is 5 frames, and dreams keep its 4-frame history (Dreamer: a SHORT_WINDOW model keeps
+  all but one frame).
+
+A 4-frame piece, the first try, could not train: torch.compile's backward for the fused attention kernel got the
+gradient layout of short sequences wrong. That happens at 4 and at 5 frames. Windows of up to SHORT_WINDOW (8)
+frames now use plain softmax attention in time, which matches the fused kernel to within 1e-7. A 5-frame piece is
+the 4-frame history the user asked for.
+
+**Baseline:** s3's archived checkpoints re-scored every 10k on the same 16 games the trainer uses (seed 43; the
+current bot, with its per-life styles and level starts; run folder's rescored_long_dream.csv). These games are
+harder than the ones in s3's own tests (castles 6-4 and 7-1 among them; standing still there kills Mario), so the
+numbers differ from those. Median frames held, and scores by horizon, with buttons:
+
+| step | camera held | Mario held | scene wrong +64 | Mario kept +16 |
+|---|---|---|---|---|
+| 10k | 10 | 1 | 0.047 | 0.18 |
+| 20k | 19 | 1 | 0.029 | 0.27 |
+| 30k | 18 | 2 | 0.026 | 0.29 |
+| 40k | 16 | 3 | 0.025 | 0.30 |
+| 50k | 22 | 3 | 0.022 | 0.35 |
+
+**Predictions (before results):**
+1. About 2 steps/s, GPU-bound: each step encodes 1.6x the frames of s3's (measured 2.15 at 600 steps).
+2. Ahead of s3 at the same step on the short-range scores, with buttons:
+   - by 20k, Mario kept at +16 above s3's 0.27 and Mario held above 1 frame;
+   - camera held above s3's 19.
+3. Behind or level with s3 on the scene at +64 (no long history to copy from), within 0.01.
+4. What would make it worth keeping: by 30k it beats s3 at 50k on Mario kept at +16 (0.35), in under half
+   s3's steps. Then grow the history to 65 frames from an earlier checkpoint while it is still rising.
+
+## The short-history design, revised (2026-10-19/20)
+
+The 5-frame pieces of `world_model_smb_s3_h4` became a banded temporal mask (`--history`, Dynamics `history`):
+- whole windows, each frame attending to itself and the 4 frames before it;
+- no duplicated frames;
+- `_banded` scores only those keys (frames x 5, not frames^2: a masked full attention over 300-frame windows filled
+  the card).
+
+Batch rows come from any of the game workers (LiveBatches any_worker, `--rows`). The one-per-worker rule held the
+other workers' pinned windows without bound while it waited on a slow stream: 10 GB with 8 workers.
+
+**`world_model_smb_s3_band5`** (16 workers, 10 rows x 96 frames, fresh): tracked s3 step for step through 32k.
+
+**`world_model_smb_s3_band5_big`** (8 workers, 16 rows x 96 frames = 1,536 a step, fresh): 1.87 steps/s.
+- Slow before 16k: the motion signal sat at 0.03-0.05, where band5 had 0.15-0.30.
+- From 30k its long dreams with buttons beat s3 at the same step. At 40k:
+  - Mario held 5 frames against s3's 3;
+  - Mario kept at +64 0.11 against 0.03;
+  - sprites kept 0.08 against 0.04;
+  - camera lag 33 px against 41.
+- Flat from ~40k to 64k (camera ~23, Mario 3-6, kept +16 0.36-0.39, +64 0.09-0.12).
+- Previews stayed slightly behind s3's per step.
+
+## SMB s9 stacked from the big-batch s3 (`world_model_smb_s9_band5`, from s3_band5_big 30k, 2026-10-20)
+
+**Why:** the user, 2026-10-20: grow to s9 from around 30k (before the plateau at ~40k, while the button dreams were
+still rising: G_stack's earlier-is-better).
+
+**History unchanged at 5.** No precedent joins depth growth and context growth in one step, so the history gets its
+own stage at s9's plateau. On how much history matters: GameNGen's ablation shows 4, 8 and 16 frames nearly equal
+and 64 only slightly better, DIAMOND uses 4, and band5 matched s3 with 64.
+
+**Recipe:** G_stack 3x of the 30k weights with their AdamW state, step and learning rate carried on. 14 rows x 64
+frames (896 a step), 8 workers. At 16 rows the card filled and spilled 1.5 GB into shared memory: 2 steps in 10
+minutes.
+
+**Predictions:**
+1. About 1.0 steps/s (measured 1.03 at 30.4k).
+2. A loss spike at the growth, gone within ~1k steps.
+3. By 40k (10k after the growth) it passes the s3 line's plateau on the button dreams:
+   - Mario kept at +64 above 0.12;
+   - Mario held above 6 frames;
+   - camera held above 24 frames.
+   It was the s3_band5_big run that went flat at 40k, so s9 at 40k beating 0.12 is the test.
+4. The scene improves the most, as in the first SMB s9_stack.
+
+**Result to 52.9k, history 5 (2026-10-20):**
+- The 40k prediction failed: camera 22, Mario 6, Mario kept at +64 0.09, against more than 24, 6 and 0.12.
+- Against the s3 line at the same steps:
+  - the scene is clearly better (wrong at +64 0.017-0.019 against 0.020-0.028);
+  - Mario kept at +16 rose test by test, 0.35 to 0.41 (s3 line 0.35-0.39);
+  - Mario held a steady 6;
+  - Mario kept at +64, the sprites and the camera stayed level.
+- The motion signal held at 0.28-0.42.
+- Context for "flat": s9 had trained 22.9k steps (about 20 M frames) of its own. Tetris s9 had 104k steps (about
+  106 M frames) before its best (cool140), and improved for ~90k steps after its grow.
+
+**Full attention in time from 52,930 (the user, 2026-10-20).** With a band, each layer sees only 4 frames back, so
+information from further back reaches a frame only by being relayed layer to layer through the frames between. That
+spends depth on carrying information forward in time rather than on processing it (the user's reasoning). Full
+causal attention over the window is the standard (Genie, GameNGen, Oasis, our Tetris models) and costs ~1% of a
+step at 64 frames. The band bought nothing measurable: band5 matched the full-window s3.
+
+Continued from the latest checkpoint with `--history` unset:
+- the loss jumped to 0.28 on the first step and was back to 0.04 within 270 steps;
+- 16 GB on the card against 21-22 GB with the band (the fused causal kernel beats the banded einsum on memory too).
+
+**Prediction:** within ~10k steps, Mario kept at +64 and the sprites rise above the history-5 line (0.08-0.11 and
+0.05-0.09), the first scores the band never moved. The scene stays at its level.
+
+**Result with full attention, 52.9k to 100k** (pressed long dreams, 16 trials each; noise about ±0.04 on Mario kept, ±0.02 on sprites):
+
+| steps | camera held | Mario held | lag +64 | Mario kept +16 | Mario kept +64 | sprites kept +64 |
+|---|---|---|---|---|---|---|
+| 44-52k (history 5) | 33 | 7-9.5 | 34 | 0.38-0.41 | 0.08-0.11 | 0.05-0.09 |
+| 54k (the switch) | 20 | 3 | 45 | 0.23 | 0.00 | 0.04 |
+| 58-66k | 32-34 | 7-9 | 35 | 0.38-0.40 | 0.09-0.10 | 0.07-0.08 |
+| 68-80k | 33-38 | 8-11.5 | 29-35 | 0.43-0.49 | 0.12-0.15 | 0.08-0.12 |
+| 82-100k | 32-39 | 9-11.6 | 27-36 | 0.43-0.49 | 0.10-0.20 | 0.08-0.13 |
+
+- The prediction came true late: it took 15k steps, not 10k. To 66k the model only recovered from the switch. From 68k Mario kept at
+  +64 and the sprites passed the history-5 line, and by 80k Mario kept at +16 was 0.47-0.49.
+- Flat-ish from ~76k, but still noisy upward (96k: Mario kept at +64 0.20). The scene stayed at 0.013-0.016.
+- The user stopped it at 100,000 and saw the cause in the dreams: sprites in front of coins, blocks and background
+  pieces break up. A pixel has one colour, so it can hold only one of the two, and the model has to get both back
+  from history. Scrolling it can learn; an overlap it cannot represent.
+
+## SMB s3 on two layers, full attention (`world_model_smb_s3_layers`, fresh, 2026-10-20)
+
+**Why:** the user, 2026-10-20: "the 64 frames is 100% better also so we should start s3 again with some sort of
+sprite overlap fix and the full attention length".
+
+**The overlap fix: two layers per frame.**
+- Each frame comes as a background picture (no sprites, from the PPU background tiles through the palette RAM) and
+  a sprite picture (the sprite pixels, a TRANSPARENT colour 58 everywhere else). Sprites over background give back
+  the frame exactly: 0 wrong pixels over 3,000 frames.
+- Input: the two layers' patch embeddings are summed. The patch conv is linear, so this is the embedding of both
+  pictures at once, at the same token count.
+- Output: a second head predicts the sprite layer (59 colours with TRANSPARENT). The composed picture's
+  probabilities are `sprite[:58] + sprite[58] * background`, and dreams decode on those. The loss is the sum of the
+  two layers' masked losses.
+- Shipping is unchanged (code + weights + a start screenshot). The start screenshot gives only the picture, so it
+  enters as background + TRANSPARENT sprites, and from the next frame the model writes both layers itself.
+
+**Recipe:** s3 from scratch with full causal attention over 64-frame windows; 16 rows (1,024 frames a step); 8
+workers. The other flags are the same as s3_band5_big. No rollouts.
+
+**Predictions:**
+1. About 2 steps/s, near s3_band5_big's 1.87. Two layers double the window data, but the token count is the same.
+2. The sprite loss falls fast: the sprite layer is mostly TRANSPARENT, and sprites are a few hundred pixels.
+3. Against s3_band5_big at the same steps, from ~20k:
+   - sprites kept at +64 above its 0.08-0.12;
+   - Mario kept at +64 above its 0.09-0.12.
+   The scene and the camera stay level, because the scroll is unchanged.
+4. Mario stops breaking up in front of coins and ? blocks in the previews and dreams.
+
+**Result overnight, to 70.6k (72 M frames, 2026-10-21)** (pressed long dreams, averaged over 3 tests; the one-layer
+line is s3_band5_big, compared at the same frames seen):
+
+| frames | sprites kept +64 (one-layer) | Mario kept +64 (one-layer) | Mario kept +16 (one-layer) | Mario held (one-layer) |
+|---|---|---|---|---|
+| 14-18 M | 0.071 (0.038) | 0.015 (0.010) | 0.21 (0.16) | 2.1 (1.9) |
+| 31-35 M | 0.074 (0.049) | 0.036 (0.050) | 0.25 (0.25) | 3.1 (2.4) |
+| 49-53 M | 0.061 (0.047) | 0.048 (0.067) | 0.32 (0.33) | 4.7 (6.2) |
+| 67-72 M | 0.071 (0.076) | 0.085 (0.107) | 0.36 (0.375) | 7.9 (8.0) |
+
+1. Speed: 1.9-2.2 steps/s as predicted (about 2,000 frames/s, 170 M frames a day). 6.6 GB peak, no restarts in 9.5 h.
+2. The sprite loss fell fast as predicted, to 0.015 by 2k, and has sat at 0.009-0.012 since 20k.
+3. **Failed at the frames predicted.**
+   - Sprites kept at +64 led the one-layer line about 1.5x from 8k to 46k (8-47 M frames), so two layers learned
+     sprites sooner. It never rose above 0.06-0.09, and the one-layer line caught up by ~60 M frames.
+   - Mario kept at +64 trailed slightly the whole way. It is level now, within noise.
+   - At 72 M frames the run sits inside the one-layer line's plateau band (61-98 M frames: Mario kept +64
+     0.09-0.12, sprites 0.05-0.08), on its lower side.
+   - The scene is better: wrong at +64 0.019 against 0.024-0.028.
+4. Not judged yet: whether the dreams lose fewer sprites in front of coins and blocks. That needs the dream GIFs, not
+   these scores.
+- The losses and the plateau signal kept improving all night, and the dream scores did not follow them after about
+  60 M frames. Previews moved own frames: 0.05 at 10k, 0.25 at 40k, 0.46-0.50 at 62-72k (the one-layer line:
+  ~0.02 at 4k).
+
+**Stopped at 80,000 (81.9 M frames, 2026-10-21 09:11)** by the user's choice, to grow it. Last test (80k): pressed Mario
+kept +16 / +64 0.39 / 0.08, scene wrong +64 0.020. The plateau signal was still rising (previews moved own frames
+0.36-0.53 over 60-78k).
+
+## SMB two-layer s3 stacked 3x (`world_model_smb_s9_layers`, from s3_layers 80k, 2026-10-21)
+
+**Why:** the user, after reading the Tetris record: "take the current model and grow it to s9 then train it long".
+In Tetris the largest late gains came from exactly this path: s3_motion_local 48k stacked 3x (s9_stack), trained
+about 100k steps more, then a cooldown (cool140). Turn direction there appeared only 30-54k steps after the growth.
+The earlier SMB s9 (s9_band5) never had that: it spent 23k of its steps on a band and ran full attention for only
+47k, with no cooldown.
+
+**Recipe:** G_stack 3x of s3_layers' 80k (the trained weights with their AdamW state; the step and the learning
+rate 3e-4 carry on, no new warmup). Checked on the CPU first: every s9 weight equals its source block's, the
+sprite head included. Two layers, full causal attention, 64-frame windows, 14 rows (896 frames a step; the last
+SMB s9 spilled into shared memory at 16), 8 workers, and s3_layers' other flags. 3,182,193 parameters. No step
+limit and no cooldown yet: the cooldown waits on a plateau in the window trends.
+
+**Predictions:**
+1. About 1.0 steps/s (the one-layer s9: 1.03): about 900 frames/s, 78 M frames a day. Tetris's 156 M total is about
+   a day away (82 M already seen).
+2. A loss spike at the growth, back within about 1k steps.
+3. Compared at the same frames seen with s9_band5 (one layer; its full-attention end, 96-100k, was 106-109 M frames:
+   pressed Mario kept +16 0.46-0.49, +64 0.16-0.20, sprites kept +64 0.09-0.11), this run passes it by about 110 M
+   frames (step ~110k): Mario kept +64 above 0.15, Mario kept +16 above 0.45, and **sprites kept +64 above 0.11**.
+   Two layers held sprites level with one layer at s3; at s9 they should pull ahead.
+4. The scene stays at 0.020 or better (s9_band5 0.013-0.016 to 100k).
+5. Not a plateau before 156 M frames (step ~165k), judged by window trends: Tetris s9 improved for about 100k steps
+   after its growth.
+
+**Stopped at 85,275 (2026-10-21 10:49) by the user** to train something different from scratch. Untested beyond its
+82k and 84k long dreams.
+
+## Why Mario is a blob: the model recalls patches, it does not copy pixels (2026-10-21)
+
+Checks on s3_layers 80k (scratchpad mario_blur.py, mario_motion_test.py, head_ceiling.py, mario_motion_entropy.py;
+the long-dream trials, the bot's presses):
+- **The data allows a sharp Mario.** From his last 12 moves and the buttons, Mario's next move is right 91% of the
+  time (held-out MLP, 82k play frames); his speed and sub-pixel bytes take it to 95-96%.
+- **The head can draw one.** An encoder that sees the true patch, decoded by the model's own head (96 numbers ->
+  256 pixels x 16 colour dims), draws real sprite patches 98% right, 96% sure and right.
+- **The model does not.** One frame ahead from a real history, Mario's real colours get probability 0.40; 2-5% of
+  his pixels are drawn sure and right (both s3 runs, one layer or two), given its own drawn motion or the real
+  motion alike, and 5-8% when Mario is identical to the frame before. Its probability is as high 1-2 px away as at
+  his place (0.40 / 0.40; the real picture 1.0 / 0.63): a blob in his colours. The background beside him is copied.
+- Reading: the background is a few thousand patches seen hundreds of times each (2,951 distinct in 20k frames),
+  so the model recalls them; sprite patches are each nearly new (18,999 distinct: any offset in a patch, any pose),
+  and nothing makes it carry pixels over from the frame before, so it averages.
+
+## Copy pretraining on moving pictures (`world_model_smb_s3_copy`, then `..._copy_lr3e3`, 2026-10-21)
+
+**Why:** the user: pretrain the model to copy, then switch to real play. data/moving_pictures.py: real SMB
+backgrounds (harvested from the bot's live game) sliding at a constant speed and real sprite cut-outs moving and
+bouncing, every window's colours shuffled, so nothing can be recalled and only copying the frame before predicts
+the next. Motion codes from the composed pictures (frame_motion, as the real stream). `--copy-pretrain`; relaunch
+without it to switch. A ROM-tile source (SMB's CHR in random palettes, `--copy-pretrain rom` once wired) was built
+beside it; the user preferred the harvested sprites, which stay whole.
+
+**`world_model_smb_s3_copy` (s3, lr 3e-4, 16 rows, 8 workers), stopped at 6,000:** data-bound at 1.2-1.4 steps/s
+(each window 360 ms of a worker: 140 ms playing 16 game frames for sources, 170 ms of motion search; the trainer
+waited 0.5-0.8 s a step). Copying came slowly: the previews' changed pixels wrong one frame ahead 0.84 at 1k,
+0.81 at 1.6k, 0.75-0.78 at 2-3k, 0.70 at 6k. Long dreams on real trials (not trained on): scene wrong +64 0.24 ->
+0.18.
+
+**`world_model_smb_s3_copy_lr3e3` (from scratch):** the user's "more aggressive": lr 3e-3 (10x), 4 game frames
+harvested a window (from 16), 12 workers (from 8); everything else the same.
+
+**Predictions:**
+1. 1.8-2.1 steps/s, data waits under 100 ms.
+2. Changed pixels wrong one frame ahead under 0.50 by 6k (the 3e-4 run: 0.70 at 6k), and falling.
+3. No divergence: QK-norm keeps attention bounded; a loss spike that does not recover within 500 steps means 3e-3
+   is too high (then 1e-3).
+4. If it still sits near 0.70 at 6k, the learning rate was not the limit: the next step is Muon or the
+   architecture (patches, depth).
+
+**`..._copy_lr3e3` stopped at about 16k (2026-10-21):** 3e-3 trained stably and its masked loss fell faster (2k
+windows 0.61 -> 0.55 over 6-14k; 3e-4 about 0.90 at 6k), at 1.9-2.1 steps/s with 12 workers. Prediction 2 failed:
+the whole-frame previews stayed at 0.70 changed pixels wrong one frame ahead (2k windows 0.711 / 0.698 / 0.705 /
+0.697 over 6-14k), as at 3e-4. The user: shuffled-colour copy windows are not better than real play trained faster.
+
+## Training as a dream draws, change-weighted, with Mario's state in the border (`world_model_smb_s3_dreamtrain`, 2026-10-21)
+
+**Why:** the whole-frame previews stayed flat while the masked loss fell, in both copy runs and on real play: the
+model fills frames in and does not draw them from the last. training_mask showed why: after a cut every frame
+gets its own masking rate, so the frame before a predicted one is mostly masked too and part of the frame itself
+shows; about one frame a window was trained the way a dream draws (a whole frame from a clean past). The user:
+try three things at once.
+1. `--clean-hidden 0.5`: half the windows hide every k-th frame whole (k 2-4, a random first one) and show the rest
+   fully: each predicted frame drawn whole from a clean past.
+2. `--change-weight 10` on both layers (the sprite layer newly: Dynamics.loss_weights on its pixels, and the
+   decoder undoes it on both, FrameDecoder sprite_last).
+3. The border draws 13 RAM bytes in every SMB frame (world_nes_smb.BORDER_STATE, smb_model_frame): Mario's
+   animation frame and timer, graphics, state, x and y speed and sub-pixels, and the five enemy slots' x sub-pixels.
+   The search (80k play frames, held-out MLP) took the bits not predictable from the picture's history and the
+   buttons from 0.56 / 0.84 to 0.26 / 0.28 (Mario's x / y move), 0.62 to 0.28 (his shape changing), 0.35 to 0.06
+   (the enemies' x move). Every SMB model frame has the state from now on (the stream, the long-dream trials, the
+   SMB app, the levels check); older SMB checkpoints never saw it.
+s3 from scratch on real play, two layers, full attention, lr 3e-3, 12 workers, 16 rows.
+
+**Predictions (against s3_layers, 3e-4, at the same frames; mario_sure_16 is new, so only this run has it):**
+1. The whole-frame previews move: changed pixels wrong one frame ahead under 0.55 by 10k (s3_layers about 0.67-0.87
+   at 2-10k on real play, flat near 0.70 in the copy runs).
+2. Mario kept at +16 above s3_layers at the same frames from about 10k (s3_layers 0.17 at 10k, 0.24 at 30k).
+3. mario_sure_16 (Mario's pixels sure and right over the first 16 dreamed frames) above 0.10 by 20k: s3_layers 80k
+   drew 2-5% of them sure and right one frame ahead.
+4. The border digits are learned: the state bytes come out right in teacher-forced frames before the dreams use
+   them (the Tetris fall timer: counted by 4k with rotary time).
+
+**To 19.6k (20 M frames, 2026-10-21 21:00): the best SMB model so far, at a fraction of the frames.** Pressed long
+dreams against s3_layers at the same steps, and the best earlier model (s9_band5 at 80-100k, about 90-109 M frames):
+
+| | s3_dreamtrain 14-18k (14-18 M frames) | s3_layers 14-18k | s9_band5 80-100k |
+|---|---|---|---|
+| camera held | 43-56 | 20-25 | 32-39 |
+| camera lag +64 | 13.6-14.9 px | 45.5-46 | 27-36 |
+| Mario held | 10.2-11.4 | 1.6-2.4 | 9-11.6 |
+| Mario kept +16 | 0.47-0.49 | 0.18-0.22 | 0.43-0.49 |
+| Mario kept +64 | 0.09-0.12 | 0.01-0.02 | 0.10-0.20 |
+| sprites kept +64 | 0.05-0.06 | 0.06-0.09 | 0.08-0.13 |
+| Mario sure +16 (new) | 0.11-0.12 | - | - |
+| scene wrong +64 | 0.030-0.033 | 0.037-0.040 | 0.013-0.016 |
+
+- The jump came at 4-6k: whole-frame previews' changed pixels wrong one frame ahead fell from 0.75-0.84 to 0.37
+  at 4k and 0.06-0.27 from 6k on (s3_layers 0.28-0.94 to 20k); moved cells right in the previews 0.6-0.9 from 5k
+  (s3_layers 0.00-0.23); camera held 18.6 -> 52 between 4k and 6k.
+- Predictions 1-3 held: previews under 0.55 from 4k; Mario kept +16 above s3_layers from 2k (0.45 against 0.13 at
+  10k); Mario sure 0.105 at 10k, 0.118 at 18k. Prediction 4 (the border digits) not checked yet.
+- Which of the three changes did it is not measured (all three at once, the user's choice). Still behind the s9
+  line on sprites kept and the scene, with a fifth of its frames.
+
+**Stopped at 21,890 (2026-10-21 21:18)** for the size comparison below.
+
+## s9 and s12 from scratch on the same frames (`output/scale_ab`: `world_model_smb_s9`, `world_model_smb_s12`, 2026-10-21)
+
+**Why:** the user's theory: this world model is an exercise in memorising the whole game, so capacity matters
+and the total loss (mostly the easy tiers) says little. How big a model the game needs has no formula: the ROM is
+40 KB (a floor only); by data per parameter (about 10 billion tokens by 39 M frames; LM scaling suggests about
+5 M parameters even if 1% of tokens are informative) our 2-3 M models are on the small side; the earlier SMB s9
+held Mario at +64 1.5-2x the s3 line at about the same frames. The user: train an s9 and an s12 from scratch for
+the same frames.
+
+**Recipe:** s3_dreamtrain's exactly (two layers, full attention, `--clean-hidden 0.5`, `--change-weight 10`, the
+border's 13 state bytes, lr 3e-3, 12 workers) but 12 rows (768 frames a step: at 14 the pair peaked at 18.7 GB allocated, 23.75 GB on the card, 0.8 GB free, too close before a long-dream test; restarted at 12 from step 420: 16.0 GB, about 4 GB free), both
+models in one process on the same batches, so every comparison is at equal frames. s9 3.18 M parameters, s12 3.81 M
+(width 96: each block about 0.21 M).
+
+**Predictions:**
+1. Speed about 0.45-0.55 steps/s for the pair (s9 about 1.2 alone, s12 about 0.9).
+2. Both make s3_dreamtrain's jump (whole-frame previews from about 0.8 to under 0.3 changed pixels wrong one frame
+   ahead) by the same frames or sooner (s3: between 3.1 and 4.1 M frames).
+3. At equal frames from about 10 M on, s12 at or above s9 and both above s3_dreamtrain on Mario kept +64, Mario
+   sure +16 and sprites kept +64 (s3_dreamtrain at 14-18 M frames: 0.09-0.12, 0.11-0.12, 0.05-0.06); camera
+   held already high at s3 (43-56).
+4. The gap s12 - s9 smaller than s9 - s3 (depth alone at width 96 has diminishing returns); if s12 is not above
+   s9 by 20 M frames, width is the next lever, not depth.
+
+**Overnight to 28,200 steps each (21.7 M frames, 2026-10-22 07:25): s12 is the best SMB model so far; size pays,
+with diminishing returns from depth.** Pressed long dreams, means of the 3 tests at 16-20 M frames:
+
+| | s12 | s9 | s3_dreamtrain | s9_band5 80-100k (one layer, ~100 M frames) |
+|---|---|---|---|---|
+| camera held | 60 | 62 | 52 | 32-39 |
+| camera lag +64 | 9.2 px | 13.8 | 14.3 | 27-36 |
+| Mario held | 16.2 | 15.9 | 10.9 | 9-11.6 |
+| Mario kept +16 | 0.595 | 0.543 | 0.479 | 0.43-0.49 |
+| Mario kept +64 | 0.275 | 0.220 | 0.106 | 0.10-0.20 |
+| sprites kept +64 | 0.146 | 0.136 | 0.052 | 0.08-0.13 |
+| Mario sure +16 | 0.241 | 0.194 | 0.114 | - |
+| scene wrong +64 | 0.028 | 0.028 | 0.031 | 0.013-0.016 |
+
+- Prediction 1 failed the good way: 0.71-0.86 steps/s for the pair (0.45-0.55 predicted).
+- Prediction 2 held: both made the jump sooner than s3 by frames (s12 by 3.1 M frames: camera held 57, lag 31; s3
+  between 4.1 and 6.1 M).
+- Prediction 3 held: from 8 M frames s12 >= s9 > s3 on Mario kept +64, Mario sure and sprites kept.
+- Prediction 4 held: the s12 - s9 gap is smaller than s9 - s3 (Mario kept +64 at 16-20 M: +0.055 against +0.114;
+  Mario sure +0.047 against +0.080; sprites +0.010 against +0.084).
+- The dreams (the 6-4 trial, s12): the camera follows Mario through 512 frames and Mario keeps his shape and
+  moves with the buttons; the fire bars are mostly lost; the HUD's world digit is wrong (6-4 dreamed as 4-4) and the
+  timer does not count; the bottom border band is garbled (the state digits).
+- Learning signals flattening: losses 0.12-0.15 over 8-28k; the previews' changed pixels wrong one frame ahead
+  best at 12-20k (s12 0.11) and 0.15-0.19 since.
+
+**s9 stopped at 28,878 (2026-10-22 morning); s12 continues alone** (the user), resumed from 28,878 at 12 rows: 1.42
+steps/s alone against 0.71-0.86 for the pair, 15.7 GB peak.
+
+**The long-dream trials, spread over the game (2026-10-22).** The user: one view of one history is "super
+unhelpful ... it worked in Tetris but cannot work here". The 16 trials were 4 histories of the bot, 4 trials 600
+frames apart in each: two or three levels (the s9 line's: 1-1, 1-2, 6-4), and the sheet and GIF showed trial 0 (the
+same 6-4 castle every test). Now (smb_long_dream.TrialStream, level_trial): 32 trials, one a level in a seeded
+order, each its own game of the training bot from the level's start (SmbGame.start_level), a seeded 32-1200 frames
+in; every test's sheet and GIF show 4 of them at random, in a grid. About 10 s a trial (5-6 min for 32, in the
+trainer's background worker). Scores from before (every run until s12 at 28,878) are on the old set and do not
+compare test for test with later ones.
+
+**The next-frames test replaces the SMB long dreams in the trainer (2026-10-22).** The user's measure: 256 live
+training windows of 72 frames; the model is given the first 64 (their motion, the real buttons) and draws the last 8
+one after another, its own frames going back in (Dreamer keeping 63); pixels wrong at frames 1 (one step), 4 and 8
+(its own rollout), for Mario (his box from the RAM), Mario not sharp (right and 90% sure), every sprite, the
+changed and unchanged pixels, and the border (diagnostics/next_frames.py; scripts/next_frames_check.py on saved
+checkpoints, with a window). On s12's archived checkpoints (seed 11, frame 1 / 4 / 8):
+
+| step | Mario wrong | Mario not sharp | sprites wrong | changed wrong | unchanged wrong | border wrong |
+|---|---|---|---|---|---|---|
+| 10k | 0.43 / 0.61 / 0.71 | 0.82 / 0.85 / 0.89 | 0.36 / 0.51 / 0.61 | 0.10 / 0.16 / 0.24 | 0.002 / 0.004 / 0.008 | 0.026 / 0.041 / 0.046 |
+| 20k | 0.38 / 0.52 / 0.62 | 0.76 / 0.79 / 0.82 | 0.33 / 0.47 / 0.56 | 0.09 / 0.13 / 0.22 | 0.002 / 0.005 / 0.010 | 0.020 / 0.032 / 0.039 |
+| 30k | 0.36 / 0.49 / 0.60 | 0.74 / 0.76 / 0.80 | 0.32 / 0.45 / 0.54 | 0.075 / 0.12 / 0.21 | 0.001 / 0.004 / 0.007 | 0.017 / 0.030 / 0.035 |
+| 40k | 0.36 / 0.51 / 0.62 | 0.72 / 0.75 / 0.79 | 0.32 / 0.45 / 0.54 | 0.076 / 0.11 / 0.20 | 0.001 / 0.003 / 0.006 | 0.015 / 0.028 / 0.034 |
+| 50k | 0.35 / 0.48 / 0.59 | 0.70 / 0.73 / 0.78 | 0.31 / 0.44 / 0.52 | 0.099 / 0.15 / 0.24 | 0.005 / 0.017 / 0.027 | 0.015 / 0.026 / 0.033 |
+
+- Mario is a third wrong one step from 63 real frames: the blur is in the one-step prediction, not only the rollout.
+- The one step keeps improving, slowly (most of it by 30k); frame 1 to 8 adds 0.24-0.28 to Mario wrong at every step.
+- 50k broke the background in some windows; its long dream broke the scene in 2-2 and 7-2 (water starts) at 50k
+  and 52k, not at 54k and 56k.
+- The border digits: 1.5% wrong one step out, falling steadily.
+
+The trainer runs it every 2,000 steps from 64k (about 80 s; the windows are made at launch on 8 low-priority workers,
+from the run's seed, so its numbers are on another set than the table's); checkpoints are still archived every
+2,000 steps for scripts/smb_long_dream.py. The window's dream curves and Long dream tab show it (runs from before:
+their long dreams). The first full run kept every Dreamer's cache until a GC: 5 checkpoints filled the 24 GB
+card (gc.collect and empty_cache after each batch, as the long dreams do).
+
+## s12 cooldown from 88k (`world_model_smb_s12_cool88`, 2026-10-22)
+
+**Why:** the next-frames test flat over 66-88k (Mario wrong one step out 0.333 -> 0.324, sharp 0.31 -> 0.33, 17 M
+frames), the loss still drifting down, and the background breaking in some windows at one test and clean at the
+next (50k, 70k, 74k, 86k, 88k): noise in the weights. s12 trained at a constant 3e-3 (ten times the Tetris runs')
+and never cooled. The user: no more growing ("this is as big as we get").
+
+**Run:** model_step88000.pt as the new folder's model_latest.pt; s12's flags plus `--cooldown 88000 12000` (linear
+from 3e-3 to zero by 100k, the length of every earlier cooldown); the same next-frames windows as s12's tests
+(the same --seed). s12 stopped at 89.6k, resumable.
+
+**Predictions (written before launch):**
+1. Mario wrong one step out from about 0.33 to 0.28-0.30; Mario sharp (frame 1) from 0.31-0.33 to 0.35+.
+2. The background breaks stop: unchanged wrong at frame 1 stays at about 0.0008 at every test.
+3. The frame 1 -> 8 gap in Mario wrong (about 0.18) shrinks a little, to 0.15-0.17.
+4. If none of these move, the limit is not optimization (next: the pixel head's per-pixel independence, data balance).
+
+**Result (finished 23:04): the cooldown helped Mario a little and steadied the background; most of the gain came
+in its first 6k steps.** Next frames at drawn frames 1 / 4 / 8 (the trainer's windows):
+
+| step | Mario wrong | Mario sharp | sprites wrong | changed wrong | unchanged wrong | border wrong |
+|---|---|---|---|---|---|---|
+| s12 80-84k (mean) | 0.334 / 0.444 / 0.524 | 0.31 / 0.30 / 0.27 | 0.298 / 0.434 / 0.520 | 0.197 / 0.198 / 0.279 | 0.0007 (0.005-0.007 at 86-88k) | 0.015 / 0.025 / 0.035 |
+| cool 94k | 0.309 / 0.409 / 0.487 | 0.34 / 0.34 / 0.31 | 0.279 / 0.401 / 0.480 | 0.190 / 0.188 / 0.271 | 0.0007 | 0.014 / 0.024 / 0.032 |
+| cool 100k | 0.311 / 0.431 / 0.515 | 0.355 / 0.334 / 0.298 | 0.273 / 0.395 / 0.482 | 0.188 / 0.181 / 0.259 | 0.0005 | 0.012 / 0.022 / 0.030 |
+
+1. Partly: Mario wrong one step out 0.334 -> 0.311 (predicted 0.28-0.30), flat from 94k; Mario sharp 0.31 -> 0.355
+   (predicted 0.35+).
+2. Held: no background break in six tests (unchanged wrong 0.0005-0.0008).
+3. Failed: the frame 1 -> 8 gap did not shrink (0.18-0.20).
+4. Optimization was part of it, not most: a third of Mario's pixels are still wrong one step out at learning rate
+   zero. world_model_smb_s12_cool88 at 100k is the best SMB model so far.
+
+## Tetris and SMB in one model: w128 (`world_model_both_w128`, 2026-10-22)
+
+**Why (the user):** "a 128 wide x 12 deep model with the recipie we used for s12 but from both tetris and mario using
+the border colors as the signal to the model which rom we are playing"; "it has to be even mario and tetris 6 and 6".
+No more growing after this one.
+
+**What was built:** `--game both` (6 windows of each game a step, Tetris's rows first); the Tetris stream as two
+layers (world_nes_windows `layers`: the falling and next pieces are sprites; it composes to exactly the plain
+stream's pictures, events and motion); one motion vocabulary (data/motion_vocab.py: STILL, Tetris's 44 moves, SMB's
+116, NEW: 162 codes); each game's tests every 2,000 steps (Tetris's long dreams with two-layer context, SMB's next
+frames on the same windows as s12's: the same --seed); the live event scores on Tetris's rows; the window shows
+every game's previews (4 each) and an "SMB next frames" view. The border needs no change: the games already paint
+it with different colour indices (Tetris 55, 56, 57; SMB 55, 40, 24), so every frame says which game it is.
+
+**Run:** w128 (dim 128, 12 layers, 4 heads, 6.18 M parameters) from scratch; s12's flags (two layers, motion first,
+clean hidden 0.5, change weight 10, lr 3e-3, local attention, space rope, QK-norm, actnorm) with --rows 6 and 8
+workers a game. 1.01 steps/s (768 frames a step, 384 of each game), 20.4 GB peak, no retries.
+
+**Predictions (written at launch):**
+1. Each game's frames never take the other's look: no Mario sprites in a Tetris dream, no Tetris well in an SMB one.
+2. SMB at equal SMB frames (s12 saw 768 a step, this 384: compare s12 at half the step): next-frames Mario wrong
+   within 0.02 of s12's; width makes up for sharing the model.
+3. Tetris's long dreams climb as the earlier Tetris runs did by frames, noisier at lr 3e-3 (ten times theirs).
+4. It ends with a cooldown, as the s12 cooldown showed it should.
+
+**Smaller tests (2026-10-23, the user: "Cut Tetris to 16 and halve smbs").** The tests at 2k took about 9 minutes
+(Tetris's long dreams 7.5, SMB's next frames 1.5) against 29 of training: a quarter of the time. Now 16 Tetris trials
+a variant (LONG_DREAM_TRIALS; the first 16 of the same games) and 128 SMB windows (next_frames.COUNT; the first 128
+of the same set). w128 resumed at 2,865. Tests from 4k on are on the smaller sets.
+
+**Learning rate stepped to 1e-3 at 31,816 (2026-10-23 08:16, the user: "do the next set of training at a slightly
+lower value and then cool down in like 24 hours").** Both games had been flat about 6k steps at 3e-3 (SMB Mario
+wrong one step out 0.417-0.425 since 24k; Tetris swinging around its 26-28k level, junk rows 7-18 a 100 frames
+with buttons). The s12 cooldown took nearly all its gain by about 1.3e-3 (Mario 0.333 -> 0.309 at 94k) and none
+after; DeepSeek's multi-step schedule steps the peak to about a third, then to a tenth near the end. Plan: 1e-3 for
+about 24 hours (about 90k steps), then linear to zero over 12k steps.
+
+Prediction: within 4-6k steps SMB Mario wrong one step out to 0.39-0.40 and sharp to 0.23+; Tetris's swings
+narrow (junk rows with buttons under 7 at every test, hit without buttons 0.65+), then both keep improving slowly.
+
+**Learning rate stepped to 3e-4 at 71,657 (2026-10-23 17:58, the user: "Let's do another step down").** At 1e-3 the
+gain came by about 50k and the next 20k steps (about 8 M frames a game) added nothing: SMB Mario wrong one step out
+0.355 (50-56k window) -> 0.351 (68-71k), sharp 0.285 -> 0.289; Tetris hit flat since 44k (0.90-0.97 without
+buttons, 0.58-0.64 with); the loss crept up, 0.045 -> 0.053. The second stair of the multi-step schedule (DeepSeek:
+about a third, then a tenth). Prediction: SMB Mario wrong one step out to 0.33-0.34 and sharp 0.30+ within 6k
+steps, Tetris with buttons lost + morph back under 1.7, the loss back under 0.047; if none moves, cool to zero.
+
+## s6 on SMB, a stair schedule (`world_model_smb_s6_stairs`, 2026-10-23 22:37)
+
+**Why (the user):** capacity is not the limit ("the params vs rom state measure says we have WAY more than enough"),
+exposures are (docs/guides/memorizing_the_game.md): a small, fast model on one game reaches far more frames an
+hour. "Start aggresive for half the training then do a step down for 1/10th and then step down 5 times for the rest
+of the training time, then do a 12k cooldown"; 24 hours of stairs. w128 stopped at 87,907 (3e-4), resumable.
+
+**What was built:** `--stairs HOURS` (STAIR_LRS 3e-3 for 50% of the hours, 1e-3 for 10%, then 6.3e-4, 4e-4,
+2.5e-4, 1.6e-4, 1e-4 for 8% each; by training time, not steps, since the GPU's power limit moves the speed; the
+hours are kept in the checkpoint), then `--final-cooldown 12000` steps linear to zero, where training ends;
+`--level-starts` (the share of new games that jump to the least-played level; 0.8 here, 0.5 before: the castles
+get the fewest frames); the next-frames test from every level (4 windows from each of the 32, from games started
+at the level, made as the training stream makes them; per-level scores in next_frames_levels.csv).
+
+**Run:** s6 (dim 96, 6 layers, 2.56 M parameters), SMB only, 16 windows a step (1,024 frames), 12 workers; s12's
+recipe otherwise (two layers, motion first, clean hidden 0.5, change weight 10, local attention, space rope,
+QK-norm, actnorm). 1.68 steps/s at the 215 W limit: about 6 M SMB frames an hour, about 150 M over the 24 hours
+(the even-coverage budget is about 110 M), 11.3 GB peak.
+
+**Predictions (written at launch):**
+1. The cooled model beats every earlier SMB model on the per-level test: Mario wrong one step out under 0.29 (s12
+   cooled and w128 at 3e-4 were about 0.31 on the old test; they need scoring on the new one to compare).
+2. The castles' Mario scores end within 0.05 of the levels' mean (they get the fewest frames now).
+3. The stairs show as steps in the tests: each step down improves Mario within about 4k steps, as 1e-3 and 3e-4
+   did on w128; the 12 hours at 3e-3 plateau first.
+
+**Result (finished 2026-10-25 about 06:00): every stair helped down to 1.6e-4; s6 ends level with s12, not past it.**
+24.0 stair-hours ended at step 140,167, the cooldown at 152,167 (26.0 hours, 156 M SMB frames: about 1,380
+exposures a place on average, 940 for the least-played levels). Mario wrong one step out at the end of each stair
+(the trainer's per-level test): 3e-3 0.338, 1e-3 0.310, 6.3e-4 0.303, 4e-4 0.295, 2.5e-4 0.293, 1.6e-4 0.283,
+1e-4 0.281-0.285, cooldown 0.282-0.289 (nothing; it starts from 1e-4). Mario sharp 0.323 -> 0.420. Loss 0.102 ->
+0.059.
+
+The same test on the earlier models (scripts/next_frames_check.py --trainer 43, output/next_frames/20261025_073612):
+
+| model | SMB frames | Mario wrong 1 / 4 / 8 | Mario sharp 1 / 4 / 8 | sprites 1 | changed 1 | border 1 | castles / other |
+|---|---|---|---|---|---|---|---|
+| s12 cooled 100k (3.8 M) | 77 M | 0.287 / 0.393 / 0.509 | 0.416 / 0.356 / 0.302 | 0.339 | 0.053 | 0.013 | 0.214 / 0.309 |
+| w128 87.9k, 3e-4 (6.2 M, both games) | 34 M | 0.297 / 0.418 / 0.532 | 0.387 / 0.335 / 0.279 | 0.349 | 0.049 | 0.013 | 0.214 / 0.324 |
+| s6 stairs 152k (2.6 M) | 156 M | 0.285 / 0.407 / 0.542 | 0.419 / 0.360 / 0.294 | 0.334 | 0.046 | 0.011 | 0.216 / 0.309 |
+
+1. Met but not won: 0.285 is under 0.29, but s12 cooled scores 0.287 on the same windows (and better at frames 4
+   and 8); s6 is better than s12 on 18 of 32 levels.
+2. Held, for every model: the castles (0.21) beat the other levels (0.31) in all three.
+3. Held down to 1.6e-4; 1e-4 and the cooldown from it added nothing.
+
+**The finding:** three models of 2.6-6.2 M parameters, 34-156 M SMB frames, balanced or not, three schedules, end
+with the same per-level profile: the same easy levels (4-4 0.02-0.04, 1-1 0.15) and the same hard ones (2-1
+0.55-0.57, 4-3 0.45-0.51, 4-2, 6-2, 1-2 0.48-0.50, 5-4 0.39-0.44). Size, frames, balance and the schedule do not move
+Mario's one-step error below about 0.28; what limits it is the same in every model. Next: look at what the model gets
+wrong in the hard levels' windows.
+
+## Does Mario follow the buttons? (`scripts/smb_button_check.py`, 2026-10-25)
+
+**Why:** the user played s6 in the play app (`--game smb`): "its just not learned the mechanics at all". Not the hard
+levels first: Mario first.
+
+**The test** (`diagnostics/button_follow.py`): one moment from each of the 32 levels (a fresh game of the training bot
+from the level's start, 150-900 frames in, Mario on screen). The real game is forked and played 32 frames five ways
+(the bot's own presses, Right held, Left held, Right + A held, nothing), and the model dreams the same five button
+sequences from the same 48 real frames. On Mario's area (the five real boxes): m(s, s') = the share of pixels where
+the dream with buttons s draws what the game with s' shows. follow(s) = m(s, s) minus the mean over the others;
+spread = how much the five real games differ (the most follow can be); held = the held variants' mean follow over
+the spread.
+
+**Result (s6 stairs 152k, s12 cooled 100k):** every dream matches its own buttons' game best, at every frame (the
+model reads the buttons; the dream with no buttons matches the no-press game, not the bot's). But held presses carry
+about 40% of their effect at frame 8, 30% at 16 and 20-26% at 32, against about 60% for the bot's own presses at 16;
+Left held is the worst (s12 at frame 16: its Left dream matches the no-press game, 0.881, better than the Left one,
+0.861). On the version with fumbles (below), held at 8/16/32: s6 0.41/0.30/0.26, s12 0.42/0.31/0.19.
+
+The training data: random-brain play was 3.9% of s6's windows (its turns are 60-300 frames against the planners'
+600-2,400, so its pick weight of 0.13 gave little time); the rest is the planners, whose presses follow from the
+scene.
+
+## s3 with fumbles, rollouts and the button test (`world_model_smb_s3_buttons`, 2026-10-25 10:30)
+
+**Why (the user):** "do all 3 and lets try s3 again with these fixes": the three options after the button test.
+
+**What was built:**
+1. **Fumbles** (`smb_bot.BrainSwitcher`): whatever brain plays, at 0.015 a play frame one of RandomBrain's button
+   combinations is held 4-30 frames, then the brain replans from where Mario is (`replan`: the perfect brain keeps
+   its style). 22.8% of play frames (measured, 8 x 40 s), "brain: fumble" in the data columns (a window counts if
+   any of its frames is a fumble's: about half the windows). Deaths per 1,000 play frames 0.79 -> 1.68; the level
+   starts keep every level covered.
+2. **Two-layer rollouts** (HorizonDrive's SRR): each drawn frame scored against the two layers' composed picture;
+   `--resync` stays pictures-only. `--rollouts-from STEP`: teacher forcing first, the rollouts (and their depth
+   schedule) from STEP, in one run (the single-stage goal). The reason for SMB: on real history Mario's speed is in
+   the frames, so the next frame barely needs the buttons; on its own drifted history the buttons are what tells
+   where the real Mario is.
+3. **The button test in the trainer** every 2,000 steps (`buttons.csv`, `buttons.png`, the window's "SMB buttons"
+   curve view, first in the dream table).
+
+Also: every check window and the trainer's and play app's windows show a failure whole (`ui/check_window.py`:
+title "- FAILED", the traceback in red, exit 1); the user: "YOU CANNOT LET A UI SWALLOW AN ERROR".
+
+**Run:** s3 (96 x 3, 1.93 M parameters), SMB, s6's recipe (two layers, motion first, clean hidden 0.5, change weight
+10, local attention, space rope, QK-norm, actnorm, level starts 0.8, 16 windows a step, 12 workers), stairs 12 hours
+then the 12k cooldown; rollouts `--rollouts 32 8 20000 --rollouts-from 10000 --blend 8 --refresh 2000`. Smoke run:
+about 1.27 steps/s at depth 32, 7.3 GB peak.
+
+**Predictions (written at launch):**
+1. Held share at frame 16 above s6's 0.30 by step 30k (20k steps of rollouts), and above 0.40 by the end.
+2. Left held's follow at frame 16 above s6's +0.041 by the end (the fumbles hold Left in every level).
+3. Next frames: Mario wrong at frame 8 under s6's 0.542 by the end (rollouts train on the model's own drift);
+   frame 1 may be a little worse than s6's 0.285 (a third of the layers, a third of the frames an hour after 10k).
+4. Before 10k (teacher forcing, fumbles only), held share already above the smoke run's ~0 and rising.
+
+**s3_buttons stopped at 59,097 (2026-10-25 20:20, the user's call; resumable into its cooldown).** Held share at
+8/16/32 rose from 0.05-0.08 (12-26k) to 0.20/0.14/0.09 at 36k, after the rollouts reached depth 8, then held flat
+to 56k (0.17/0.17/0.09); Left's follow at 16 doubled to +0.028 (s6's end +0.041). Next frames stayed behind s6 at the
+same step (Mario wrong 1/4/8 at 56k 0.40/0.58/0.70 against 0.34/0.47/0.60). Predictions 1 and 3 failed; s6 was never
+button-tested mid-run, so whether the fumbles and rollouts helped at all is not known.
+
+## A deep Tetris model: s15 (`world_model_tetris_s15`, 2026-10-25 20:45)
+
+**Why (the user):** "I think I want to try a giant tetris model, like s15 or something", after the s3 run. This
+reverses "we are done growing" (2026-10-22), by the user's choice. For SMB, s6, s12 and w128 hit the same wall;
+for Tetris the deepest model so far had 8 layers.
+
+**Run:** s15 (dim 96, 15 layers, 4.38 M parameters; `MODELS` now has s4-s15), Tetris only, s6's recipe (two layers,
+motion first, clean hidden 0.5, change weight 10, local attention, space rope, QK-norm, actnorm), 12 windows a step,
+12 workers, 3e-4 flat after the warmup, until stopped. Smoke: about 1.1 steps/s, 18.5 GB allocated in training,
+22.8 GB on the card during the long dreams (tight, not spilling).
+
+**To compare against:** the Tetris references (actnorm 72k, resync 18k) on the long dreams with buttons first, at
+equal frames (12 x 64 = 768 frames a step).
+
+Also fixed: the SMB button test's trials key was "buttons", the same as Tetris's pressed long dreams
+(PRESSED_VARIANT): a Tetris run crashed at its first test, and a run on both games would have lost its pressed
+dreams. Now "smb_buttons".
+
+**Overnight schedule (2026-10-25 23:35, the user: "add a step schedual ... step down however you think is most
+effective, finish at like 8 am").** Relaunched from 13,329 with `--stairs 9.3 --stair-lrs 3e-4 1.9e-4 1.2e-4
+--stair-shares 0.785 0.1075 0.1075 --final-cooldown 9000` (the stair rates and shares are options now, defaults
+STAIR_LRS / STAIR_SHARES): 3e-4 held to 7.3 training hours (about 04:00; WSD's long stable phase, the river
+valley), 1.9e-4 to 8.3 h (05:00) and 1.2e-4 to 9.3 h (06:00), steps of about x0.63 as on s6 (each helped down to
+1.6e-4; 1e-4 and below added nothing there), then linear to zero over 9,000 steps (about 1.9 h at 1.3 steps/s with
+the tests: ends near 07:55).
+
+**Result (finished 2026-10-26 08:12 at 48,584; 37 M Tetris frames):** stairs ended at 39,584 (the GPU ran 1.14
+steps/s, so the steps fell later than planned: 1.9e-4 from about 31.5k, 1.2e-4 from 35.6k), then the 9,000-step
+cooldown. Long dreams (16 trials, mean of the last three tests 44-48k) against the bests (32 trials, same seed):
+
+| with buttons | s15 44-48k | actnorm 72k | resync 18k |
+|---|---|---|---|
+| shape | 0.41 | 0.55 | 0.54 |
+| spawn | 0.98 | 1.00 | 1.00 |
+| breaks / 100 frames | 0.48 | 0.48 | 0.47 |
+| morphs / 100 frames | 0.58 | 0.78 | 0.60 |
+| full rows never cleared / 100 | 4.9 (0.2-8.5) | 0.32 | 0.53 |
+| wrong +128 | 0.030 | 0.028 | 0.027 |
+
+No buttons: shape 0.76 (actnorm 0.69, resync 0.73), spawn 0.94, breaks 0.05, morphs 0.03, no full rows, wrong +128
+0.017: the best no-button dreams so far. Turned cells in its own preview frames 0.02 at 12k, 0.35-0.47 at 22-30k
+(3e-4), then 0.75-0.87 at 38-40k (the 1.2e-4 stair), 0.65-0.74 in the cooldown; masked 0.25 -> 0.79. The A/B swap
+gap (live turn gap) stayed small: 0.00-0.03 to 34k, 0.02-0.10 from 36k. The pressed clock (timer wrong +128) fell
+0.19 (20k) -> 0.10 (36-38k) -> 0.03 (48k). Each step down showed: 1.9e-4 pressed shape 0.35 -> 0.42; 1.2e-4 the turns,
+the full rows (7.9 -> 0.2-0.4) and the swap gap; the cooldown the clock.
+
+## Width against depth at one size: s3_w176 (`world_model_tetris_s3_w176`, 2026-10-26 08:25)
+
+**Run:** s3 at 176 wide (3 layers, 4 heads of 44, 4.35 M parameters against s15's 4.38 M), s15's recipe and
+batches, 3e-4 flat. 1.65 steps/s bare, about 1.37 with the tests (s15 about 1.2). Stopped at 25,367 (13:38) for the
+conv ends run below.
+
+**Result (12-22k, level = the mean of the last 3 tests, slope per 2k; s15 at the same steps):** ahead of s15 early
+(moved cells, presence, fewer breaks to 8k), then:
+
+| with buttons | w176 | s15 |
+|---|---|---|
+| shape | 0.23, flat from 14k | 0.30, +0.023 |
+| spawn | 0.48, +0.09 | 0.44, +0.13 |
+| breaks / morphs per 100 frames | 0.88 / 0.72, rising | 0.73 / 0.57 |
+| live turn exact / swap gap | 0.47 / +0.11 | 0.32 / -0.03 |
+
+No buttons: shape 0.65 against 0.69, spawn 0.14 against 0.58. Width learned which way a piece turns sooner; depth
+kept pressed pieces whole and spawned sooner. The parameter map showed why the comparison is lopsided: the pixel ends
+(the 16 x 16 patch conv and the two linear heads, 176 numbers to 4,096) are 50% of w176's weights and 27% of s15's,
+so the wide model's 3 blocks have 2.1 M weights against s15's 3.1 M.
+
+## Conv ends: s3_w176_conv (`world_model_tetris_s3_w176_conv`, 2026-10-26)
+
+**Change (the user: "do it at both ends, so its kinda like a tiny simple vae that we train when we are training the
+model"):** both pixel ends become 2 x 2 pyramids (`Dynamics(conv_ends=(32, 48, 64))`, models/dynamics.py): in, the
+colour embedding 2 x 2 at a time to 32 wide (still linear, so the patch kernel computes it), then per-pixel RMSNorm,
+GELU and a 2 x 2 linear map to 48 (4 px), 64 (8 px, one Tetris cell) and the token; out, the same steps down to
+each pixel's colour vector against the tied colour table, each layer its own head. No step crosses a token's edge
+(a hidden token cannot leak into a visible one; MaskGIT's per-token decoding unchanged); trained only through the
+model's loss, no reconstruction loss or KL (the October video VAE's KL diverged). The ends go from 2.17 M weights
+to about 0.2 M; the blocks are w176's exactly, so the run is w176 with only its ends changed.
+
+**Predictions (written before the run):** the same early tiers as w176 or a little slower (a nonlinear stem has
+more to learn at first); by 12-22k fewer breaks and morphs with buttons than w176's 0.88 / 0.72 and shape with
+buttons above its flat 0.23. If it matches w176 instead, the ends were not the bottleneck and depth is the lever.
+
+**Result (stopped at 37,326, 21:33):** the predictions held. Against w176 and s15 at the same steps, with buttons
+(level of the last 3 tests): 12-20k shape 0.27 rising (w176 0.23 flat, s15 0.30), spawn 0.69 (0.48 / 0.44), timer
+wrong 0.15 (0.27 / 0.21), fall 0.98 (1.24 / 1.22); 26-32k shape 0.34-0.38, spawn 1.00, lost / morph 0.42 / 0.52
+falling (s15 at the same steps 0.41-0.98 / 0.54-0.96). Against actnorm 72k / resync 18k: fewer breaks (0.42 against
+0.48 / 0.47) and morphs (0.52 against 0.78 / 0.60), behind on shape (0.36 against 0.55) and full rows (6.9 against
+0.32 / 0.53: no line clears, as every 3-layer run). Gravity timing the clearest win (fall 1.00, timer wrong 0.04-0.09
+with or without buttons). Turns right about 0.8 but almost as right with A and B swapped (gap 0.07). No-button dreams
+repeat one piece type. Cost: 17.6 GB allocated in training against w176's 11.4 (the ends' maps kept for backward);
+in the browser the ends are cheaper than the linear ones (in 83 M against 185 M multiply-adds a frame, out 323 k
+against 721 k a token a head).
+
+## The big run: s9_w176_conv from scratch (`world_model_tetris_s9_w176_conv`, 2026-10-26 23:04 to Friday)
+
+**Why (the user):** conv ends help "no matter what"; train long, one stage, no growth ("I dont want to grow"); 9
+layers for depth (the only model whose turns followed A vs B was 9 deep). 6.51 M parameters.
+
+**Memory found on the way:** `torch.compile` of the whole model keeps most of what the block checkpoints drop: one
+s9 forward and backward peaks at 22.0 GB compiled with recompute, 5.5 GB eager with recompute, 39.1 GB without. The
+first s9 smoke spilled 5.2-5.5 GB into system memory over PCIe (Windows' "GPU Process Memory\Shared Usage" counter;
+nvidia-smi's used memory only showed the card full). Recompute models now compile each block on its own and run the
+checkpoints around them (train_dynamics_ui.Model); the output end's steps are recomputed too (masked_loss). s9: 11.6
+GB, 0.54 steps/s steady (GPU at the 215 W limit, about 72% busy between the compiled blocks).
+
+**Run:** s3_w176_conv's flags, `run_until_stopped.ps1 -Name s9conv` (restarts after a crash), `--stairs 72.5
+--stair-lrs 3e-4 1.9e-4 1.2e-4 --stair-shares 0.8344 0.0828 0.0828 --final-cooldown 12000`: 3e-4 to about Thursday
+11:30, 1.9e-4 and 1.2e-4 six hours each, the cooldown ending near 06:30 Friday (about 135 k steps, 100 M frames).
+
+**To compare against:** s3_w176_conv and s15 at the same steps, then actnorm 72k / resync 18k / s9_cool140 on the
+button dreams; line clears (full rows) and the A/B swap gap are the open tiers.
+
+## s9 post-trained on brains that press like people (`world_model_tetris_s9_postB`, 2026-11-01 16:07)
+
+**Why:** play felt far worse than the tests, and the tests could not see it (output/tests_2026-11-01/results.md).
+Play's decoder matches the test path (0.95-0.98 exact one frame ahead). What play feeds the model was never in
+training: every brain tapped 1 frame, 1 apart, and two buttons were down together on 0.03% of frames (A+B only).
+Down held through turns and shifts broke dreams 25-47x; a person's 2-3 frame taps 2-5 apart, 3x. The user: the model
+only needs to see the distribution, not have all the data in it; then: make the perfect brain hold its buttons and
+still play perfectly. The data now (tetris_bot.py, docs/guides/dynamics.md): the perfect brain holds each turn and
+shift 1 to h frames and releases 1 to g (per piece, under hold_cap(level)), and 40% of its pieces hold Down through
+the turns; a person brain (15% of short games) and random-brain pairs; about 1% of frames have two buttons.
+
+**Setup:** s9_w176_conv's final 135,582 checkpoint (the best on buttons and breaks; post-trains A and A0 were not
+better) continued at the control's recipe: --hold-lr 1.2e-4 until Start Cooldown, then --final-cooldown 4000; no IDM
+loss (it cost post-train A its turns), no chunk head. Muon replaced AdamW on 10-31 and s9 is AdamW's: Muon's 72
+matrices start without state (run_outputs.load_optimizer from_adamw; match_rms_adamw keeps its steps AdamW's size),
+the AdamW part's 172 weights keep s9's state. Dry run (200 steps, output/tests_2026-11-01/postB_dry) clean: first
+losses as the control's (0.35 against 0.38), 12.3 GB. The live long-dream trials now come from the new brains, so
+its button scores are not quite paired with s9's.
+
+**Predictions (before launch):**
+1. The press-timing check (scripts/press_timing_check.py, after the run): the "person, Down held" row's lost/morph
+   (s9 0.32/0.42 per 100 frames) fall at least by half, piece hit +32 (0.51) and fall (0.14) rise toward the bot's;
+   the 20 fps row (0.037/0.025) moves toward the bot's (0.013/0.009).
+2. No-button long dreams and the live A/B gap stay at s9's level (the new presses are a small share of the data).
+3. The first few hundred steps cost a little (Muon's fresh momentum and the new presses), back by ~2k.
+
+**So far (2026-11-01):** by 138k-140k the button long dreams were level with the control post-train or better
+(lost/morph 0.13/0.15 against 0.21/0.21 at 140k; piece hit +32 1.00), no-button +128 1.07% against 1.15%; the
+full-rows spikes (2.8-4.0) are one or two trials with a row stuck full, as s9 had at 134k (2.7). Paused at 142,048
+for play beside s9: the user, "it does seem to play better". Prediction 3 held (worse at 136k, back by 138k).
+
+**New brains from 144,979:** the user asked whether the brain ever presses a piece against a wall or moves it
+right before it places; none of the planned brains did (every shift high up, straight drops only). The perfect
+brain (hold) now presses into a wall or the stack (NUDGE), leaves its last shift until 1-3 rows above the landing
+(LATE), and takes tucks under overhangs (tetris_bot.tucks); real games: 176 of 176 pieces landed as planned,
+14 of them tucks. The census (output/tests_2026-11-01/press_census_walls) per 1,000 of its frames: 5.4 presses that
+moved nothing, 2.0 late shifts, 0.1 tucks. The run resumed from 144,979 on them, still at the held rate.
+
+## s9 post-trained with the carried cache (`world_model_tetris_s9_postC`, planned for the night of 2026-11-01)
+
+**Why:** since 2026-11-01 every dream's history is a ring (models/dynamics.py TemporalCache, test 3: it scored as
+the re-encode and was 18% faster), so past its first 64 frames a dream attends to keys each written with their
+own 63-frame past, which training never showed: every training window started from nothing. The user asked to
+train with the circular buffer, as a comparison post-train after postB.
+
+**Setup:** postB's recipe from the same s9 checkpoint (135,582), on the latest brains (wall and stack presses,
+late shifts, tucks), plus --carry (Transformer-XL's memory, models/dynamics.py Memory): each row one history
+worker's stream, windows 63 frames apart (sharing a frame); each window frame attends to its own and the 63
+before it, the earlier ones from the last window's keys and values; those from a clean no-grad pass after each
+optimizer step (every token visible, its real motion, as a dream writes its history); each row seeing a random 0..63
+frames of its memory, so every history length down to a dream's 3-frame start is trained (the user chose the clean
+pass and the random lengths, 2026-11-01). A unit test shows a teacher-forced window with its memory gives exactly
+the features the dream's ring gives. Held rate to 147,590 (postB's hold), then 4,000 cooling.
+
+**Predictions (before launch):**
+1. Cost: about 25% slower per step (the clean pass), under 1 GB more VRAM; measured in a 200-step dry run first.
+2. The long dreams past the window improve over postB's at the same steps: the +128 wrong pixels and the timer's
+   +128 error (postB 146k buttons: 1.87% and 5.21%), since a carried key can hold what happened before the window.
+3. One-frame scores and the live turn gap stay at postB's (short histories are still trained).
+4. The press-timing check's rows as postB's or better.

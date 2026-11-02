@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import re
 import time
-from collections import Counter
+from collections import Counter, deque
 
 import torch
 from torch.utils.data import DataLoader
@@ -21,12 +21,24 @@ def data_fields(names) -> list[str]:
     return ["data_windows", "data_kept", *(data_field(n) for n in names), *NOVELTY_FIELDS]
 
 
+EXTRA = ("who", "effect")                         # per-frame fields carried when the stream has them
+
+
 class LiveBatches:
-    """Assemble one chunk per history worker into a [workers, T, ...] batch.
+    """Assemble one chunk from each of `workers` different history workers into a [workers, T, ...] batch.
+
+    The loader may have more workers than a batch has rows (spare ones) and deliver out of order
+    (DataLoader in_order=False): a batch takes the first windows ready from different workers, and a worker's
+    further windows wait (in its order) for the next batches, so a worker in a slow stretch (the SMB planner
+    in a hard spot) holds up no batch while the others have windows ready. Rows are in worker-id order.
 
     Checks that no worker repeats within a batch and that every worker's tick
     advances by whole chunks (streams may toss windows, never parts of one), so
-    a duplicated, restarted or misaligned history fails loudly. Marked streams
+    a duplicated, restarted or misaligned history fails loudly. any_worker: rows are simply the first `workers`
+    windows ready, from any history workers, a worker's consecutive windows possibly side by side (for a
+    trainer whose windows are each a whole history, carrying nothing to the next batch: the world models).
+    Nothing waits on a slow stream and nothing is held (one-per-worker batches held the other workers' pinned
+    windows without bound while waiting on a slow one: 10 GB with 8 workers, 2026-10-19); no order checks. Marked streams
     (world_nes_tetris.WindowToss marked) send every window: `kept` [workers]
     says which of the last batch's the toss kept, and the data counts are of
     those alone. Windows with a counterfactual twin (world_nes_tetris.TurnBranches) add it as a row after
@@ -34,10 +46,11 @@ class LiveBatches:
     workers' own windows.
     """
 
-    def __init__(self, loader: DataLoader, workers: int, new_frames: int, novelty=None):
-        """novelty: a diagnostics.novelty.Novelty that sees every window trained on (take_stats reports it)."""
+    def __init__(self, loader: DataLoader, workers: int, new_frames: int, novelty=None, any_worker: bool = False):
+        """workers: a batch's rows (any_worker: from any of the loader's workers). novelty: a
+        diagnostics.novelty.Novelty that sees every window trained on (take_stats reports it)."""
         self.iterator = iter(loader)
-        self.novelty = novelty
+        self.novelty, self.any_worker = novelty, any_worker
         self.workers, self.new_frames = workers, new_frames
         self.last_tick: dict[int, int] = {}
         self.wait_sum_ms = self.wait_max_ms = 0.0
@@ -46,26 +59,49 @@ class LiveBatches:
         self.names: Counter = Counter()           # labelled windows (world_nes_tetris.WindowToss): what is in them
         self.windows = self.judged = 0
         self.kept = torch.ones(workers, dtype=torch.bool)
-        self.motion = None                         # the last batch's motion codes, when the stream makes them
+        self.continues = torch.zeros(workers, dtype=torch.bool)   # each row's window right after its last (not
+        self.motion = None                                        # any_worker: a worker's next chunk)                         # the last batch's motion codes, when the stream makes them
         self.branch_at = torch.full((workers,), -1, dtype=torch.long)
         self.piece = None                          # [rows, T] each frame's piece byte, when the stream has it
         self.events = None                         # [rows, T] each picture's events (tetris_events.frame_events)
+        self.extra: dict[str, torch.Tensor] = {}   # [rows, T] each frame's EXTRA fields the stream has (who chose
+                                                   # its press, its effect: world_nes_tetris who / effects)
         self.branch_kinds: Counter = Counter()    # the twins trained on since take_stats, by kind
+        self.pending: dict[int, deque] = {}        # windows that came while their worker was in the batch
+
+    def _part(self, taken: dict) -> dict:
+        """The next window of a worker not yet in this batch: its oldest held one, else the loader's next (a
+        window whose worker is in the batch, or has windows held, is held, keeping each worker's order; any_worker:
+        the loader's next, whatever its worker)."""
+        if self.any_worker:
+            return next(self.iterator)
+        for worker, held in self.pending.items():
+            if held and worker not in taken:
+                return held.popleft()
+        while True:
+            part = next(self.iterator)
+            worker = int(part["worker_id"])
+            if worker in taken or self.pending.get(worker):
+                self.pending.setdefault(worker, deque()).append(part)
+                continue
+            return part
 
     def next(self) -> tuple[torch.Tensor, torch.Tensor]:
         start = time.monotonic()
         chunks, action_chunks, meta, kept, motion, twins, piece, events = {}, {}, {}, {}, {}, {}, {}, {}
+        follows = {}
+        extra = {name: {} for name in EXTRA}
         while len(chunks) < self.workers:
-            part = next(self.iterator)
-            worker = int(part["worker_id"])
-            if worker in chunks:
-                raise RuntimeError(f"duplicate history worker {worker} in mixed batch")
+            part = self._part(chunks)
+            worker = len(chunks) if self.any_worker else int(part["worker_id"])     # the row's key
             tick = int(part["tick"])
-            if worker in self.last_tick and (tick <= self.last_tick[worker]
-                                             or (tick - self.last_tick[worker]) % self.new_frames):
-                raise RuntimeError(f"worker {worker} frame stream jumped: tick {tick} after "
-                                   f"{self.last_tick[worker]}, not whole {self.new_frames}-frame chunks later")
-            self.last_tick[worker] = tick
+            if not self.any_worker:
+                follows[worker] = tick - self.last_tick.get(worker, tick) == self.new_frames
+                if worker in self.last_tick and (tick <= self.last_tick[worker]
+                                                 or (tick - self.last_tick[worker]) % self.new_frames):
+                    raise RuntimeError(f"worker {worker} frame stream jumped: tick {tick} after "
+                                       f"{self.last_tick[worker]}, not whole {self.new_frames}-frame chunks later")
+                self.last_tick[worker] = tick
             picture = (part["layers"] if "layers" in part else {"x": part["x"], "sprites": part["sprites"]}
                        if "sprites" in part else part["x"])
             chunks[worker], action_chunks[worker] = picture, part["action"]
@@ -75,6 +111,9 @@ class LiveBatches:
                 piece[worker] = part["piece"]
             if "events" in part:
                 events[worker] = part["events"]
+            for name in EXTRA:
+                if name in part:
+                    extra[name][worker] = part[name]
             if "branch" in part:
                 twins[worker] = part["branch"]
                 self.branch_kinds[part["branch"]["kind"]] += 1
@@ -97,12 +136,13 @@ class LiveBatches:
         # Each chunk is already pinned (DataLoader pin_memory), so per-chunk copies are truly
         # asynchronous and the batch is stacked on the GPU. Stacking on the CPU first made an
         # unpinned tensor whose copy blocked the main thread until the GPU queue drained.
-        order = range(self.workers)
+        order = sorted(chunks)
         self.kept = torch.tensor([kept[i] for i in order] + [True] * len(twins))
+        self.continues = torch.tensor([follows.get(i, False) for i in order] + [False] * len(twins))
         branched = sorted(twins)
         self.branch_at = torch.tensor([-1] * self.workers + [int(twins[i]["at"]) for i in branched])
-        if isinstance(chunks[0], dict):            # layered windows (data/nes_layers.py), or x with sprites
-            x = {k: torch.stack([chunks[i][k].cuda(non_blocking=True) for i in order]) for k in chunks[0]}
+        if isinstance(chunks[order[0]], dict):     # layered windows (data/nes_layers.py), or x with sprites
+            x = {k: torch.stack([chunks[i][k].cuda(non_blocking=True) for i in order]) for k in chunks[order[0]]}
         else:
             x = torch.stack([chunks[i].cuda(non_blocking=True) for i in order]
                             + [twins[i]["x"].cuda(non_blocking=True) for i in branched])
@@ -117,6 +157,9 @@ class LiveBatches:
         self.events = (torch.stack([events[i].cuda(non_blocking=True) for i in order]
                                    + [twins[i]["events"].cuda(non_blocking=True) for i in branched])
                        if events else None)
+        self.extra = {name: torch.stack([v[i].cuda(non_blocking=True) for i in order]
+                                        + [twins[i][name].cuda(non_blocking=True) for i in branched])
+                      for name, v in extra.items() if v}
         return x, actions
 
     def take_stats(self) -> dict[str, float]:

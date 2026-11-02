@@ -52,7 +52,7 @@ import torch.nn.functional as F
 from torch import nn
 from torch.utils.checkpoint import checkpoint
 
-from token_world.models.dynamics import Block, TemporalCache, button_bits, rotary
+from token_world.models.dynamics import Block, TemporalCache, button_bits, rotary, rotary_turns
 from token_world.models.video_vae import build as build_vae
 from token_world.models.video_vae import frames as untile
 
@@ -98,7 +98,8 @@ def pair_temporal(att, yc: torch.Tensor, yt: torch.Tensor) -> tuple[torch.Tensor
         q, k, v = att.qkv(y).view(m, t, 3, heads, d // heads).permute(2, 0, 3, 1, 4)
         if att.q_norm is not None:
             q, k = att.q_norm(q), att.k_norm(k)
-        return rotary(q, times, axis=2), rotary(k, times, axis=2), v
+        turns = rotary_turns(times, q.shape[-1] // 2)
+        return rotary(q, turns, axis=2), rotary(k, turns, axis=2), v
 
     (qc, kc, vc), (qt, kt, vt) = qkv(yc), qkv(yt)
     oc = F.scaled_dot_product_attention(qc, kc, vc, is_causal=True)
@@ -392,7 +393,8 @@ class LatentDreamer:
                 latent, probs = self._frame()
             torch.cuda.current_stream().wait_stream(side)
             self.graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(self.graph):
+            with torch.cuda.graph(self.graph, capture_error_mode="thread_local"):   # other threads (the
+                # DataLoader pinning batches) may use CUDA meanwhile: a global capture fails on them (2026-10-19)
                 self.out = self._frame()
         else:
             self.graph.replay()

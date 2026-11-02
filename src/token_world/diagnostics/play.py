@@ -16,6 +16,15 @@ game's exact pieces; per 100 frames:
 - full: full rows that never clear (frames with a full row, past SETTLE frames since it filled).
 - size: pieces born too big or too small: across each stretch with the top rows filled or a row full (a spawn,
   a clear), the cell count changing by anything but four per piece less ten per cleared row.
+- floating: pieces that lock with nothing under them (2026-10-18, the user: a piece "snapped to another piece on
+  the side like 1 block from the ground and stopped"). A piece is followed from its spawn (cells appearing in
+  the top TOP rows with none leaving) through each move or turn (as many cells leave, all of them its, as
+  arrive; a dream's first frame with 1-4 cells in those rows starts with them: the long dreams start at a fresh
+  piece); when the next piece spawns, or cells that are not its leave after a full row (a clear; without one, a
+  board that empties for a reset or a new game, nothing is judged), it has locked where it last
+  moved, and it rested on something if one of its cells is on the floor or on a block directly below that is
+  not its own. A real piece always does (a lock is the game finding the row below taken). Pieces whose moves
+  cannot be followed (they gain or lose blocks: morph, size) are not judged.
 Frames with anything in the top TOP rows, before or after, are left out of lost and morph: a piece spawns
 there partly above the well and comes into view a row at a time (a vertical I over four rows), so the real
 count changes too. Top-outs (from five or more full rows, the curtain, until the well is empty again) are left
@@ -45,7 +54,7 @@ SKIP = 400                    # game frames between windows, so they come from d
 PRESSED = 0.05                # a window's frames with a button down, at least (the bot has idle stretches)
 STACK = 12                    # the well's filled cells at the context's end, at least (a board, not a new game)
 TOP = 4                       # the well's top rows, where pieces spawn and come into view (an I is 4 tall)
-FIELDS = ("lost", "morph", "full", "size", "shape")
+FIELDS = ("lost", "morph", "full", "size", "floating", "shape")
 
 
 @dataclass
@@ -115,7 +124,44 @@ def integrity(cells: np.ndarray) -> dict[str, float]:
     over = _over(cells.all(2).sum(1), count)
     stood = (run[1:] > SETTLE) & ~top[1:] & ~over[1:]     # not a topped-out board (the curtain fills every row)
     return {"lost": float(lost * per), "morph": float(morph * per), "full": float(stood.sum() * per),
-            "size": float(_sizes(count, (since > SETTLE) & ~top, over) * per)}
+            "size": float(_sizes(count, (since > SETTLE) & ~top, over) * per),
+            "floating": float(sum(not resting for resting in locks(cells, over)) * per)}
+
+
+def locks(cells: np.ndarray, over: np.ndarray | None = None) -> list[bool]:
+    """Each followed piece's lock in well cells [T, 20, 10] (frames of a top-out, `over`, left out) -> whether it
+    rested on something (the floor, or a block directly below that is not its own): floating's pieces."""
+    out, piece, board = [], None, None
+    first = {tuple(p) for p in np.argwhere(cells[0, :TOP])}
+    if 0 < len(first) <= 4:                                # a dream starts at a fresh piece: it is the one falling
+        piece, board = first, cells[0]
+
+    def judge(piece, board):
+        if piece is not None and len(piece) == 4 and not any(r < TOP for r, _ in piece):
+            out.append(any(r == cells.shape[1] - 1 or (board[r + 1, c] and (r + 1, c) not in piece)
+                           for r, c in piece))
+
+    for t in range(1, len(cells)):
+        if over is not None and (over[t] or over[t - 1]):
+            piece = None
+            continue
+        gone = {tuple(p) for p in np.argwhere(cells[t - 1] & ~cells[t])}
+        new = {tuple(p) for p in np.argwhere(cells[t] & ~cells[t - 1])}
+        if not gone and not new:
+            continue
+        spawned = not gone and new and all(r < TOP for r, _ in new)
+        if spawned and piece is not None and all(r < TOP for r, _ in piece):
+            piece |= new                                   # still coming into view
+        elif spawned:
+            judge(piece, board)                            # the next piece: the last one locked
+            piece, board = new, cells[t]
+        elif piece is not None and gone <= piece and len(new) == len(gone):
+            piece, board = (piece - gone) | new, cells[t]  # a move or a turn
+        else:
+            if piece is not None and not gone <= piece and cells[t - 1].all(1).any():
+                judge(piece, board)                        # a clear (from a full row): it locked before
+            piece = None                                   # (or a reset, or a change that cannot be followed)
+    return out
 
 
 def _over(full_rows: np.ndarray, count: np.ndarray) -> np.ndarray:

@@ -7,8 +7,9 @@ Any model, pixel or layered (diagnostics/worlds.py); every model dreams the same
 the layered models have their layers; the pixel model reads the same frames).
 
 Runs default to the long-trained ones (see play_world_model.py). Each keep is
-how many frames a dream keeps when its window slides (models/dynamics.py
-Dreamer; default three quarters of the window). Every run x keep dreams the
+how many frames a latent model's dream keeps when its window slides
+(models/latent_dynamics.py; default three quarters of the window; the pixel
+model's history is a ring, models/dynamics.py TemporalCache, and ignores it). Every run x keep dreams the
 same trials. Dreams are soft, so scores are expectations.
 
 The bot plays World NES until a fresh piece has spawned, then either nobody

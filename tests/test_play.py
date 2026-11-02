@@ -11,7 +11,7 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from token_world.diagnostics.play import SETTLE, Play, score
+from token_world.diagnostics.play import SETTLE, Play, integrity, locks, score
 
 
 def frame(cells) -> np.ndarray:
@@ -92,6 +92,27 @@ class PlayScoreTests(unittest.TestCase):
             result = run(spawned(wrong))
             self.assertAlmostEqual(result["size"], 100 / 109)
             self.assertEqual(result["morph"], 0.0)                       # already wrong when it left the top
+
+    def test_a_piece_that_locks_with_nothing_under_it_floats(self):
+        o = [(0, 4), (0, 5), (1, 4), (1, 5)]
+        side = [(r, c) for r in range(17, 20) for c in range(4)]           # a stack beside the piece's columns
+        well = lambda cells: np.isin(np.arange(200).reshape(20, 10), [r * 10 + c for r, c in cells])
+
+        def dream(stop):                       # the O spawns, falls a row a frame to `stop`, then the next spawns
+            frames = [well(side)] + [well(side + at(o, r, 0)) for r in range(stop + 1)]
+            frames += [frames[-1]] * 5 + [well(side + at(o, stop, 0) + o)] * 3
+            return np.stack(frames)
+
+        self.assertEqual(locks(dream(18)), [True])                          # on the floor
+        self.assertEqual(locks(dream(16)), [False])                         # beside the stack, a row above it
+        result = integrity(dream(16))
+        self.assertAlmostEqual(result["floating"], 100 / (len(dream(16)) - 1))
+        reset = np.concatenate([dream(16)[:10], np.zeros((5, 20, 10), bool)])   # the board empties mid-fall
+        self.assertEqual(locks(reset), [])
+        row = [(19, c) for c in range(10) if c not in (4, 5)] + [(18, c) for c in range(4)]
+        frames = [well(row)] + [well(row + at(o, r, 0)) for r in range(19)]                  # it fills row 19
+        frames += [well([(18, c) for c in range(4)] + [(18, 4), (18, 5)])] * 3 + [well([(19, c) for c in range(6)])] * 3
+        self.assertEqual(locks(np.stack(frames)), [True])                   # judged as it clears
 
     def test_a_top_out_and_a_new_game_are_no_size_or_full(self):
         curtain = [frame([(r, c) for r in range(20 - n, 20) for c in range(10)]) for n in range(5, 21)]

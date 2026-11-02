@@ -92,7 +92,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from token_world.models.dynamics import COLOURS, SIZE, Attention, Block, RMSNorm, TemporalCache, rotary
+from token_world.models.dynamics import COLOURS, SIZE, Attention, Block, RMSNorm, TemporalCache, rotary, rotary_turns
 
 LOW = 4                                         # the convolutions' smallest picture: 4 x 4
 GROUPS = 8                                      # GroupNorm's groups after every convolution
@@ -380,7 +380,8 @@ class StreamEncoder:
         if attention.q_norm is not None:
             q, k = attention.q_norm(q), attention.k_norm(k)
         times = torch.arange(length, device=x.device)
-        q, k = rotary(q, times, axis=2)[:, :, history:], rotary(k, times, axis=2)
+        turns = rotary_turns(times, q.shape[-1] // 2)
+        q, k = rotary(q, turns, axis=2)[:, :, history:], rotary(k, turns, axis=2)
         at = history + torch.arange(s, device=x.device)                              # the new frames' places
         keys = times[None]
         seen = (keys <= at[:, None]) & (keys >= at[:, None] - history)                # up to `history` back

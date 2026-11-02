@@ -5,7 +5,8 @@
 //     cd web && node test_screenshot.mjs
 import { readFile } from "node:fs/promises";
 import { startFrames } from "./dreamer.js";
-import { LINES, WIDTH, guessCorners, pictureImage, startPicture, toPicture, toStart } from "./screenshot.js";
+import { LINES, TRANSPARENT, WIDTH, guessCorners, lastFrame, pictureImage, startPicture, toPicture,
+         toStart } from "./screenshot.js";
 
 const load = async (name) => new Uint8Array(await readFile(new URL(`model/${name}`, import.meta.url)));
 const meta = JSON.parse(new TextDecoder().decode(await load("context.json")));
@@ -56,11 +57,17 @@ const cropped = toPicture(crop, [[0, 0], [WIDTH, 0], [WIDTH, 224], [0, 224]], pa
 check("picture back from the 224 visible lines", differ(cropped, real, 8 * WIDTH, 232 * WIDTH) === 0,
       `${differ(cropped, real, 8 * WIDTH, 232 * WIDTH)} pixels differ in lines 8-231`);
 
-// the start: the picture back as the start's last frame, border bands and all, three times
+// the start: the picture back as the start's last frame as shown, border bands and all, three times (two
+// layers: all of it the background, no sprites)
 const built = toStart(scaled, start).start, size = 256 * 256;
-const lastFrame = (x) => x.data.subarray(x.data.length - size);
+const layers = built.shape.length === 4 ? built.shape[1] : 1;
+check("the start's shape", JSON.stringify(built.shape.slice(1)) === JSON.stringify(start.shape.slice(1)),
+      JSON.stringify(built.shape));
 for (let f = 0; f < built.shape[0]; f++) {
-  const n = differ(built.data.subarray(f * size, (f + 1) * size), lastFrame(start));
-  check(`start frame ${f} as the real start's last`, n === 0, `${n} pixels differ`);
+  const frame = built.data.subarray(f * layers * size, (f + 1) * layers * size);
+  const n = differ(frame.subarray(0, size), lastFrame(start));
+  const sprites = layers === 2 ? size - frame.subarray(size).filter((c) => c === TRANSPARENT).length : 0;
+  check(`start frame ${f} as the real start's last`, n === 0 && sprites === 0,
+        `${n} pixels differ, ${sprites} sprite pixels`);
 }
 process.exit(failed ? 1 : 0);

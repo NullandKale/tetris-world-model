@@ -21,7 +21,7 @@ try:
 except ImportError:
     OnnxDreamer = None
 
-from test_dynamics import window
+from test_dynamics import layered_window, window
 
 PALETTE = torch.randint(0, 256, (COLOURS, 3), generator=torch.Generator().manual_seed(0)).to(torch.uint8)
 
@@ -38,19 +38,20 @@ def motion_model(**options) -> Dynamics:
 @unittest.skipIf(OnnxDreamer is None, "needs onnx, onnxruntime and onnxscript")
 class OnnxTests(unittest.TestCase):
     def dream_both(self, model):
-        """3 real frames, then 7 dreamed (the 6-frame window fills and slides): each frame's colours from the
-        graphs and from PyTorch's Dreamer (each pixel's most likely colour)."""
-        x, acts = window(1, 10, 3), torch.randint(-1, 256, (1, 10), generator=torch.Generator().manual_seed(5))
+        """3 real frames (a two-layer model's layers), then 14 dreamed (the 6-frame ring goes round twice): each
+        frame's colours from the graphs and from PyTorch's Dreamer (each pixel's most likely colour)."""
+        x = layered_window(1, 17, 3) if model.two_layers else window(1, 17, 3)
+        acts = torch.randint(-1, 256, (1, 17), generator=torch.Generator().manual_seed(5))
         with tempfile.TemporaryDirectory() as folder:
             export(model, Path(folder), PALETTE)
-            onnx = OnnxDreamer(Path(folder), x[0, :3].numpy(), acts[0, :3].numpy(), keep=3)
+            onnx = OnnxDreamer(Path(folder), x[0, :3].numpy(), acts[0, :3].numpy())
             with torch.no_grad():
-                dreamer = Dreamer(model, x[0, :3], acts[0, :3], keep=3)
+                dreamer = Dreamer(model, x[0, :3], acts[0, :3])
                 for a in acts[0, 3:].tolist():
                     expected = PALETTE.numpy()[dreamer.step(a).argmax(-1).numpy()].astype(np.float32)
                     self.assertGreater((onnx.step(a) == expected).all(-1).mean(), 0.999)
                     drawn = motion_tokens(dreamer.motion[None], 16)[0].numpy()             # [N, cells]
-                    self.assertGreater((onnx.motion[-1] == drawn).mean(), 0.999)
+                    self.assertGreater((onnx.motion == drawn).mean(), 0.999)
 
     def test_a_motion_first_model_dreams_as_pytorch(self):
         torch.manual_seed(0)
@@ -59,6 +60,11 @@ class OnnxTests(unittest.TestCase):
     def test_the_plain_options_dream_as_pytorch_too(self):
         torch.manual_seed(1)
         self.dream_both(motion_model())
+
+    def test_a_two_layer_model_with_conv_ends_and_a_change_weight_dreams_as_pytorch(self):
+        torch.manual_seed(2)
+        self.dream_both(motion_model(space_rope=True, qk_norm=True, action_norm=True, local_attention=True,
+                                     two_layers=True, conv_ends=(8, 12, 16), change_weight=10.0))
 
     def test_a_model_without_motion_first_is_refused(self):
         model = Dynamics(dim=32, layers=2, heads=2, patch=16, frames=6, colour_dim=8).eval()

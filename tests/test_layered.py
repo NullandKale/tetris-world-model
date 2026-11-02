@@ -12,6 +12,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from token_world.data.nes_layers import BANDS, CELL, LAYER_COLOURS, SPRITES, TRANSPARENT, VIEW, compose
+from token_world.models.dynamics import rotary_turns
 from token_world.models.layered import (CELLS, SpatialAttention, build, mixed_rotary, patches, rollout, rotary,
                                         slots_of, unpatch)
 from token_world.models.layered_pixels import SPRITE_TOKENS, PixelLayers
@@ -93,7 +94,8 @@ class SharedTests(unittest.TestCase):
 
     def test_rotary_time_scores_by_how_far_apart_frames_are(self):
         q, k = torch.randn(1, 1, 1, 2, 24), torch.randn(1, 1, 1, 2, 24)
-        score = lambda tq, tk: (rotary(q, torch.tensor([tq])) * rotary(k, torch.tensor([tk]))).sum()
+        turn = lambda t: rotary_turns(torch.tensor([t]), 12)
+        score = lambda tq, tk: (rotary(q, turn(tq)) * rotary(k, turn(tk))).sum()
         self.assertTrue(torch.allclose(score(5, 3), score(40, 38), atol=1e-4))
         self.assertFalse(torch.allclose(score(5, 3), score(5, 4), atol=1e-4))
 
@@ -120,7 +122,7 @@ class SharedTests(unittest.TestCase):
             routed = layer(x, slots)
             b, t, n, d = x.shape
             q, k, v = layer.qkv(x).view(b, t, n, 3, layer.heads, d // layer.heads).unbind(3)
-            q, k = rotary(q, torch.arange(t)), rotary(k, torch.arange(t))
+            q, k = rotary(q, rotary_turns(torch.arange(t), q.shape[-1] // 2)), rotary(k, rotary_turns(torch.arange(t), k.shape[-1] // 2))
             naive = torch.zeros(t, n, d)
             for ti in range(t):
                 for i in range(0, n, 37):                                    # a sample of tokens
@@ -266,8 +268,9 @@ class OptionTests(unittest.TestCase):
 
     def test_mixed_rotary_turns_only_its_pairs(self):
         x = torch.randn(3, 2, 16)
-        self.assertTrue(torch.allclose(mixed_rotary(x, torch.zeros(3, 2, 4)), x))
-        turned = mixed_rotary(x, torch.full((3, 2, 4), 0.7))
+        turns = lambda angle: torch.stack((angle.cos(), angle.sin()))
+        self.assertTrue(torch.allclose(mixed_rotary(x, turns(torch.zeros(3, 2, 4))), x))
+        turned = mixed_rotary(x, turns(torch.full((3, 2, 4), 0.7)))
         self.assertTrue(torch.equal(turned[..., 8:], x[..., 8:]))
         self.assertTrue(torch.allclose(turned[..., :8].norm(dim=-1), x[..., :8].norm(dim=-1), atol=1e-5))
 

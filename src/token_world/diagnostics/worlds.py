@@ -35,8 +35,9 @@ class World:
         self.step = int(saved["step"])
         self.layered = saved["args"].get("kind") == "layered"
         self.latent = saved["args"].get("kind") == "latent"
-        self.palette = (saved["palettes"]["tetris"] if isinstance(saved["palettes"], dict) else
-                        saved["palettes"]).cpu().numpy().astype(np.uint8)
+        palettes = saved["palettes"]                 # by game; a run trains on one (Tetris unless --game)
+        self.palette = (palettes.get("tetris", next(iter(palettes.values()))) if isinstance(palettes, dict) else
+                        palettes).cpu().numpy().astype(np.uint8)
 
     def __repr__(self) -> str:
         return f"World({self.name} @ {self.step:,})"
@@ -102,12 +103,15 @@ class World:
             return np.stack(made, 1), None, None
 
     def dreaming(self, frames: np.ndarray, actions: np.ndarray, layers: dict | None = None, keep: int | None = None,
-                 temperature: float = 1.0, seed: int = 0, change_weight: float = 1.0) -> "Dreaming":
-        """One game, played live: from real context (model frames [T0, 256, 256], incoming actions [T0],
-        layered frames for the layered models) -> a Dreaming whose step(action) makes the next frame.
-        keep: frames kept when the window slides; change_weight: the pixel model's (models/dynamics.py
-        weigh_changes)."""
-        return Dreaming(self, frames, actions, layers, keep, temperature, seed, change_weight)
+                 temperature: float = 1.0, seed: int = 0, change_weight: float = 1.0,
+                 motion: np.ndarray | None = None, options: dict | None = None) -> "Dreaming":
+        """One game, played live: from real context (model frames [T0, 256, 256], or a two-layer model's
+        [T0, 2, 256, 256], incoming actions [T0], layered frames for the layered models) -> a Dreaming whose
+        step(action) makes the next frame. keep: frames kept when the window slides; change_weight: the pixel
+        model's (models/dynamics.py weigh_changes); motion: a motion model's context motion codes [T0, 32, 32] in
+        its vocabulary (None: unknown, as a screenshot's); options: the pixel model's inference settings
+        (models/decoding.py OptionDreamer: steps, order, past, ring; none: the browser's)."""
+        return Dreaming(self, frames, actions, layers, keep, temperature, seed, change_weight, motion, options)
 
     def follow(self, frames: np.ndarray, actions: np.ndarray, layers: dict | None, future_actions: np.ndarray,
                seed: int = 0) -> np.ndarray:
@@ -122,7 +126,8 @@ class Dreaming:
     pixel's most likely colour) and, for the pixel model, its colour probabilities [256, 256, C] float32 on the
     World's device (None for the committed models)."""
 
-    def __init__(self, world: World, frames, actions, layers, keep, temperature, seed, change_weight):
+    def __init__(self, world: World, frames, actions, layers, keep, temperature, seed, change_weight, motion=None,
+                 options: dict | None = None):
         self.world = world
         device = world.device
         acts = torch.as_tensor(np.asarray(actions), device=device).long()
@@ -133,9 +138,11 @@ class Dreaming:
                                                    acts, keep=keep, change_weight=change_weight,
                                                    generator=torch.Generator(device=device).manual_seed(seed))
             elif not world.layered:
-                from token_world.models.dynamics import Dreamer
-                self.dreamer = Dreamer(world.model, torch.as_tensor(np.asarray(frames), device=device), acts,
-                                       keep=keep, change_weight=change_weight)
+                from token_world.models.decoding import OptionDreamer
+                self.dreamer = OptionDreamer(world.model, torch.as_tensor(np.asarray(frames), device=device), acts,
+                                             change_weight=change_weight,
+                                             motion=None if motion is None else torch.as_tensor(motion, device=device),
+                                             **(options or {}))
             else:
                 lay = {k: torch.as_tensor(np.asarray(v), device=device)[None] for k, v in layers.items()}
                 self.dreamer = world.model.Dreamer(world.model, lay, acts[None], keep=keep, temperature=temperature,
@@ -147,6 +154,10 @@ class Dreaming:
         models have none."""
         if not self.world.layered and not self.world.latent:
             self.dreamer.set_change_weight(weight)
+
+    def newest(self) -> torch.Tensor:
+        """The pixel model's newest frame's features [1, N, dim] (a policy head's input, models/policy_head.py)."""
+        return self.dreamer.newest
 
     @torch.no_grad()
     def step(self, action: int) -> tuple[np.ndarray, torch.Tensor | None]:
