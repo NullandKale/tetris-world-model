@@ -44,7 +44,11 @@
 // a third gained nothing in either (2026-10-18).
 const IN_FLIGHT = 2;
 const STATE = 3;                                          // tensors a step hands the next: content, motion, last
-export const TRACE = 36_000;                                     // steps a trace keeps (10 minutes at 60 a second)
+export const TRACE = 36_000;                              // steps a trace keeps (10 minutes at 60 a second)
+// Frames an embed run takes at most: each frame is embedded alone (a patch convolution), so a long start goes in
+// runs. 63 frames at once failed on a phone's GPU (2026-11-03, Android: "Invalid ShaderModule Conv2dMM"); 3,
+// the old start's length, played there.
+const EMBED_RUN = 3;
 
 export class Dreamer {
   static async create(ort, load, start, actions, { executionProviders = ["webgpu"], sessionOptions = {},
@@ -94,13 +98,20 @@ export class Dreamer {
   // no real frame sees a later one, and the steps write over them); the last goes in with the first step.
   async reset(start, actions) {
     await Promise.all(this.flight.splice(0));
-    const { content, last } = await this.embed.run({ frames: new this.ort.Tensor("uint8", start.data, start.shape) });
-    this.runs.embed++;
     const size = this.n * this.dim, cells = this.n * this.cells;
+    const count = start.shape[0], bytes = start.data.length / count;       // a frame's bytes (each layer's)
+    const frames = [];
+    let last = null;
+    for (const [from, to] of embedRuns(count)) {           // the start's frames' content, EMBED_RUN at a time
+      const out = await this.embed.run({ frames: new this.ort.Tensor("uint8", start.data.subarray(from * bytes, to * bytes),
+                                                                     [to - from, ...start.shape.slice(1)]) });
+      this.runs.embed++;
+      for (let i = 0; i < to - from; i++)
+        frames.push(new this.ort.Tensor("float32", out.content.data.slice(i * size, (i + 1) * size), [this.n, this.dim]));
+      last = out.last;                                     // the last run's: the start's last frame's colours
+    }
     this.drop([this.content, this.motion, this.last, ...this.spent].filter(Boolean));
     this.spent = [];
-    const frames = Array.from(actions, (_, i) =>
-      new this.ort.Tensor("float32", content.data.slice(i * size, (i + 1) * size), [this.n, this.dim]));
     const motion = Array.from(actions, () =>
       new this.ort.Tensor("float32", new Float32Array(cells).fill(this.meta.unknown), [this.n, this.cells]));
     const t = frames.length - 1, p = this.meta.prefill;
@@ -178,6 +189,16 @@ export class Dreamer {
     this.timing.write = performance.now() - ran;
     return out.rgb;
   }
+}
+
+// A start of `count` frames (3 or more) -> the [from, to) runs it is embedded in: EMBED_RUN frames each, a last
+// run of one made two of two (embed.onnx takes 2 frames or more).
+function embedRuns(count) {
+  const sizes = new Array(Math.floor(count / EMBED_RUN)).fill(EMBED_RUN);
+  if (count % EMBED_RUN === 1) sizes.splice(-1, 1, 2, 2);
+  else if (count % EMBED_RUN) sizes.push(count % EMBED_RUN);
+  let from = 0;
+  return sizes.map((size) => [from, (from += size)]);
 }
 
 // The cache write: a step's new_keys, new_values [layers, tokens, heads, head_dim] into each layer's keys
