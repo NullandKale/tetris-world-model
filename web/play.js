@@ -5,14 +5,17 @@
 //   ?verbose              onnxruntime's own log, everything (node placements, ...)
 //   ?check                first dream the start with no buttons against PyTorch's frames (model/reference.bin)
 //   ?model=NAME           the graphs in model_NAME/ instead of model/ (another export to try on a device)
+//   ?slow=MS              each step takes at least MS ms (a slow GPU, to see frame skip on a fast one)
 import * as ort from "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.30.0/dist/ort.webgpu.min.mjs";
 import { Dreamer, GpuScreen, startFrames } from "./dreamer.js";
 import { setupEditor } from "./shot_editor.js";
 import { FrameGraph } from "./frame_graph.js";
+import { Presses, Timeline } from "./presses.js";
 import { Timings, catchProfiles, findBackend, log, logged, profile, warn, watchDevice } from "./diagnostics.js";
 
 const OPTIONS = new URLSearchParams(location.search);
 const PROFILE = OPTIONS.has("profile"), VERBOSE = OPTIONS.has("verbose"), PROFILE_FRAMES = 120;
+const SLOW = Number(OPTIONS.get("slow")) || 0;
 const MODEL = OPTIONS.has("model") ? `model_${OPTIONS.get("model").replace(/[^a-z0-9_-]/gi, "")}` : "model";
 ort.env.wasm.wasmPaths = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.30.0/dist/";
 ort.env.logLevel = VERBOSE ? "verbose" : "warning";
@@ -24,7 +27,7 @@ const KEYS = { ArrowLeft: LEFT, ArrowRight: RIGHT, ArrowDown: DOWN, ArrowUp: UP,
                Enter: START, Shift: SELECT };
 const NAMES = [["A", A], ["B", B], ["Select", SELECT], ["Start", START], ["Up", UP], ["Down", DOWN],
                ["Left", LEFT], ["Right", RIGHT]];
-const FRAME_MS = 1000 / 60;
+const MAX_SKIP = 6;                                 // frames a step may cover at most; slower, the game slows
 
 const $ = (id) => document.getElementById(id);
 const screen = $("screen");
@@ -34,6 +37,7 @@ let tapped = 0;                                     // buttons pressed since the
                                                     // a tap shorter than a frame, 250 ms at 4 frames/s, never
                                                     // reached the model; now it gets one frame)
 const touches = new Map();                          // on-screen button held by each pointer (finger, mouse)
+const presses = new Presses();                      // the buttons at 60 frames a second (presses.js)
 
 const load = logged(async (name) => {
   const response = await fetch(`${MODEL}/${name}`);
@@ -121,12 +125,35 @@ async function check() {
 const TOLERANCE = 2;                             // colour values: PyTorch's are rounded to bytes
 const median = (xs) => xs.length ? [...xs].sort((a, b) => a - b)[xs.length >> 1] : NaN;
 
+// The play loop on the game's clock (presses.js): a step starts at the earliest at the next frame's 60th of a
+// second and covers the frames since the last step's, at most MAX_SKIP (the skip: the Timeline shows each step's
+// frames and their buttons). The model takes one frame a step whatever the skip (its training's: no model
+// learned to skip yet), from the buttons held now and those tapped since the last step.
 async function run() {
   let average = 0, frames = 0, last = performance.now();
+  let shown = presses.frame(last);                   // the game frame on the screen
   const timings = new Timings(), graph = new FrameGraph($("frame-graph"), $("frame-legend"));
+  const timeline = new Timeline($("press-timeline"), $("press-stats"));
   for (;;) {
-    if (paused) { await sleep(50); last = performance.now(); timings.reset(last); continue; }
+    if (paused) {
+      await sleep(50);
+      last = performance.now();
+      timings.reset(last);
+      presses.restart(shown + 1, last);              // the clock stops while paused
+      continue;
+    }
     const began = performance.now();
+    let reached = Math.max(shown + 1, presses.frame(began));     // the game frame this step shows
+    let dropped = 0;
+    if (reached - shown > MAX_SKIP) {                // too slow even skipping: the game slows down, and the
+      for (const byte of presses.bytes(shown + 1, reached - MAX_SKIP + 1)) dropped |= byte;   // frames it
+      presses.restart(shown + MAX_SKIP, began);      // drops give their buttons to the step's first, as a tap
+      reached = shown + MAX_SKIP;
+    }
+    const bytes = presses.bytes(shown + 1, reached + 1);
+    bytes[0] |= dropped;
+    timeline.add(shown + 1, bytes);
+    shown = reached;
     pending = dreamer.next(held | tapped);     // restart waits for it: never two runs on one cache
     tapped = 0;
     const frame = await pending, drawing = performance.now();
@@ -137,7 +164,8 @@ async function run() {
     if (PROFILE && frames + 1 === PROFILE_FRAMES) document.body.dataset.profile = profile(dreamer.sessions, dreamer.runs);
     const took = performance.now() - began;
     average = frames++ ? 0.9 * average + 0.1 * took : took;
-    await sleep(Math.max(0, FRAME_MS - (performance.now() - last)));
+    if (SLOW) await sleep(SLOW - took);
+    await sleep(presses.start(shown + 1) - performance.now());
     const now = performance.now(), fps = 1000 / (now - last);
     graph.add(now - last, dreamer.timing.run, dreamer.timing.write, drawn);
     last = now;
@@ -152,9 +180,10 @@ async function run() {
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 // The controller byte the next frame gets: the keyboard's buttons and the on-screen ones, together.
-function update() {
+function update(time = performance.now()) {
   held = keyboard;
   for (const bit of touches.values()) held |= bit;
+  presses.set(held, time);
   $("held").textContent = NAMES.filter(([, b]) => held & b).map(([n]) => n).join(" ");
   for (const button of $("pad").querySelectorAll("button"))
     button.classList.toggle("down", (held & Number(button.dataset.bit)) !== 0);
@@ -166,17 +195,17 @@ function key(event, down) {
   event.preventDefault();
   keyboard = down ? keyboard | bit : keyboard & ~bit;
   if (down) tapped |= bit;
-  update();
+  update(event.timeStamp);
 }
 
 for (const button of $("pad").querySelectorAll("button")) {
   const bit = Number(button.dataset.bit);
-  const release = (e) => { touches.delete(e.pointerId); update(); };
+  const release = (e) => { touches.delete(e.pointerId); update(e.timeStamp); };
   button.addEventListener("pointerdown", (e) => {
     e.preventDefault();
     touches.set(e.pointerId, bit);
     tapped |= bit;
-    update();
+    update(e.timeStamp);
   });
   button.addEventListener("pointerup", release);
   button.addEventListener("pointercancel", release);
