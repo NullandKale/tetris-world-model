@@ -1137,12 +1137,12 @@ def deepen(model: Dynamics, source: dict[str, torch.Tensor], new_at: int | None 
 
 def load_run(run, device: str = "cuda") -> tuple[Dynamics, dict]:
     """A run's model_latest.pt as an eval model with its averaged weights -> (model, checkpoint).
-    Refuses runs trained on another frame layout (model_frames.BORDER_VERSION): they would read the
-    frames' border wrongly."""
-    from token_world.data.model_frames import BORDER_VERSION
+    Refuses runs trained on another frame layout than BORDER_VERSION or BLANK_BORDER (model_frames): they
+    would read the frames' border wrongly (a BLANK_BORDER run's frames are the caller's to blank)."""
+    from token_world.data.model_frames import BLANK_BORDER, BORDER_VERSION
     saved = torch.load(Path(run) / "model_latest.pt", map_location=device, weights_only=False)
-    if saved["args"].get("border") != BORDER_VERSION:
-        raise ValueError(f"{run} was trained on another frame layout than {BORDER_VERSION}")
+    if saved["args"].get("border") not in (BORDER_VERSION, BLANK_BORDER):
+        raise ValueError(f"{run} was trained on another frame layout than {BORDER_VERSION} or {BLANK_BORDER}")
     model = build(saved["args"]).to(device).eval()
     model.load_state_dict(saved["ema"])
     return model, saved
