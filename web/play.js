@@ -8,6 +8,7 @@
 import * as ort from "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.30.0/dist/ort.webgpu.min.mjs";
 import { Dreamer, GpuScreen, startFrames } from "./dreamer.js";
 import { setupEditor } from "./shot_editor.js";
+import { FrameGraph } from "./frame_graph.js";
 import { Timings, catchProfiles, findBackend, log, logged, profile, warn, watchDevice } from "./diagnostics.js";
 
 const OPTIONS = new URLSearchParams(location.search);
@@ -122,7 +123,7 @@ const median = (xs) => xs.length ? [...xs].sort((a, b) => a - b)[xs.length >> 1]
 
 async function run() {
   let average = 0, frames = 0, last = performance.now();
-  const timings = new Timings();
+  const timings = new Timings(), graph = new FrameGraph($("frame-graph"), $("frame-legend"));
   for (;;) {
     if (paused) { await sleep(50); last = performance.now(); timings.reset(last); continue; }
     const began = performance.now();
@@ -131,12 +132,14 @@ async function run() {
     const frame = await pending, drawing = performance.now();
     draw(frame);
     frame.dispose();
-    timings.add(dreamer.timing, performance.now() - drawing);
+    const drawn = performance.now() - drawing;
+    timings.add(dreamer.timing, drawn);
     if (PROFILE && frames + 1 === PROFILE_FRAMES) document.body.dataset.profile = profile(dreamer.sessions, dreamer.runs);
     const took = performance.now() - began;
     average = frames++ ? 0.9 * average + 0.1 * took : took;
     await sleep(Math.max(0, FRAME_MS - (performance.now() - last)));
     const now = performance.now(), fps = 1000 / (now - last);
+    graph.add(now - last, dreamer.timing.run, dreamer.timing.write, drawn);
     last = now;
     if (frames % 10 === 0) {
       status(`${backend === "webgpu" ? `WebGPU${gpu ? ` (${gpu})` : ""}` : "WebAssembly (no WebGPU: slow)"}\n` +
