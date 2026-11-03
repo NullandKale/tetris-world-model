@@ -29,7 +29,11 @@
 // `ort` is passed in, so the same class runs on onnxruntime-web (browser) and onnxruntime-node (tests):
 // Dreamer.create(ort, load, start, actions, options), where load(name) resolves a model file's bytes and
 // start holds the start's frames: { data: Uint8Array of palette indices, shape: [frames, ...meta.frame] }.
-// next(action) returns the frame's colours as an ort.Tensor [256, 256, 3] float32 (getData() reads them).
+// next(action, earlier) returns the frame's colours as an ort.Tensor [256, 256, 3] float32 (getData() reads
+// them). A frame-skip model (meta.skip > 1) takes steps of 1..meta.skip frames: earlier holds the bytes of the
+// frames the step skips, newest first, and the graph gets each of its two frames' earlier bytes and frame clock.
+// dreamer.trace records what every step since the last reset fed the graph (diagnostics/input_trace.py checks it
+// against training's layout; the page saves it with its own record of the buttons, play.js), up to TRACE steps.
 // dreamer.timing holds the last step's times (ms): run (the graph's run, with the wait for the step before on
 // WebGPU) and write (the cache write); dreamer.runs counts each
 // graph's runs and dreamer.sessions holds them (diagnostics.js profile). options.log(text) hears each graph's
@@ -40,6 +44,7 @@
 // a third gained nothing in either (2026-10-18).
 const IN_FLIGHT = 2;
 const STATE = 3;                                          // tensors a step hands the next: content, motion, last
+export const TRACE = 36_000;                                     // steps a trace keeps (10 minutes at 60 a second)
 
 export class Dreamer {
   static async create(ort, load, start, actions, { executionProviders = ["webgpu"], sessionOptions = {},
@@ -111,6 +116,10 @@ export class Dreamer {
     this.cache = this.meta.cache.names.map((name) => out[name]);
     [this.content, this.motion, this.last, this.action] = [frames[t], motion[t], last, Number(actions[t])];
     this.t = frames.length;                                // frames so far: the next one's number
+    this.skip = this.meta.skip ?? 1;
+    this.skipped = new Array(this.skip - 1).fill(-1);      // the newest frame's step's earlier bytes (none)
+    this.clock = t;                                        // its frame on the frame clock
+    this.trace = { skip: this.skip, start: Array.from(actions, Number), steps: [] };
   }
 
   drop(tensors) {
@@ -138,14 +147,22 @@ export class Dreamer {
 
   // The frame that controller byte `action` produces: its colours, an ort.Tensor [256, 256, 3] (on the GPU on
   // WebGPU: GpuScreen draws it; getData() reads it; dispose() it when drawn).
-  async next(action) {
+  async next(action, earlier = []) {
     const began = performance.now();
+    if (earlier.length && earlier.length >= this.skip)
+      throw new Error(`a step covers at most ${this.skip} frames: ${1 + earlier.length} asked`);
     if (this.flight.length >= IN_FLIGHT) await this.flight.shift();     // IN_FLIGHT steps ahead of the GPU at most
     const at = this.t;
-    const int32 = (values) => new this.ort.Tensor("int32", Int32Array.from(values), [values.length]);
+    const skipped = [...Array.from(earlier, Number), ...new Array(this.skip - 1 - earlier.length).fill(-1)];
+    const clock = this.clock + 1 + earlier.length;
+    const fed = { actions: [this.action, Number(action)], skipped: [this.skipped, skipped], clock: [this.clock, clock],
+                  at: [at] };
+    if (this.trace.steps.length < TRACE) this.trace.steps.push(fed);
+    const int32 = (values, dims = [values.length]) => new this.ort.Tensor("int32", Int32Array.from(values), dims);
     const out = await this.step.run({
       previous: this.content, previous_motion: this.motion,
-      actions: int32([this.action, action]), at: int32([at]), last: this.last,
+      actions: int32(fed.actions), at: int32(fed.at), last: this.last,
+      ...(this.skip > 1 ? { skipped: int32(fed.skipped.flat(), [2, this.skip - 1]), clock: int32(fed.clock) } : {}),
       ...Object.fromEntries(this.meta.cache.names.map((name, i) => [name, this.cache[i]])) });
     const ran = performance.now();
     this.runs.step++;
@@ -153,7 +170,8 @@ export class Dreamer {
     this.drop([out.new_keys, out.new_values]);
     this.spent.push(this.content, this.motion, this.last); // queued steps may still read them: freed later
     if (this.spent.length > STATE * (IN_FLIGHT + 1)) this.drop(this.spent.splice(0, STATE));
-    [this.content, this.motion, this.last, this.action] = [out.content, out.motion, out.last_out, action];
+    [this.content, this.motion, this.last, this.action] = [out.content, out.motion, out.last_out, Number(action)];
+    [this.skipped, this.clock] = [skipped, clock];
     this.t++;
     if (this.device) this.flight.push(this.device.queue.onSubmittedWorkDone());
     this.timing.run = ran - began;

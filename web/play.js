@@ -7,7 +7,7 @@
 //   ?model=NAME           the graphs in model_NAME/ instead of model/ (another export to try on a device)
 //   ?slow=MS              each step takes at least MS ms (a slow GPU, to see frame skip on a fast one)
 import * as ort from "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.30.0/dist/ort.webgpu.min.mjs";
-import { Dreamer, GpuScreen, startFrames } from "./dreamer.js";
+import { Dreamer, GpuScreen, TRACE, startFrames } from "./dreamer.js";
 import { setupEditor } from "./shot_editor.js";
 import { FrameGraph } from "./frame_graph.js";
 import { Presses, Timeline } from "./presses.js";
@@ -28,6 +28,7 @@ const KEYS = { ArrowLeft: LEFT, ArrowRight: RIGHT, ArrowDown: DOWN, ArrowUp: UP,
 const NAMES = [["A", A], ["B", B], ["Select", SELECT], ["Start", START], ["Up", UP], ["Down", DOWN],
                ["Left", LEFT], ["Right", RIGHT]];
 const MAX_SKIP = 6;                                 // frames a step may cover at most; slower, the game slows
+                                                    // (a frame-skip model's: at most its skip)
 
 const $ = (id) => document.getElementById(id);
 const screen = $("screen");
@@ -38,6 +39,8 @@ let tapped = 0;                                     // buttons pressed since the
                                                     // reached the model; now it gets one frame)
 const touches = new Map();                          // on-screen button held by each pointer (finger, mouse)
 const presses = new Presses();                      // the buttons at 60 frames a second (presses.js)
+let traced = [];                                    // every game frame's byte the steps since the last reset got,
+                                                    // oldest first: the trace's own record (Save trace)
 
 const load = logged(async (name) => {
   const response = await fetch(`${MODEL}/${name}`);
@@ -120,6 +123,7 @@ async function check() {
   document.body.dataset.check = result;
   log(result);
   await dreamer.reset(context.start, context.actions);
+  traced = [];
 }
 
 const TOLERANCE = 2;                             // colour values: PyTorch's are rounded to bytes
@@ -127,10 +131,12 @@ const median = (xs) => xs.length ? [...xs].sort((a, b) => a - b)[xs.length >> 1]
 
 // The play loop on the game's clock (presses.js): a step starts at the earliest at the next frame's 60th of a
 // second and covers the frames since the last step's, at most MAX_SKIP (the skip: the Timeline shows each step's
-// frames and their buttons). The model takes one frame a step whatever the skip (its training's: no model
-// learned to skip yet), from the buttons held now and those tapped since the last step.
+// frames and their buttons). A frame-skip model's step is all of them: the newest frame's byte and the others',
+// newest first (dreamer.next), as training gives a step (data/world_nes_tetris.py step_bytes). Any other model
+// takes one frame a step whatever the skip, from the buttons held now and those tapped since the last step.
 async function run() {
   let average = 0, frames = 0, last = performance.now();
+  const skips = dreamer.skip > 1, most = skips ? Math.min(MAX_SKIP, dreamer.skip) : MAX_SKIP;
   let shown = presses.frame(last);                   // the game frame on the screen
   const timings = new Timings(), graph = new FrameGraph($("frame-graph"), $("frame-legend"));
   const timeline = new Timeline($("press-timeline"), $("press-stats"));
@@ -145,17 +151,19 @@ async function run() {
     const began = performance.now();
     let reached = Math.max(shown + 1, presses.frame(began));     // the game frame this step shows
     let dropped = 0;
-    if (reached - shown > MAX_SKIP) {                // too slow even skipping: the game slows down, and the
-      for (const byte of presses.bytes(shown + 1, reached - MAX_SKIP + 1)) dropped |= byte;   // frames it
-      presses.restart(shown + MAX_SKIP, began);      // drops give their buttons to the step's first, as a tap
-      reached = shown + MAX_SKIP;
+    if (reached - shown > most) {                    // too slow even skipping: the game slows down, and the
+      for (const byte of presses.bytes(shown + 1, reached - most + 1)) dropped |= byte;   // frames it drops
+      presses.restart(shown + most, began);          // give their buttons to the step's first, as a tap
+      reached = shown + most;
     }
     const bytes = presses.bytes(shown + 1, reached + 1);
     bytes[0] |= dropped;
     timeline.add(shown + 1, bytes);
     shown = reached;
-    pending = dreamer.next(held | tapped);     // restart waits for it: never two runs on one cache
-    tapped = 0;
+    const fed = skips ? Array.from(bytes) : [held | tapped];
+    if (dreamer.trace.steps.length < TRACE) traced.push(...fed);
+    pending = dreamer.next(fed.at(-1), fed.slice(0, -1).reverse());   // restart waits for it: never two runs on
+    tapped = 0;                                                        // one cache
     const frame = await pending, drawing = performance.now();
     draw(frame);
     frame.dispose();
@@ -223,11 +231,24 @@ async function restartWith(start) {
   await pending;
   context = start;
   await dreamer.reset(context.start, context.actions);
+  traced = [];
   paused = false;
   $("pause").textContent = "Pause";
   screen.focus();
 }
 $("restart").addEventListener("click", () => restartWith(context));
+// The steps since the last reset as a file: what each fed the model (dreamer.trace) and the page's own record of
+// every frame's byte; scripts/input_trace_check.py checks they are in training's order.
+$("save-trace").addEventListener("click", () => {
+  if (!dreamer) return;
+  const trace = { ...dreamer.trace, frames: traced, model: MODEL, agent: navigator.userAgent };
+  const link = document.createElement("a");
+  link.href = URL.createObjectURL(new Blob([JSON.stringify(trace)], { type: "application/json" }));
+  link.download = `trace_${MODEL}_${new Date().toISOString().replace(/[:.]/g, "-")}.json`;
+  link.click();
+  setTimeout(() => URL.revokeObjectURL(link.href), 10_000);
+  screen.focus();
+});
 $("pause").addEventListener("click", () => {
   paused = !paused;
   $("pause").textContent = paused ? "Resume" : "Pause";
