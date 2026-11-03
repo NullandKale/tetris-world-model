@@ -2,7 +2,7 @@
 // split into the step's run (with the wait for the GPU's step before: dreamer.timing), the cache write, the draw
 // and the rest (the wait for the next 60th of a second, and whatever else the browser did meanwhile); lines at
 // 60 and 30 frames/s, and the median, 90% and worst frame time under it. A bar taller than the graph is cut, a
-// red tip on top.
+// red tip on top. On a slow device (top over 100 ms) the lines are at round times instead.
 const COUNT = 240;
 const PARTS = [["step", "#7cc4ff"], ["cache write", "#c792ea"], ["draw", "#7fd88f"], ["rest", "#4a4a5c"]];
 const LINES = [[1000 / 60, "60/s"], [1000 / 30, "30/s"]];
@@ -45,7 +45,11 @@ export class FrameGraph {
     });
     ctx.font = `${10 * scale}px system-ui, sans-serif`;
     ctx.textBaseline = "bottom";
-    for (const [ms, label] of [...LINES, [top, `${top} ms`]]) {
+    // a fast device's lines at 60 and 30 frames/s; a slow one's (a phone: 200 ms) at round times
+    const every = [50, 100, 200, 500, 1000].find((s) => top / s <= 4) ?? 2000;
+    const lines = top <= 100 ? LINES : Array.from({ length: Math.floor((top - 1) / every) },
+                                                   (_, i) => [(i + 1) * every, `${(i + 1) * every} ms`]);
+    for (const [ms, label] of [...lines, [top, `${top} ms`]]) {
       if (ms > top) continue;
       ctx.fillStyle = "rgba(228, 228, 236, 0.35)";
       ctx.fillRect(0, Math.round(y(ms)), w, scale);
