@@ -4,10 +4,9 @@
 // not while training runs (or expect slow times).
 //
 //     cd web && npm install && node check_browser.mjs [browser executable] [--root ../site/web] [--profile] [--firefox]
-//                                                     [--headed] [--model NAME]
+//                                                     [--headed]
 //
 // --root serves another folder (a built site's page, site/web); without model/reference.bin there it plays only.
-// --model NAME opens the page with ?model=NAME (the graphs in model_NAME/).
 // --profile adds ?profile: each graph's GPU time by operation and node, after the page's PROFILE_FRAMES frames.
 // --firefox runs Firefox (WebDriver BiDi) instead of Chrome. --headed shows the window (headless Firefox has no
 // WebGPU on Windows: it plays on WebAssembly).
@@ -19,13 +18,12 @@ import { fileURLToPath } from "node:url";
 import puppeteer from "puppeteer-core";
 
 const args = process.argv.slice(2);
-const rootArg = args.indexOf("--root"), modelArg = args.indexOf("--model");
-const MODEL = modelArg >= 0 ? `model_${args[modelArg + 1]}` : "model";
+const rootArg = args.indexOf("--root");
 const ROOT = rootArg >= 0 ? join(process.cwd(), args[rootArg + 1]) : fileURLToPath(new URL(".", import.meta.url));
-const checking = existsSync(join(ROOT, MODEL, "reference.bin"));
+const checking = existsSync(join(ROOT, "model", "reference.bin"));
 const profile = args.includes("--profile"), firefox = args.includes("--firefox"), headless = !args.includes("--headed");
 const TYPES = { ".html": "text/html", ".js": "text/javascript", ".mjs": "text/javascript", ".json": "application/json" };
-const executable = args.find((a, i) => !a.startsWith("--") && args[i - 1] !== "--root" && args[i - 1] !== "--model")
+const executable = args.find((a, i) => !a.startsWith("--") && args[i - 1] !== "--root")
   ?? (firefox ? "C:/Program Files/Mozilla Firefox/firefox.exe" : "C:/Program Files/Google/Chrome/Application/chrome.exe");
 
 const server = createServer(async (request, response) => {
@@ -39,7 +37,7 @@ const server = createServer(async (request, response) => {
     response.writeHead(404).end();
   }
 }).listen(0);
-const options = [checking && "check", profile && "profile", modelArg >= 0 && `model=${args[modelArg + 1]}`].filter(Boolean);
+const options = [checking && "check", profile && "profile"].filter(Boolean);
 const url = `http://localhost:${server.address().port}/` + (options.length ? `?${options.join("&")}` : "");
 
 const browser = await puppeteer.launch(firefox

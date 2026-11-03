@@ -4,7 +4,6 @@
 //   ?profile              after PROFILE_FRAMES frames, log each graph's GPU time by operation and node
 //   ?verbose              onnxruntime's own log, everything (node placements, ...)
 //   ?check                first dream the start with no buttons against PyTorch's frames (model/reference.bin)
-//   ?model=NAME           the graphs in model_NAME/ instead of model/ (another export to try on a device)
 //   ?slow=MS              each step takes at least MS ms (a slow GPU, to see frame skip on a fast one)
 import * as ort from "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.30.0/dist/ort.webgpu.min.mjs";
 import { Dreamer, GpuScreen, TRACE, startFrames } from "./dreamer.js";
@@ -16,7 +15,6 @@ import { Timings, catchProfiles, findBackend, log, logged, profile, warn, watchD
 const OPTIONS = new URLSearchParams(location.search);
 const PROFILE = OPTIONS.has("profile"), VERBOSE = OPTIONS.has("verbose"), PROFILE_FRAMES = 120;
 const SLOW = Number(OPTIONS.get("slow")) || 0;
-const MODEL = OPTIONS.has("model") ? `model_${OPTIONS.get("model").replace(/[^a-z0-9_-]/gi, "")}` : "model";
 ort.env.wasm.wasmPaths = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.30.0/dist/";
 ort.env.logLevel = VERBOSE ? "verbose" : "warning";
 ort.env.webgpu.powerPreference = "high-performance";
@@ -43,8 +41,8 @@ let traced = [];                                    // every game frame's byte t
                                                     // oldest first: the trace's own record (Save trace)
 
 const load = logged(async (name) => {
-  const response = await fetch(`${MODEL}/${name}`);
-  if (!response.ok) throw new Error(`${MODEL}/${name}: ${response.status}`);
+  const response = await fetch(`model/${name}`);
+  if (!response.ok) throw new Error(`model/${name}: ${response.status}`);
   return new Uint8Array(await response.arrayBuffer());
 });
 
@@ -241,10 +239,10 @@ $("restart").addEventListener("click", () => restartWith(context));
 // every frame's byte; scripts/input_trace_check.py checks they are in training's order.
 $("save-trace").addEventListener("click", () => {
   if (!dreamer) return;
-  const trace = { ...dreamer.trace, frames: traced, model: MODEL, agent: navigator.userAgent };
+  const trace = { ...dreamer.trace, frames: traced, agent: navigator.userAgent };
   const link = document.createElement("a");
   link.href = URL.createObjectURL(new Blob([JSON.stringify(trace)], { type: "application/json" }));
-  link.download = `trace_${MODEL}_${new Date().toISOString().replace(/[:.]/g, "-")}.json`;
+  link.download = `trace_${new Date().toISOString().replace(/[:.]/g, "-")}.json`;
   link.click();
   setTimeout(() => URL.revokeObjectURL(link.href), 10_000);
   screen.focus();
