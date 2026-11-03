@@ -49,8 +49,7 @@ export class FrameGraph {
     const every = [50, 100, 200, 500, 1000].find((s) => top / s <= 4) ?? 2000;
     const lines = top <= 100 ? LINES : Array.from({ length: Math.floor((top - 1) / every) },
                                                    (_, i) => [(i + 1) * every, `${(i + 1) * every} ms`]);
-    for (const [ms, label] of [...lines, [top, `${top} ms`]]) {
-      if (ms > top) continue;
+    for (const [ms, label] of [...lines.filter(([ms]) => ms < 0.85 * top), [top, `${top} ms`]]) {   // none on the top's label
       ctx.fillStyle = "rgba(228, 228, 236, 0.35)";
       ctx.fillRect(0, Math.round(y(ms)), w, scale);
       ctx.fillStyle = "#9a9aae";
