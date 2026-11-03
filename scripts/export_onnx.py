@@ -30,7 +30,7 @@ import numpy as np
 import torch
 
 from token_world.data.real_tetris import game_start, start_context
-from token_world.diagnostics.worlds import blanked, load
+from token_world.diagnostics.worlds import load
 from token_world.models.dynamics import Dreamer
 from token_world.models.onnx_dreamer import OnnxDreamer
 from token_world.models.onnx_export import export
@@ -51,8 +51,6 @@ def main():
     started = time.perf_counter()
     pictures, actions, _, layers = start_context(game_start())
     frames = (layers if model.two_layers else pictures).astype(np.uint8)
-    if world.blank:                                       # a BLANK_BORDER model's start: its bands one shade
-        frames = blanked(frames, world.palette)
     export(model, args.out, palette)
     (args.out / "context.bin").write_bytes(np.ascontiguousarray(frames).tobytes())
     (args.out / "context.json").write_text(json.dumps({

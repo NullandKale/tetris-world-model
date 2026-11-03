@@ -28,16 +28,13 @@ ROOT = Path(__file__).resolve().parents[3]
 
 
 class World:
-    """A loaded model: name, step, layered (it needs layered context frames), blank (it reads frames in the
-    BLANK_BORDER layout: its starts are blanked, Dreaming)."""
+    """A loaded model: name, step, layered (it needs layered context frames)."""
 
     def __init__(self, model, saved: dict, name: str, device):
         self.model, self.saved, self.name, self.device = model, saved, name, torch.device(device)
         self.step = int(saved["step"])
         self.layered = saved["args"].get("kind") == "layered"
         self.latent = saved["args"].get("kind") == "latent"
-        from token_world.data.model_frames import BLANK_BORDER
-        self.blank = saved["args"].get("border") == BLANK_BORDER
         palettes = saved["palettes"]                 # by game; a run trains on one (Tetris unless --game)
         self.palette = (palettes.get("tetris", next(iter(palettes.values()))) if isinstance(palettes, dict) else
                         palettes).cpu().numpy().astype(np.uint8)
@@ -133,8 +130,6 @@ class Dreaming:
                  options: dict | None = None):
         self.world = world
         device = world.device
-        if world.blank:                                 # its layout: the start's border bands one shade
-            frames = blanked(frames, world.palette)
         acts = torch.as_tensor(np.asarray(actions), device=device).long()
         # the history is encoded as the steps run (bf16 on the GPU), so its cache holds what the steps write
         with torch.autocast(device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"):
@@ -175,15 +170,6 @@ class Dreaming:
             return composed({k: v[0].cpu().numpy() for k, v in frame.items() if k != "probs"}), None
 
 
-def blanked(frames, palette) -> np.ndarray:
-    """Model frames [T, 256, 256] (two layers [T, 2, 256, 256]) in the BLANK_BORDER layout, copied: the border
-    bands one shade (two layers: the background's; the sprite layer has none there)."""
-    from token_world.data.model_frames import blank_bands, border_slots
-    out = np.array(frames, copy=True)
-    blank_bands(out[:, 0] if out.ndim == 4 else out, border_slots(torch.as_tensor(palette)))
-    return out
-
-
 def composed(frame: dict) -> np.ndarray:
     """A layered frame -> its model frame [256, 256] (TRANSPARENT where nothing at all is drawn: colour 0)."""
     out = model_frame(compose(frame), frame["border"])
@@ -212,10 +198,10 @@ def load(run: str | Path, device: str = "cuda") -> World:
         from token_world.models.latent_dynamics import build
         model = build(saved["args"]).to(device).eval()
     else:
-        from token_world.data.model_frames import BLANK_BORDER, BORDER_VERSION
+        from token_world.data.model_frames import BORDER_VERSION
         from token_world.models.dynamics import build
-        if saved["args"].get("border") not in (BORDER_VERSION, BLANK_BORDER):
-            raise ValueError(f"{run} was trained on another frame layout than {BORDER_VERSION} or {BLANK_BORDER}")
+        if saved["args"].get("border") != BORDER_VERSION:
+            raise ValueError(f"{run} was trained on another frame layout than {BORDER_VERSION}")
         model = build(saved["args"]).to(device).eval()
     model.load_state_dict(saved["ema"])
     return World(model, saved, name, device)

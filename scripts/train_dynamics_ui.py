@@ -895,8 +895,6 @@ class Member:
             saved = torch.load(args.post_train, map_location="cuda", weights_only=False)
             differ = {k: (saved["args"].get(k), v) for k, v in self.config.items()
                       if json.dumps(saved["args"].get(k), default=str) != json.dumps(v, default=str)}
-            if differ.get("border") == (BORDER_VERSION, BLANK_BORDER):    # onto the blank layout: --blank-border's
-                del differ["border"]                      # post-train (the user's stage 3, 2026-11-02)
             if differ:
                 raise ValueError(f"--post-train {args.post_train}: its model differs from this run's: {differ}")
             saved = {k: saved[k] for k in ("step", "model", "optimizer", "ema")}   # its schedule's state stays
@@ -1613,8 +1611,7 @@ def main():
                    help="checkpoints kept at every long-dream test, in <archive>/<run folder>/ (D: has the space)")
     p.add_argument("--frames", type=int, default=64, help="window length: the model's context")
     p.add_argument("--blank-border", action="store_true",
-                   help="Tetris alone, from scratch or with --post-train from a bordered run (the border's stage 3): "
-                        "both border bands one shade in every frame (model_frames.BLANK_BORDER: no frame "
+                   help="Tetris alone: both border bands one shade in every frame (model_frames.BLANK_BORDER: no frame "
                         "counter, fall timer or autorepeat drawn; the model reads them from its history)")
     p.add_argument("--two-layers", action="store_true",
                    help="SMB: each frame as the PPU's two layers, the background with no sprites and the sprites "
@@ -1674,8 +1671,8 @@ def main():
     args.rows = args.rows or args.workers_per_game
     if args.post_train and args.grow_from:
         p.error("--post-train continues a run as it is: not with --grow-from")
-    if args.blank_border and (args.game != "tetris" or args.grow_from):
-        p.error("--blank-border: Tetris alone, from scratch or post-training a bordered run (--post-train)")
+    if args.blank_border and (args.game != "tetris" or args.post_train or args.grow_from):
+        p.error("--blank-border: Tetris alone, from scratch (its frames are another layout)")
     if args.hold_lr and (args.stairs or args.cooldown):
         p.error("--hold-lr is the whole schedule: not with --stairs or --cooldown")
     if args.ram_codes and (args.game == "smb" or args.branches
