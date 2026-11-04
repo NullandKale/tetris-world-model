@@ -3,6 +3,8 @@ __pycache__/
 output/
 web/node_modules/
 web/model/reference.bin
+web/model/skip_reference.bin
+web/model/skip_steps.json
 # game ROMs are never published
 *.nes
 *.fds

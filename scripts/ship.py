@@ -20,18 +20,19 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 ENTRIES = ["scripts/train_dynamics_ui.py", "scripts/export_onnx.py", "scripts/ship.py", "scripts/play_world_model.py",
            "scripts/long_dream_check.py", "scripts/event_checks.py", "scripts/view_runs.py", "scripts/tetris_scenarios.py",
-           "scripts/button_swap_check.py", "scripts/motion_swap_check.py",
+           "scripts/button_swap_check.py", "scripts/motion_swap_check.py", "scripts/input_trace_check.py",
            "tests/test_nes_layers.py", "tests/test_onnx.py", "tests/test_worlds.py", "tests/test_live_events.py",
            "tests/test_world_nes_tetris.py", "tests/test_tetris_events.py", "tests/test_tetris_bot.py",
            "tests/test_tetris_scenarios.py", "tests/test_long_dream.py", "tests/test_coherence.py", "tests/test_bias.py",
            "tests/test_restart.py", "tests/test_play.py", "tests/test_run_outputs.py", "tests/test_dynamics.py",
-           "tests/test_stacking.py"]
+           "tests/test_stacking.py", "tests/test_input_trace.py"]
 EXTRA = ["scripts/run_until_stopped.ps1"]
 SKIP = ("contra", "smb")                        # module names: the Contra port and SMB work are not shipped,
 KEEP = ("smb_motion",)                          # but the motion codes, which the Tetris runs' vocabulary and
                                                 # pictures read (data/motion_vocab.py, diagnostics/motion_pictures.py)
-PAGE = ["index.html", "play.js", "dreamer.js", "diagnostics.js", "screenshot.js", "shot_editor.js", "check_browser.mjs",
-        "check_screenshot.mjs", "test_dreamer.mjs", "test_screenshot.mjs", "package.json", "package-lock.json"]
+PAGE = ["index.html", "play.js", "dreamer.js", "diagnostics.js", "screenshot.js", "shot_editor.js", "presses.js",
+        "frame_graph.js", "check_browser.mjs", "check_screenshot.mjs", "test_dreamer.mjs", "test_screenshot.mjs",
+        "test_presses.mjs", "package.json", "package-lock.json"]
 MODEL = ["embed.onnx", "prefill.onnx", "step.onnx", "model.json", "context.bin", "context.json"]
 ROMS = (".nes", ".fds", ".unf", ".unif")
 
@@ -69,6 +70,8 @@ GITIGNORE = """__pycache__/
 output/
 web/node_modules/
 web/model/reference.bin
+web/model/skip_reference.bin
+web/model/skip_steps.json
 # game ROMs are never published
 *.nes
 *.fds
@@ -103,13 +106,14 @@ are small conv pyramids (2 x 2 steps between a token and its pixels). Each frame
 still, moved from where, or new) goes in beside its pixels and comes out of every token, and a dreamed frame
 draws its motion first, then its pixels given it (VideoJAM's joint appearance and motion), which is how A and B
 turn a piece the right way. Trained by masked next-frame prediction on live emulator play, changed pixels
-weighed 10 times: 135,582 steps from scratch, then post-trained to step {step:,} on players that press like
+weighed 10 times: 135,582 steps from scratch, then post-trained to step 151,606 on players that press like
 people (buttons held, Down held through turns) with each window carrying the last one's keys and values
-(Transformer-XL's memory), as the browser's ring of frames does.
+(Transformer-XL's memory), as the browser's ring of frames does, then to step {step:,} with frame skip: each step
+1 to 6 frames on, with every frame's buttons and a frame clock, so a slow device plays at the game's speed.
 
 **Play it:** the page in `web/` (published by GitHub Pages) runs the step-{step:,} checkpoint with
-onnxruntime-web on WebGPU (Chrome or Edge; elsewhere a slow WebAssembly fallback), from the start of a
-level-0 game (three frames, as both layers) or from any picture ("Start from an image": all of it background,
+onnxruntime-web on WebGPU (Chrome or Edge; elsewhere a slow WebAssembly fallback), from the level-select menu
+(63 frames, as both layers: pick a level, then Start) or from any picture ("Start from an image": all of it background,
 so a falling piece in it is read as stack). Arrows move and drop, X / Z rotate, Enter is Start; on a phone, the
 on-screen controller.
 

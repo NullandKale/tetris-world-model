@@ -22,6 +22,7 @@ except ImportError:
     OnnxDreamer = None
 
 from test_dynamics import layered_window, window
+from token_world.diagnostics.input_trace import check
 
 PALETTE = torch.randint(0, 256, (COLOURS, 3), generator=torch.Generator().manual_seed(0)).to(torch.uint8)
 
@@ -65,6 +66,32 @@ class OnnxTests(unittest.TestCase):
         torch.manual_seed(2)
         self.dream_both(motion_model(space_rope=True, qk_norm=True, action_norm=True, local_attention=True,
                                      two_layers=True, conv_ends=(8, 12, 16), change_weight=10.0))
+
+    def test_a_frame_skip_model_dreams_as_pytorch_and_traces_training_order(self):
+        torch.manual_seed(3)
+        model = motion_model(space_rope=True, qk_norm=True, action_norm=True, local_attention=True, skip=4)
+        with torch.no_grad():                                     # earlier bytes that matter (they start at zero)
+            model.skipped_action.weight.normal_()
+        x = window(1, 3, 3)
+        gen = torch.Generator().manual_seed(6)
+        gaps = [1, 3, 4, 2, 1, 4, 4, 3, 1, 2, 2, 4, 1, 3]              # the 6-frame ring round twice
+        with tempfile.TemporaryDirectory() as folder:
+            export(model, Path(folder), PALETTE)
+            onnx = OnnxDreamer(Path(folder), x[0].numpy(), np.array([-1, 0, 8]))
+            frames = []
+            with torch.no_grad():
+                dreamer = Dreamer(model, x[0], torch.tensor([-1, 0, 8]))
+                for gap in gaps:
+                    pressed = torch.randint(-1, 256, (gap,), generator=gen).tolist()      # oldest first
+                    earlier = pressed[:-1][::-1]
+                    expected = PALETTE.numpy()[dreamer.step(pressed[-1], earlier).argmax(-1).numpy()].astype(np.float32)
+                    self.assertGreater((onnx.step(pressed[-1], earlier) == expected).all(-1).mean(), 0.999)
+                    frames += pressed
+        trace = {**onnx.trace, "frames": frames}
+        self.assertEqual(check(trace)["gaps"], {1: 4, 2: 3, 3: 3, 4: 4})
+        trace["steps"][5]["skipped"][1] = trace["steps"][5]["skipped"][1][::-1]    # a step's bytes reversed
+        with self.assertRaisesRegex(ValueError, "step 5"):
+            check(trace)
 
     def test_a_model_without_motion_first_is_refused(self):
         model = Dynamics(dim=32, layers=2, heads=2, patch=16, frames=6, colour_dim=8).eval()

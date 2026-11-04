@@ -833,6 +833,45 @@ The play app's **change weight** multiplies the odds of every pixel change by w 
 effect on the next frame. Measured on stage B (docs/guides/recipe_attempts.md), w = 2 or 3 makes
 every long-dream score worse; the dreams and the browser decode at 1.
 
+### Next-piece choice: an open problem, under-measured (2026-11-03)
+
+The game picks every next piece at random (the NES re-rolls a repeat once). A dream has to choose like the
+game does: all 7 types, in about the real shares, with the piece in the next-piece box being the one that spawns.
+Playing the models, the user sees a poor mix of pieces. That is not new: the layered run's dreams chose one or
+two types (`recipe_attempts.md`, "Not learned: choosing the next piece").
+
+**What measures it now.** `diagnostics/bias.py`, at every long-dream test (`bias.csv`): it learns the box's real
+shapes from real frames and counts each new shape a dream's box shows. On the skip run at 180k (16 games):
+
+| | real games | dreams |
+|---|---|---|
+| pieces chosen | 15 | 9-12 |
+| types seen (of 7) | 6 | 4-5 |
+| most common type's share | 0.27 | 0.40-0.50 |
+| box frames garbled | - | 24-34% (postC: 10-29%; more at bigger skips) |
+
+So the dreams favour a few types and blur the box. But the test reads only the first 128 frames of each dream
+(`FIRST`): about 10 choices a variant, too few to measure the shares of 7 types, and it never looks at the well.
+
+**Planned measure (not built):**
+
+1. Count over the whole 1,000-frame dream. Keep the box's most likely colours every frame (a 24 x 40 crop):
+   about 25 pieces a game, about 400 a variant per test.
+2. Score against the real games from the same starts:
+   - type shares, and their total-variation distance from the real ones;
+   - repeat rate (the NES's re-roll makes real repeats rarer than 1 in 7);
+   - droughts: the longest run without each type (the I piece above all);
+   - box to well: the piece that spawns is the one the box showed (spawn shapes learned from real frames, as
+     the box's are);
+   - box timing: the box changes only at a spawn; any other change is flicker;
+   - the garbled share, as now.
+3. A standalone check, for confident numbers on any checkpoint: one seeded live stream (`tests-on-a-stream`),
+   about 64 games x 3,000 frames (about 4,000 pieces: each type's share to about +-1.5%), in a Tk window. It
+   needs the GPU, so training pauses while it runs. First runs: postC, and the skip run's latest, to see
+   whether frame skip changed the mix.
+4. Later, the same box classifier in the browser (`web/play.js`), with a piece tally on the page: what a
+   player sees.
+
 ## Generation and previews
 
 **Decoding, measured 2026-10-02** (small 90.6k, no training, 12 games, 512-frame
@@ -911,9 +950,14 @@ python -m http.server 8000 -d web                 # open http://localhost:8000 i
 
 The export (`models/onnx_export.py`) writes the pixel model's averaged weights
 (motion first; 2026-10-07 to 10-18 the page had the layered model,
-layered_tokens.md) as three graphs, plus the page's start: `context.bin`, one
-level-0 game start as model frames (3 frames of palette indices, 8 frames into
-the game) and `context.json` (their shape, the buttons, the palette). A frame
+layered_tokens.md) as three graphs, plus the page's start: `context.bin`, 3
+model frames of the level-select menu, cursor on level 0, nobody pressing
+anything (`real_tetris.menu_start`, since 2026-11-03; before, 8 frames into a
+level-0 game) and `context.json` (their shape, the buttons, the palette). The
+player picks a level and presses Start. A first check (s9_skip 181,600, CPU):
+the dream holds the menu, moves the cursor and starts a game on Start, but at
+level 0 whatever level was picked (the real game: level 2), its statistics
+counter not counting the first piece. A frame
 is kept as its content (its patch tokens, soft for a dreamed frame: each
 pixel's colour probabilities through the colour table, [256, 96]) and its
 motion (each token's four 8 x 8 cells' codes, [256, 4]; not known for the
@@ -974,6 +1018,26 @@ held in P3 at 57-91% busy; with two, 38 frames/s. Half
 precision (onnxconverter-common, float32 inputs and outputs) changed nothing
 on the 3090 (63 against 61 ms a step in the slowed state; 3 colour values in
 96 frames differ from PyTorch), so the graphs stay float32.
+
+**Frame skip in the browser (2026-11-03).** The page runs on a 60 Hz game clock (`web/presses.js`): every
+press is kept by the browser's event time, and each step covers the game frames since the last one, at most 6.
+A frame-skip model (`model.json` `skip` > 1, trained with `--skip`) gets the whole step: its step graph takes
+`skipped` [2, skip - 1] (each of its two frames' step's earlier bytes, newest first) and `clock` [2] (their
+frames on the frame clock, what the temporal rotary turns by; `at` still places frames in the ring and sets the
+masks), and the prefill adds the "no earlier bytes" embedding to the start's frames. `dreamer.next(action,
+earlier)` takes the step's newest byte and the others, newest first. Any other model gets one frame a step, as
+before. Since 2026-11-03 the page plays the skip run (`s9_skip`), and there are no other builds to pick
+(`?model` is gone).
+
+The input trace makes sure the browser gives a model its buttons in training's order. `dreamer.trace` records
+what every step fed the step graph (both frames' bytes, earlier bytes, clock, ring place), and the page keeps
+its own record of every game frame's byte. **Save trace** downloads both as one JSON file, and
+`python scripts/input_trace_check.py <trace.json>` rebuilds every step from the frame bytes the way training
+lays out a skip window (`world_nes_tetris.step_bytes`, then the shift to incoming bytes) and compares,
+exiting 1 at the first step that differs (`diagnostics/input_trace.py`; `tests/test_input_trace.py` checks
+training's own windows pass). For a skip model the export also dreams 96 seeded steps of 1..skip frames with
+random bytes through PyTorch and onnxruntime, checks their trace, and writes `skip_steps.json` and
+`skip_reference.bin`, which `web/test_dreamer.mjs` replays in JavaScript (`TRACE=file` saves its trace).
 
 The page can also start from a picture ("Start from an image", `web/
 screenshot.js`): a screenshot, framed by its four corners and snapped to the

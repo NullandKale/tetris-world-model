@@ -167,6 +167,7 @@ class Dream:
     sure: np.ndarray              # [FIRST, 256, 256] float16: its probability
     cells: np.ndarray             # [FUTURE, 20, 10] bool: the well's blocks every frame (integrity scores)
     seen: np.ndarray | None = None  # [FUTURE // EVERY, 256, 256, 3] uint8: every EVERY-th frame's expected colours
+    steps: np.ndarray | None = None  # [FUTURE] bool: the frames a step drew (a skip dream's); None: every frame
 
     @classmethod
     def of_frames(cls, trial: "Trial", frames: np.ndarray, palette: np.ndarray) -> "Dream":
@@ -179,6 +180,15 @@ class Dream:
                    np.stack([well_cells(f, empty) for f in frames]), palette[frames[EVERY - 1::EVERY]])
 
 
+def skip_gaps(skip: int, rng: np.random.Generator | None = None) -> np.ndarray:
+    """A skip dream's steps (dreams gaps): each step's frames, enough for FUTURE, the first one frame (a frame
+    to hold from the start). rng None: then every `skip` frames; else each 1..skip frames, uniform (as
+    SkipWindows trains)."""
+    if rng is None:
+        return np.array([1] + [skip] * (FUTURE // skip))
+    return np.concatenate([[1], rng.integers(1, skip + 1, FUTURE)])
+
+
 def empty_colour(trial: "Trial") -> int:
     """The empty well's colour."""
     return int(np.bincount(trial.future[0][UPPER].ravel()).argmax())
@@ -186,11 +196,16 @@ def empty_colour(trial: "Trial") -> int:
 
 @torch.no_grad()
 def dreams(model, trials: list[Trial], palette: np.ndarray, keep: int | None = None, change_weight: float = 1.0,
-           pictures: int = 0, batch: int = BATCH) -> Iterator[Dream]:
+           pictures: int = 0, batch: int = BATCH, gaps: np.ndarray | None = None) -> Iterator[Dream]:
     """Each trial's FUTURE frames from its context, given its buttons (change_weight: Dreamer's), BATCH trials
     dreamed side by side (models/dynamics.py Dreamer) -> its Dream, in order; the first `pictures` trials keep
     their pictures (Dream.seen). keep: the latent model's, whose window slides (the pixel model's history is a
-    ring: dynamics.TemporalCache)."""
+    ring: dynamics.TemporalCache). gaps (a skip model, Dynamics skip; skip_gaps): each step's frames, each step
+    with all its frames' buttons, its frame held until the next step, as a slow device shows the game: every
+    score then reads what a player sees, against the real game's every frame (Dream.steps: the drawn ones)."""
+    steps = np.zeros(FUTURE, bool)
+    at = np.cumsum(gaps) if gaps is not None else np.arange(1, FUTURE + 1)
+    steps[at[at <= FUTURE] - 1] = True
     device = next(model.parameters()).device
     colours = torch.as_tensor(palette, dtype=torch.float32, device=device)
     for lo in range(0, len(trials), batch):
@@ -212,8 +227,14 @@ def dreams(model, trials: list[Trial], palette: np.ndarray, keep: int | None = N
                        for t in group]                       # a two-layer model: the context's layers
             dreamer = make(model, torch.from_numpy(np.stack(context)).to(device),
                            torch.from_numpy(np.stack([t.actions for t in group])).to(device))
+            last = 0                                     # the frame the last step drew
             for h in range(1, FUTURE + 1):
-                probs = dreamer.step(buttons[:, h - 1]).float()                  # [b, 256, 256, COLOURS]
+                if gaps is None:
+                    probs = dreamer.step(buttons[:, h - 1]).float()              # [b, 256, 256, COLOURS]
+                elif steps[h - 1]:                       # a step to frame h, the frames since the last one's bytes
+                    earlier = buttons[:, last:h - 1].flip(-1)                    # newest first
+                    probs = dreamer.step(buttons[:, h - 1], earlier).float()
+                    last = h
                 top = probs.max(-1)
                 expected = None
                 if h <= FIRST:
@@ -241,7 +262,8 @@ def dreams(model, trials: list[Trial], palette: np.ndarray, keep: int | None = N
             yield Dream(np.stack([f[i] for f in rgb]), {h: right[h][i] for h in HORIZONS},
                         np.stack([f[i] for f in filled]), np.stack([f[i] for f in likely]),
                         np.stack([f[i] for f in sure]), np.stack([f[i] for f in cells]),
-                        np.stack([f[kept] for f in seen]) if kept is not None else None)
+                        np.stack([f[kept] for f in seen]) if kept is not None else None,
+                        steps if gaps is not None else None)
 
 
 def dream(model, trial: Trial, palette: np.ndarray, keep: int | None = None, change_weight: float = 1.0) -> Dream:
@@ -271,8 +293,10 @@ def score(trial: Trial, dreamed: Dream) -> dict[str, float]:
       pixels there (each pixel's probability, however faint) over the real piece's (NaN with no piece);
     - shape: over the frames whose upper playfield holds one whole real piece (4 cells), the share in which
       the dream's holds the same cells, wherever they are (an erased, garbled or swapped piece scores 0);
-    - lost_long, morph_long, full_long, size_long: the integrity scores (play.py) over all FUTURE frames.
-    Every score but the last three looks at the first FIRST frames."""
+    - lost_long, morph_long, full_long, size_long: the integrity scores (play.py) over all FUTURE frames;
+    - wrong_steps, shape_steps: the frames a step drew alone (Dream.steps; a skip dream's others hold the last
+      one, behind the real game): playfield pixels whose most likely colour is wrong, and shape.
+    Every score but the integrity ones looks at the first FIRST frames."""
     out = {f"wrong_{h}": float(1 - dreamed.right[h][PLAYFIELD].mean()) for h in HORIZONS}
     out |= {f"timer_wrong_{h}": float(1 - dreamed.right[h][TIMER].mean()) for h in HORIZONS}
     empty = empty_colour(trial)
@@ -300,6 +324,10 @@ def score(trial: Trial, dreamed: Dream) -> dict[str, float]:
     still = np.all(np.concatenate([trial.context, trial.future])[:, UPPER_CELLS[0], UPPER_CELLS[1]] != empty, 0)
     out["shape"] = _shape(cells(real_frames[:, UPPER_CELLS[0], UPPER_CELLS[1]] & ~still),
                           cells(sure[:, UPPER_CELLS[0], UPPER_CELLS[1]] & ~still))
+    drawn = np.ones(FIRST, bool) if dreamed.steps is None else dreamed.steps[:FIRST]
+    out["wrong_steps"] = float((dreamed.likely[drawn] != trial.future[drawn])[:, PLAYFIELD[0], PLAYFIELD[1]].mean())
+    out["shape_steps"] = _shape(cells(real_frames[drawn][:, UPPER_CELLS[0], UPPER_CELLS[1]] & ~still),
+                                cells(sure[drawn][:, UPPER_CELLS[0], UPPER_CELLS[1]] & ~still))
     out["fall"] = _fall(real_upper, dream_upper)
     out["spawn"], out["spawn_lag"] = _spawn(real_frames, sure, static, empty)
     start = well_cells(trial.context[-1], empty)[None]

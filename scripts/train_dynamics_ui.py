@@ -86,7 +86,7 @@ from token_world.diagnostics.novelty import NOVELTY_FIELDS, Novelty
 from token_world.diagnostics import bias
 from token_world.diagnostics.coherence import PatchBank
 from token_world.diagnostics.coherence import score as coherence
-from token_world.diagnostics.long_dream import TrialStream, animation, dreams, score, stacked
+from token_world.diagnostics.long_dream import TrialStream, animation, dreams, score, skip_gaps, stacked
 from token_world.diagnostics.long_dream import sheet as dream_sheet
 from token_world.diagnostics.run_outputs import (HORIZONS, append_long_dream, horizon_fields, horizon_outputs,
                                                MuonAdamW, load_optimizer, open_metrics, optimizer_state,
@@ -94,7 +94,7 @@ from token_world.diagnostics.run_outputs import (HORIZONS, append_long_dream, ho
                                                write_horizon_curve)
 from token_world.data.tetris_motion import UNKNOWN as MOTION_UNKNOWN
 from token_world.models.dynamics import (COLOURS, SIZE, Dynamics, background_frames, border_pixels, build, choice_kl,
-                                         compose_frames, compose_probs, deepen, incoming_actions,
+                                         compose_frames, compose_probs, deepen, incoming_actions, incoming_skipped,
                                          stacked_source, unpatch_pixels, weigh_changes,
                                          MOTION_CODES, TURNED, masked_loss, motion_loss, motion_tokens, own_share, patch_pixels, rollout, sample_choice,
                                          training_mask)
@@ -189,17 +189,22 @@ LONG_DREAM_EVERY = 2000                           # steps between long-dream tes
 LONG_DREAM_TRIALS = 16                            # trials per test (32 until 2026-10-23): the same games at every test and in every
                                                   # run with the same --seed, so tests compare like with like
 LONG_DREAM_VARIANT = "1 pass"                     # long_dream.csv's variant column: no buttons
+SKIP_TESTS = (2, 3, 4, 5, 6)                      # a skip model's button dreams also stepped every s frames, and
+SKIP_RANDOM_SEED = 0                              # each step 1..skip frames (the same draw at every test)
 PRESSED_VARIANT = "buttons"                       # and the bot's buttons (since 2026-10-08)
 LIVE_FIELDS = [f"live_{event_slug(n)}_{k}" for n in EVENTS for k in ("n", "exact", "wrong", "false")] + [
     "live_turn_n", "live_turn_exact", "live_turn_exact_swapped", "live_turn_gap", "live_turn_wrong",
     "live_turn_wrong_swapped"]
 
 
+SKIP_MAX = 6                                      # --skip's largest (frame_skip_design: the page's 6x mode)
+SKIP_FIELDS = tuple(f"train_loss_skip{g}" for g in range(1, SKIP_MAX + 1))   # changed pixels' loss, g-frame steps
 PRESS_FIELDS = ("train_loss_idm", "idm_windows", "idm_right", "idm_real_right", "idm_moves", "idm_moves_right",
                 "idm_moves_real_right", "head_loss", "head_chunks", "head_first", "head_repeat", "head_new",
                 "head_whole",        # --idm-loss's reading of the drawn frames (and of the real ones); --policy-head's
                 "train_loss_ram", "ram_frames", "ram_right", "ram_moves", "ram_moves_right", "code_used_tetris",
-                "code_used_smb", "prior_right_tetris", "prior_right_smb")   # a latent's codes (code_sums)
+                "code_used_smb", "prior_right_tetris", "prior_right_smb",   # a latent's codes (code_sums)
+                *SKIP_FIELDS)
 
 
 def metric_fields(games) -> list[str]:
@@ -294,7 +299,8 @@ class GameBatches:
                                                        who=bool(getattr(args, "policy_head", None)),
                                                        effects=bool(getattr(args, "idm_loss", None)
                                                                     or getattr(args, "ram_codes", 0)),
-                                                       blank=getattr(args, "blank_border", False))
+                                                       blank=getattr(args, "blank_border", False),
+                                                       skip=getattr(args, "skip", 1))
         if "contra" in GAMES:                     # imported only when used: Contra can't break a Tetris run
             from token_world.data.world_nes_contra import WorldNesContraStreams, contra_palette
             self.palettes["contra"] = contra_palette()
@@ -345,6 +351,9 @@ class GameBatches:
                     else None)                                                              # [B, T]
         self.piece = (torch.cat([filled(p, x) for p, x in zip(piece, index)])
                       if any(p is not None for p in piece) else None)                     # [B, T]
+        # --skip (Tetris alone): each step's earlier bytes [B, T, skip - 1] and frame clock [B, T]
+        self.skips = {name: self.batches["tetris"].extra[name] for name in ("skipped", "times")
+                      if "tetris" in self.batches and name in self.batches["tetris"].extra}
         self.branch_at = torch.cat([self.batches[g].branch_at for g in GAMES])
         motion = [self.batches[g].motion for g in GAMES]
         if all(m is not None for m in motion):         # each game's codes in the run's vocabulary (motion_vocab)
@@ -380,7 +389,7 @@ PLAYFIELD = (slice(52, 212), slice(92, 172))                # the well, in model
 
 def live_event_scores(model, forward, index: torch.Tensor, incoming: torch.Tensor, events: torch.Tensor,
                       motion: torch.Tensor | None = None, piece: torch.Tensor | None = None,
-                      generator: torch.Generator | None = None) -> dict[str, float]:
+                      generator: torch.Generator | None = None, skips: dict | None = None) -> dict[str, float]:
     """The training batch's own event scores, one step ahead from the real past (2026-10-17; the user: "why are
     we not gathering these stats just on the fucking training data"): the stream is fresh every step, so every
     batch is unseen. In each window one event frame (events [B, T], tetris_events.frame_events; the rarest
@@ -389,8 +398,10 @@ def live_event_scores(model, forward, index: torch.Tensor, incoming: torch.Tenso
     exact (every pixel that changed from the frame before more likely right than wrong), wrong (the changed
     pixels' expected wrong share), false (the well's unchanged pixels' expected changed share). The J / L /
     T turns are scored again with A and B swapped (piece [B, T], each frame's RAM orientation byte): the turn
-    gap, exact with the real press less with the swapped one. -> sums: "<event> n / exact / wrong / false",
+    gap, exact with the real press less with the swapped one (--skip: every byte of the step; skips, forward's
+    skipped and times). -> sums: "<event> n / exact / wrong / false",
     "turn n / exact / exact swapped / wrong / wrong swapped"."""
+    skips = skips or {}
     b, t = index.shape[:2]
     device, n, p = index.device, model.grid ** 2, model.patch
     ev = events.cpu().clone()
@@ -424,7 +435,7 @@ def live_event_scores(model, forward, index: torch.Tensor, incoming: torch.Tenso
     before = patch_pixels(pictures[rw, rf - 1][:, None], p)[:, 0].long()
     changed, static = (real != before) & keep, (real == before) & well
 
-    def codes(acts):
+    def codes(acts, step):
         """A latent's choices: the real frames' from the posterior, as in training, and the hidden frame's the
         prior's most likely given these buttons (a swapped press reaches the frame through it, as in a dream)."""
         if not model.latent:
@@ -432,13 +443,13 @@ def live_event_scores(model, forward, index: torch.Tensor, incoming: torch.Tenso
         post = model.read_choice(index)
         z = F.one_hot(post.argmax(-1), post.shape[-1]).flatten(-2).float()
         z[:, 0] = 0                                                                # frame 0 has no choice
-        features = forward(index, acts, mask, z=z, motion=given)                   # causal: the hidden frame's
+        features = forward(index, acts, mask, z=z, motion=given, **step)           # causal: the hidden frame's
         prior = model.prior(features[:, :-1], acts[:, 1:])[rw, rf - 1]             # own choice does not reach it
         z[rw, rf] = F.one_hot(prior.argmax(-1), prior.shape[-1]).flatten(-2).to(z.dtype)
         return z
 
-    def scored(acts):
-        probs = model.picture_probs(forward(index, acts, mask, z=codes(acts), motion=given)[rw, rf])
+    def scored(acts, step):
+        probs = model.picture_probs(forward(index, acts, mask, z=codes(acts, step), motion=given, **step)[rw, rf])
         wrong = 1 - probs.gather(-1, real[..., None])[..., 0]                      # [K, N, P*P]
         moved = 1 - probs.gather(-1, before[..., None])[..., 0]
         has = changed.flatten(1).any(1)
@@ -446,7 +457,7 @@ def live_event_scores(model, forward, index: torch.Tensor, incoming: torch.Tenso
         miss = torch.where(has, (wrong * changed).flatten(1).sum(1) / changed.flatten(1).sum(1).clamp_min(1), torch.nan)
         false = (moved * static).flatten(1).sum(1) / static.flatten(1).sum(1).clamp_min(1)
         return exact.cpu(), miss.cpu(), false.cpu()
-    exact, miss, false = scored(incoming)
+    exact, miss, false = scored(incoming, skips)
     out = {}
     for i, name in enumerate(names):
         if torch.isnan(exact[i]):
@@ -457,14 +468,17 @@ def live_event_scores(model, forward, index: torch.Tensor, incoming: torch.Tenso
     turning = [i for i, name in enumerate(names) if name == "rotate" and piece is not None
                and bool(TURNS_AT[int(piece[rows[i], frames[i] - 1])]) and not torch.isnan(exact[i])]
     swapped = incoming.clone()
+    skipped = skips["skipped"].clone() if "skipped" in skips else None
     for i in turning:                         # the press shows a frame late: frame f - 1's incoming
         w, f = rows[i], frames[i]
-        for at in (f - 1, f):
-            v = int(swapped[w, at])
-            if v >= 0 and (v & (A | B)) in (A, B):
-                swapped[w, at] = (v & ~(A | B)) | ((A | B) ^ (v & (A | B)))
+        for at in (f - 1, f):                 # a skip step: every one of its frames' bytes (2026-11-03: its last
+            for row in [swapped[w, at:at + 1]] + ([skipped[w, at]] if skipped is not None else []):   # alone
+                for k in range(len(row)):     # left the press in the earlier ones, swapped turns 0.84 right)
+                    v = int(row[k])
+                    if v >= 0 and (v & (A | B)) in (A, B):
+                        row[k] = (v & ~(A | B)) | ((A | B) ^ (v & (A | B)))
     if turning:
-        exact_s, miss_s, _ = scored(swapped)
+        exact_s, miss_s, _ = scored(swapped, {**skips, **({"skipped": skipped} if skipped is not None else {})})
         out["turn n"] = float(len(turning))
         out["turn exact"] = float(sum(exact[i] for i in turning))
         out["turn exact swapped"] = float(sum(exact_s[i] for i in turning))
@@ -524,8 +538,9 @@ def train_step(model, forward, index, actions, depth: int = 0, blend: int = 0,
                branch_at: torch.Tensor | None = None, critic: TurnCritic | None = None,
                critic_weight: float = 0.0, piece: torch.Tensor | None = None, idm: IDM | None = None,
                idm_weight: float = 0.0, effect: torch.Tensor | None = None, ram_codes: float = 0.0,
-               memory=None):
+               memory=None, skips: dict | None = None):
     """One MaskGIT step on windows index [B, T, 256, 256] -> losses (total has the graph).
+    skips (--skip): forward's skipped [B, T, skip - 1] (incoming) and times [B, T], each step's frames.
     memory (--carry, depth 0): the frames before each row's window (models/dynamics.py Memory), which every
     window frame attends to as well.
     idm (with effect [B, T], each press's effect, -1 for no label): idm_weight times idm_press_loss.
@@ -622,7 +637,7 @@ def train_step(model, forward, index, actions, depth: int = 0, blend: int = 0,
                 shown = shown & ~turning[:, :, None, None]
             scored = scored & ~shown
         given = torch.where(scored, torch.full_like(given, MOTION_UNKNOWN), given)
-    features = forward(index, incoming, mask, soft=soft, z=z, motion=given, memory=memory)
+    features = forward(index, incoming, mask, soft=soft, z=z, motion=given, memory=memory, **(skips or {}))
     weight = model.loss_weights(target)
     frames = press_weights(incoming, press_weight)
     if frames is not None:
@@ -681,6 +696,11 @@ def train_step(model, forward, index, actions, depth: int = 0, blend: int = 0,
     border = border_pixels(model.patch, index.device)[where[2]]
     changed = (target[:, 1:] != target[:, :-1])[where[0], where[1] - 1, where[2]]   # frame 0 is never masked
     mean = lambda v, m: (v * m).sum() / m.sum().clamp_min(1)
+    if skips and "times" in skips:                   # --skip: the changed pixels' loss by their step's frames
+        gap = skips["times"].diff(dim=1)[where[0], where[1] - 1][:, None]           # [M, 1]
+        for g in range(1, SKIP_MAX + 1):
+            on = changed & ~border & (gap == g)
+            pressed[f"skip_loss_{g}"], pressed[f"skip_px_{g}"] = (per_pixel * on).sum(), on.sum()
     nan = torch.tensor(float("nan"))
     return {"total": total, "game": mean(per_pixel, ~border), "border": mean(per_pixel, border),
             "changed": mean(per_pixel, changed & ~border), "masked": mask[:, 1:].float().mean(),
@@ -819,13 +839,15 @@ def withheld_motion(motion: torch.Tensor, generator: torch.Generator | None = No
     return torch.where(hidden[:, :, None, None], torch.full_like(motion, MOTION_UNKNOWN), motion)
 
 
-def preview(model, index, actions, palettes, out: Path, args, motion: torch.Tensor | None = None) -> dict[str, float]:
+def preview(model, index, actions, palettes, out: Path, args, motion: torch.Tensor | None = None,
+            skips: dict | None = None) -> dict[str, float]:
     """Per game: generated vs real frames at each horizon, contact sheets and horizon_curve.csv.
 
     The last max(HORIZONS) frames of each window are generated one after another from the rest, as soft
     frames; "wrong" is each pixel's probability of anything but the real colour (expected wrong pixels).
     A motion model's context gets the batch's motion, and the motion it draws for its own frames is scored on
-    the real moved and turned cells (preview_motion_moved / _turned).
+    the real moved and turned cells (preview_motion_moved / _turned). skips (--skip): the batch's skipped
+    (stream alignment) and times; each generated frame is a step.
     """
     b, t = index.shape[:2]
     start = t - max(HORIZONS)
@@ -834,12 +856,16 @@ def preview(model, index, actions, palettes, out: Path, args, motion: torch.Tens
     real, last_context = pictures[:, start:], pictures[:, start - 1]
     model.eval()
     decoder = model.decoder(b, index.device)      # the model's own, kept: one CUDA graph and memory pool for
-    decoder.prefill(index[:, :start], incoming[:, :start], motion[:, :start] if model.motion else None)  # every
+    skipped = incoming_skipped(skips["skipped"]) if skips else None
+    times = skips["times"] if skips else None
+    decoder.prefill(index[:, :start], incoming[:, :start], motion[:, :start] if model.motion else None,  # every
+                    skipped=skipped[:, :start] if skips else None, times=times[:, :start] if skips else None)
     wrong, rgb, drawn = [], [], []                # preview (a new Dreamer's took and freed ~96 segments each)
     colours = {g: palettes[g].to(index.device, torch.float32) for g in GAMES}
     per = args.rows
     for i, at in enumerate(range(start, t)):
-        made = decoder.next(incoming[:, at:at + 1], at)
+        made = decoder.next(incoming[:, at:at + 1], at, skipped=skipped[:, at:at + 1] if skips else None,
+                            clock=times[:, at] if skips else None)
         probs = made["probs"].float()                                                # [B, 256, 256, COLOURS]
         if model.motion:
             drawn.append(made["motion"])
@@ -886,17 +912,21 @@ class Member:
                        "change_weight": args.change_weight, "motion": args.motion,
                        "motion_first": args.motion_first, "local_attention": args.local_attention,
                        "two_layers": args.two_layers,
-                       "motion_codes": motion_codes(GAMES)}
+                       "motion_codes": motion_codes(GAMES),
+                       **({"skip": args.skip} if args.skip > 1 else {})}
         self.model = build(self.config, self.config["recompute"]).cuda()
         self.path = self.out / "model_latest.pt"
         saved = torch.load(self.path, map_location="cuda", weights_only=False) if self.path.is_file() else None
-        source, adamw = None, False
+        source, adamw, new = None, False, ()
         if saved is None and args.post_train:             # a finished run continued in this folder
             saved = torch.load(args.post_train, map_location="cuda", weights_only=False)
             differ = {k: (saved["args"].get(k), v) for k, v in self.config.items()
                       if json.dumps(saved["args"].get(k), default=str) != json.dumps(v, default=str)}
             if differ.get("border") == (BORDER_VERSION, BLANK_BORDER):    # onto the blank layout: --blank-border's
                 del differ["border"]                      # post-train (the user's stage 3, 2026-11-02)
+            if "skip" in differ and differ["skip"][0] in (None, 1):        # --skip's: the earlier bytes' map
+                del differ["skip"]                        # added, from zero (Dynamics skip, 2026-11-02)
+                new = ("skipped_action",)
             if differ:
                 raise ValueError(f"--post-train {args.post_train}: its model differs from this run's: {differ}")
             saved = {k: saved[k] for k in ("step", "model", "optimizer", "ema")}   # its schedule's state stays
@@ -923,8 +953,10 @@ class Member:
         self.memory = None                                # --carry: the last window's (Memory), not saved: a
                                                           # resumed run starts each row afresh
         if saved is not None:                             # resume this run
-            self.model.load_state_dict(saved["model"])
-            load_optimizer(self.optimizer, saved["optimizer"], from_adamw=adamw)
+            missing, unexpected = self.model.load_state_dict(saved["model"], strict=not new)
+            if unexpected or any(not k.startswith(new) for k in missing):
+                raise ValueError(f"the saved model's weights do not fit: missing {missing}, unexpected {unexpected}")
+            load_optimizer(self.optimizer, saved["optimizer"], new=new, from_adamw=adamw)
             self.step = int(saved["step"])
             self.hours, self.cooldown_from = float(saved.get("hours", 0.0)), saved.get("cooldown_from")
         elif source is not None and self.config.get("stack"):   # stacked: each copy takes its source block's
@@ -933,7 +965,8 @@ class Member:
                            source_of=lambda n: stacked_source(n, old))        # warmup again (Bu, 2511.04981)
             self.step = int(source["step"])
         self.live = list(self.model.state_dict().values())
-        self.ema = ([saved["ema"][k].to("cuda", torch.float32) for k in self.model.state_dict()]
+        self.ema = ([saved["ema"][k].to("cuda", torch.float32) if k in saved["ema"] else v.detach().clone()
+                     for k, v in self.model.state_dict().items()]           # (new weights: their own start)
                     if saved is not None else [v.detach().clone() for v in self.live])
         self.start_step = self.saved_step = self.step
         self.parameters = sum(p.numel() for p in self.model.parameters())
@@ -991,9 +1024,18 @@ class Member:
         gc.collect()                                      # training's cached blocks back first: the dreams' caches
         torch.cuda.empty_cache()                          # and graphs go on top (2026-11-01: vit_tiny_lam, 25.8 GB)
         means, gifs, sheets = {}, [], []
+        gaps = {variant: None for variant in sets}        # a skip model: its button dreams at SKIP_TESTS too
+        if model.skip > 1 and PRESSED_VARIANT in sets:
+            for s in SKIP_TESTS:
+                if s <= model.skip:
+                    gaps[f"{PRESSED_VARIANT} skip {s}"] = skip_gaps(s)
+            gaps[f"{PRESSED_VARIANT} skip 1-{model.skip}"] = skip_gaps(model.skip,
+                                                                      np.random.default_rng(SKIP_RANDOM_SEED))
+            sets = {**sets, **{v: sets[PRESSED_VARIANT] for v in gaps if v not in sets}}
         for variant, trials in sets.items():
             rows, likely = [], []
-            for i, (trial, dreamed) in enumerate(zip(trials, dreams(model, trials, palette, pictures=1))):
+            made = dreams(model, trials, palette, pictures=1, gaps=gaps[variant])
+            for i, (trial, dreamed) in enumerate(zip(trials, made)):
                 rows.append({"step": self.step, "variant": variant, "level": trial.level,
                              **score(trial, dreamed),
                              **coherence(bank, trial.context[-1], dreamed.likely, dreamed.sure)})
@@ -1045,8 +1087,11 @@ class Member:
     def train_step(self, index, actions, args, motion: torch.Tensor | None = None,
                    branch_at: torch.Tensor | None = None, piece: torch.Tensor | None = None,
                    events: torch.Tensor | None = None, effect: torch.Tensor | None = None,
-                   who: torch.Tensor | None = None, continues: torch.Tensor | None = None) -> None:
-        """continues [B] (--carry): each row's window follows on from its last one."""
+                   who: torch.Tensor | None = None, continues: torch.Tensor | None = None,
+                   skips: dict | None = None) -> None:
+        """continues [B] (--carry): each row's window follows on from its last one. skips (--skip): the batch's
+        skipped [B, T, skip - 1] (stream alignment) and times [B, T]."""
+        skips = ({"skipped": incoming_skipped(skips["skipped"]), "times": skips["times"]} if skips else {})
         if args.stairs and self.cooldown_from is None and stair_rate(self.hours, args) is None:
             self.cooldown_from = self.step                # the stairs' hours are over: the final cooldown
             print(f"{self.name}: {self.hours:.2f} h of stairs done at step {self.step}: cooling to zero over "
@@ -1068,7 +1113,7 @@ class Member:
                                      hide_presses=args.hide_presses, branch_at=branch_at, critic=self.critic,
                                      critic_weight=self.critic_weight, piece=piece, idm=self.idm,
                                      idm_weight=args.idm_weight, effect=effect, ram_codes=args.ram_codes,
-                                     memory=memory)
+                                     memory=memory, skips=skips)
         self.add_sums(self.losses.pop("pressed"))
         self.losses["total"].backward()
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
@@ -1080,7 +1125,7 @@ class Member:
         with torch.no_grad():
             torch._foreach_lerp_(self.ema, self.live, 1 - EMA_DECAY)
         if args.carry:
-            self.carry(index, actions, motion, continues)
+            self.carry(index, actions, motion, continues, skips)
         if self.head is not None and self.step % HEAD_EVERY == 0:
             if who is None:
                 raise ValueError("the policy head needs the batch's actors")
@@ -1088,7 +1133,7 @@ class Member:
         if events is not None and self.step % LIVE_EVERY == 0:   # the batch's own event scores, unseen data
             with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
                 scores = live_event_scores(self.model, self.forward, index, incoming_actions(actions), events,
-                                           motion, piece)
+                                           motion, piece, skips=skips)
             for k, v in scores.items():
                 self.live_sums[k] = self.live_sums.get(k, 0.0) + v
         self.step += 1
@@ -1104,7 +1149,7 @@ class Member:
         return self.memory.seeing(torch.where(follows, length, 0))
 
     @torch.no_grad()
-    def carry(self, index, actions, motion, continues) -> None:
+    def carry(self, index, actions, motion, continues, skips: dict | None = None) -> None:
         """--carry: the next window's memory, from a clean pass over this one after the optimizer step (every
         token visible and its real motion, as a dream writes its history; each row seeing all of its own
         memory), the window's frames but the last (the next window's first)."""
@@ -1118,7 +1163,7 @@ class Member:
         tokens = motion_tokens(motion, model.patch) if model.motion else None
         with torch.autocast("cuda", dtype=torch.bfloat16):
             _, self.memory = self.forward(index, incoming_actions(actions), visible, motion=tokens, memory=full,
-                                          collect=True)
+                                          collect=True, **(skips or {}))
 
     def add_sums(self, sums: dict[str, torch.Tensor]) -> None:
         """Add this step's sums (GPU scalars: no wait for the GPU) to the ones since the last checkpoint."""
@@ -1148,7 +1193,8 @@ class Member:
                 "ram_right": rate("ram_right", "ram_frames"), "ram_moves": s.get("ram_moves", 0.0),
                 "ram_moves_right": rate("ram_moves_right", "ram_moves"), "code_used_tetris": used("tetris"),
                 "code_used_smb": used("smb"), "prior_right_tetris": rate("prior_right_tetris", "code_frames_tetris"),
-                "prior_right_smb": rate("prior_right_smb", "code_frames_smb")}
+                "prior_right_smb": rate("prior_right_smb", "code_frames_smb"),
+                **{f"train_loss_skip{g}": rate(f"skip_loss_{g}", f"skip_px_{g}") for g in range(1, SKIP_MAX + 1)}}
 
     def head_step(self, index, actions, motion, who) -> None:
         """The chunk head's step on the batch, as the probe trained it (scripts/policy_probe.py): the model's
@@ -1190,7 +1236,7 @@ class Member:
             raise RuntimeError(f"{self.name}: nonfinite loss at step {step}; last checkpoint is {self.saved_step}")
         memory = gpu_memory(self.allocator)                # the training steps', before the preview's
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            m = preview(self.model, index, actions, batches.palettes, self.out, args, batches.motion)
+            m = preview(self.model, index, actions, batches.palettes, self.out, args, batches.motion, batches.skips)
         gc.collect()                                       # the cache back to what training holds: a launch's
         torch.cuda.empty_cache()                           # first steps peaked at 19 GB and kept 23.5 reserved,
         m.update(stats)                                    # spilling until a long dream freed it (2.4 s a step
@@ -1442,7 +1488,8 @@ def train(args, events: queue.Queue, stop: threading.Event) -> None:
                         bank.add(window)
                 for member in members:
                     member.train_step(index, actions, args, batches.motion, batches.branch_at, batches.piece,
-                                      batches.events, batches.effect, batches.who, batches.continues)
+                                      batches.events, batches.effect, batches.who, batches.continues,
+                                      batches.skips)
                 due = [m for m in members if m.step == m.start_step + 1 or m.step % args.preview_every == 0]
                 if due:
                     stats = batches.take_stats()          # data waits since the last checkpoint, shared
@@ -1574,6 +1621,10 @@ def main():
     p.add_argument("--hold-lr", type=float, default=None, metavar="LR",
                    help="hold the rate at LR until the window's Start Cooldown (or the file <run>/start_cooldown), "
                         "then --final-cooldown steps to zero, where training ends (post-training)")
+    p.add_argument("--skip", type=int, default=1, metavar="N",
+                   help="frame skip (2026-11-02): every step of a window is 1..N frames after the one before "
+                        "(uniform, per step), with every frame's controller byte (models/dynamics.py Dynamics skip); "
+                        "a --post-train of a model without it adds the earlier bytes' map from zero; needs --carry")
     p.add_argument("--carry", action="store_true",
                    help="carry each row's last window's temporal keys and values into its next (Transformer-XL's "
                         "memory; models/dynamics.py Memory), so training sees the history a dream's ring holds: each "
@@ -1692,6 +1743,10 @@ def main():
                        or any(MODELS[m].get("latent") for m in args.models)):
         p.error("--carry: Tetris alone, no --rollouts, --branches or latent, and --rows as --workers-per-game "
                 "(each row one worker's stream)")
+    if not 1 <= args.skip <= SKIP_MAX:
+        p.error(f"--skip: 1 to {SKIP_MAX} frames a step")
+    if args.skip > 1 and not (args.carry and args.game == "tetris"):
+        p.error("--skip: Tetris with --carry (skip windows follow on from each other, sharing a step)")
     if args.two_layers and args.game != "smb" and args.branches:
         p.error("--two-layers: no Tetris branches (they are made of pictures)")
     if args.copy_pretrain and not (args.game == "smb" and args.two_layers and args.motion):

@@ -11,10 +11,10 @@ draws its motion first, then its pixels given it (VideoJAM's joint appearance an
 turn a piece the right way. Trained by masked next-frame prediction on live emulator play, changed pixels
 weighed 10 times: 135,582 steps from scratch, then post-trained to step 151,606 on players that press like
 people (buttons held, Down held through turns) with each window carrying the last one's keys and values
-(Transformer-XL's memory), as the browser's ring of frames does, then to step 184,000 with frame skip: each step
+(Transformer-XL's memory), as the browser's ring of frames does, then to step 188,000 with frame skip: each step
 1 to 6 frames on, with every frame's buttons and a frame clock, so a slow device plays at the game's speed.
 
-**Play it:** the page in `web/` (published by GitHub Pages) runs the step-184,000 checkpoint with
+**Play it:** the page in `web/` (published by GitHub Pages) runs the step-188,000 checkpoint with
 onnxruntime-web on WebGPU (Chrome or Edge; elsewhere a slow WebAssembly fallback), from the level-select menu
 (63 frames, as both layers: pick a level, then Start) or from any picture ("Start from an image": all of it background,
 so a falling piece in it is read as stack). Arrows move and drop, X / Z rotate, Enter is Start; on a phone, the

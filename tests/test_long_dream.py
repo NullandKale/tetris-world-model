@@ -12,7 +12,7 @@ sys.path.insert(0, str(ROOT / "src"))
 import torch
 
 from token_world.diagnostics.long_dream import (EVERY, FIRST, FUTURE, PLAYFIELD, Dream, Trial, animation, dreams,
-                                                score, sheet, stacked)
+                                                score, sheet, skip_gaps, stacked)
 from token_world.models.dynamics import Dynamics
 
 PALETTE = np.zeros((58, 3), np.uint8)
@@ -176,6 +176,50 @@ class ThousandFrameTests(unittest.TestCase):
             self.assertGreater((a.likely == b.likely).mean(), 0.9999)
             self.assertLess(np.abs(a.sure.astype(np.float32) - b.sure.astype(np.float32)).max(), 1e-3)
             self.assertGreater((a.cells == b.cells).mean(), 0.999)
+
+
+class SkipDreamTests(unittest.TestCase):
+    """2026-11-03: a skip model's dreams (dreams gaps) and the scores of the frames its steps drew."""
+
+    def test_steps_cover_the_dream_one_way_or_at_random(self):
+        fixed = skip_gaps(4)
+        self.assertEqual((fixed[0], set(fixed[1:].tolist())), (1, {4}))
+        self.assertGreaterEqual(fixed.sum(), FUTURE)
+        drawn = skip_gaps(6, np.random.default_rng(0))
+        self.assertEqual(drawn[0], 1)                                       # a frame to hold from the start
+        self.assertGreaterEqual(drawn.sum(), FUTURE)
+        self.assertEqual(set(drawn.tolist()), set(range(1, 7)))
+        self.assertTrue(np.array_equal(drawn, skip_gaps(6, np.random.default_rng(0))))   # the same every test
+
+    def test_a_held_dream_is_behind_between_steps_and_right_on_them(self):
+        for trial in (trial_with_piece(), trial_with_tetromino()):
+            steps = np.zeros(FUTURE, bool)
+            steps[np.cumsum(skip_gaps(6))[np.cumsum(skip_gaps(6)) <= FUTURE] - 1] = True
+            last = np.maximum.accumulate(np.where(steps[:FIRST], np.arange(FIRST), 0))
+            held = Dream.of_frames(trial, trial.future[last], PALETTE)     # the real game, shown at each step
+            behind = score(trial, held)
+            held.steps = steps
+            out = score(trial, held)
+            self.assertEqual(out["wrong_steps"], 0.0)
+            self.assertGreater(behind["wrong_steps"], 0.0)                  # as if every frame were drawn
+            if not np.isnan(out["shape_steps"]):
+                self.assertEqual(out["shape_steps"], 1.0)
+
+    def test_a_skip_dream_draws_at_its_steps_and_holds_between(self):
+        torch.manual_seed(0)
+        model = Dynamics(dim=32, layers=2, heads=2, patch=16, frames=6, colour_dim=8, skip=6).eval()
+        torch.nn.init.normal_(model.skipped_action.weight, std=0.1)
+        palette = np.random.default_rng(0).integers(0, 256, (58, 3)).astype(np.uint8)
+        trial = trial_with_tetromino()
+        trial.buttons = np.random.default_rng(1).integers(0, 256, FUTURE)
+        gaps = skip_gaps(6, np.random.default_rng(2))
+        made = next(dreams(model, [trial], palette, pictures=1, gaps=gaps))
+        at = np.cumsum(gaps)
+        self.assertTrue(np.array_equal(np.nonzero(made.steps)[0], at[at <= FUTURE] - 1))
+        for h in range(1, FIRST):                                           # frame h + 1 held unless a step drew it
+            if not made.steps[h]:
+                self.assertTrue(np.array_equal(made.likely[h], made.likely[h - 1]))
+        self.assertIsNone(next(dreams(model, [trial], palette)).steps)       # one frame a step: every frame drawn
 
 
 if __name__ == "__main__":

@@ -111,6 +111,12 @@ def incoming_actions(actions: torch.Tensor) -> torch.Tensor:
     return F.pad(actions[..., :-1], (1, 0), value=-1)
 
 
+def incoming_skipped(skipped: torch.Tensor) -> torch.Tensor:
+    """A frame-skip stream's older bytes [..., T, K] (skipped[t]: the bytes before action t of the step from
+    frame t to t + 1, newest first, -1 past the step's frames) -> each frame's (as incoming_actions)."""
+    return F.pad(skipped[..., :-1, :], (0, 0, 1, 0), value=-1)
+
+
 class ColourEmbedding(torch.autograd.Function):
     """F.embedding of palette indices, with the table's gradient as one-hot matmuls.
 
@@ -236,8 +242,10 @@ class Memory:
     memory-efficient kernel, trained at 0.34 steps/s against postB's 0.57), its block mask made once a forward for
     every layer; on the CPU (no FlexAttention backward) the explicit mask, which the GPU test checks it against."""
 
-    def __init__(self, keys: list, values: list, length: torch.Tensor):
-        self.keys, self.values, self.length = keys, values, length
+    def __init__(self, keys: list, values: list, length: torch.Tensor, times: torch.Tensor | None = None):
+        """times [B, M]: the memory's frames on the frame clock, the next window's first frame at 0 (a frame-skip
+        window's; None: -M..-1)."""
+        self.keys, self.values, self.length, self.times = keys, values, length, times
         self.masks: dict = {}                            # (tokens, queries, span) -> (rows, block mask or None)
 
     def frames(self) -> int:
@@ -258,16 +266,17 @@ class Memory:
 
     def seeing(self, length: torch.Tensor) -> "Memory":
         """The same keys and values, each row seeing its last length[b] frames."""
-        return Memory(self.keys, self.values, length)
+        return Memory(self.keys, self.values, length, self.times)
 
 
 def rotary_turns(times: torch.Tensor, half: int) -> torch.Tensor:
-    """Frames `times` [T] -> rotary's (cos, sin) [2, T, half] float32 (half: the head size / 2). Training makes
+    """Frames `times` [T] (or [B, T], each row its own: a frame-skip window's frame clock) -> rotary's (cos, sin)
+    [2, T, half] ([2, B, T, half]) float32 (half: the head size / 2). Training makes
     it once a forward, outside the compiled blocks (Dynamics.forward): made inside, inductor fused the cos and
     sin into every element of q and k (all their tokens and channels, forward and recompute: 90 ms of a 1.46 s
     12-row step, 2026-11-02) where the table is 64 x 22."""
     freq = ROPE_BASE ** -(torch.arange(half, device=times.device, dtype=torch.float32) / half)
-    angle = times.to(torch.float32)[:, None] * freq                                   # [T, half]
+    angle = times.to(torch.float32)[..., None] * freq                                 # [(B,) T, half]
     return torch.stack((angle.cos(), angle.sin()))
 
 
@@ -275,13 +284,21 @@ def rotary(x: torch.Tensor, turns: torch.Tensor, axis: int = 1) -> torch.Tensor:
     """RoPE over time (Su et al., 2104.09864; Open-Oasis's temporal attention): x [..., hd] whose axis `axis`
     holds T frames, turns [2, T, hd / 2] their rotary_turns -> x with each pair of channels rotated by an angle
     proportional to its frame, so a query and a key score by how many frames apart they are, whatever window
-    slot they sit in."""
+    slot they sit in. turns [2, B, T, hd / 2]: each of B rows its own frames (a frame-skip window's frame clock),
+    x's first axis B * k, row b's k together."""
     half = x.shape[-1] // 2
+    rows = turns.shape[1] if turns.dim() == 4 else None
+    if rows is not None:
+        x = x.view(rows, x.shape[0] // rows, *x.shape[1:])
+        axis += 1
     shape = [1] * x.dim()
     shape[axis], shape[-1] = -1, half
-    cos, sin = turns[0].view(shape).to(x.dtype), turns[1].view(shape).to(x.dtype)
+    if rows is not None:
+        shape[0] = rows
+    cos, sin = turns[0].reshape(shape).to(x.dtype), turns[1].reshape(shape).to(x.dtype)
     x1, x2 = x[..., :half], x[..., half:]
-    return torch.cat((x1 * cos - x2 * sin, x1 * sin + x2 * cos), -1)
+    out = torch.cat((x1 * cos - x2 * sin, x1 * sin + x2 * cos), -1)
+    return out.flatten(0, 1) if rows is not None else out
 
 
 class Attention(nn.Module):
@@ -317,9 +334,9 @@ class Attention(nn.Module):
         if self.rotate:                                                    # [b, heads, n frames, hd]
             if turns is None:
                 turns = rotary_turns(at + torch.arange(-m, n, device=x.device), q.shape[-1] // 2)
-            q, k = rotary(q, turns[:, m:], axis=2), rotary(k, turns[:, m:], axis=2)
+            q, k = rotary(q, turns[..., m:, :], axis=2), rotary(k, turns[..., m:, :], axis=2)
         if memory is not None:
-            y = self._carried(q, k, v, *memory, before=turns[:, :m] if self.rotate else None)
+            y = self._carried(q, k, v, *memory, before=turns[..., :m, :] if self.rotate else None)
             y = self.out(y.transpose(1, 2).reshape(b, n, d))
             return (y, kept) if collect else y
         banded = causal and self.span is not None and self.span < n
@@ -552,7 +569,8 @@ class Dynamics(nn.Module):
                  action_norm: bool = False, action_blocks: tuple[int, ...] | None = None,
                  change_weight: float = 1.0, motion: bool = False, motion_first: bool = False,
                  local_attention: bool = False, motion_codes: int = MOTION_CODES, history: int | None = None,
-                 two_layers: bool = False, conv_ends: tuple[int, ...] | None = None, shared_heads: bool = False):
+                 two_layers: bool = False, conv_ends: tuple[int, ...] | None = None, shared_heads: bool = False,
+                 skip: int = 1):
         """space_rope: space is also rotary in the spatial attention (RoPE-Mixed: learned 2D directions per
         layer and head, by each patch's row and column), on top of the learned place per patch (space_pos):
         RoPE-Mixed + APE, the paper's choice at a fixed resolution (2403.13298: APE about doubles RoPE's gain
@@ -586,6 +604,11 @@ class Dynamics(nn.Module):
         shared_heads (two_layers with conv_ends): both layers' heads share the pyramid down to each 2 x 2 pixels'
         vector and split only at the last map, each layer's own linear to its pixels' colour vectors (the user,
         2026-10-31: "only split at the very last step to save params").
+        skip: a step may cover up to `skip` frames (frame skip, 2026-11-02: a slow device keeps the game's pace by
+        drawing every s-th frame): each step also takes the controller bytes of its frames before the last (the
+        `skipped` bytes, newest first; -1 past the step's), through their own linear map beside the last byte's,
+        from zero, so a model grown to skip starts as it was at s = 1; and time is the frame clock (forward's
+        times and clock: rotary by frames, the window, ring and masks by steps).
         All off when absent from a run's config (build)."""
         super().__init__()
         self.patch, self.frames, self.action_norm, self.history = patch, frames, action_norm, history
@@ -632,6 +655,11 @@ class Dynamics(nn.Module):
         else:
             self.place = None
         self.action = nn.Linear(9, dim)
+        self.skip = int(skip)
+        if self.skip > 1:                  # a step's earlier frames' bytes, from zero (as the action_norm's)
+            self.skipped_action = nn.Linear(9 * (self.skip - 1), dim)
+            nn.init.zeros_(self.skipped_action.weight)
+            nn.init.zeros_(self.skipped_action.bias)
         self.blocks = nn.ModuleList(Block(dim, heads, modern, space_rope, qk_norm,
                                           action_norm and (action_blocks is None or i in action_blocks),
                                           SIZE // patch if local_attention else None, history)
@@ -682,7 +710,8 @@ class Dynamics(nn.Module):
     def forward(self, frames: torch.Tensor, actions: torch.Tensor, mask: torch.Tensor,
                 cache: list[TemporalCache] | None = None, at=0,
                 soft: tuple[torch.Tensor, torch.Tensor] | None = None, z: torch.Tensor | None = None,
-                motion: torch.Tensor | None = None, memory: Memory | None = None, collect: bool = False):
+                motion: torch.Tensor | None = None, memory: Memory | None = None, collect: bool = False,
+                skipped: torch.Tensor | None = None, times: torch.Tensor | None = None, clock=None):
         """frames [B, T, 256, 256] palette indices, soft frames float [B, T, 256, 256, colour_dim]
         (embed_probs), or frames already embedded as patch tokens float [B, T, N, dim]; actions [B, T] bytes
         that produced each frame (-1 = none); mask [B, T, N] tokens hidden from the model; soft (training)
@@ -701,6 +730,12 @@ class Dynamics(nn.Module):
         memory (training, no cache): the frames before the window's, carried from the last window (Memory;
         --carry). collect: -> (features, Memory of this window's frames but the last, every row seeing all of
         them), the next window's memory.
+
+        Frame skip (a skip model): skipped [B, T, skip - 1] the bytes of each step's frames before its last
+        (incoming_skipped; newest first, -1 past the step's; None: every step one frame); times [B, T] (training)
+        each window frame on the frame clock, the first at 0 (None: 0..T-1; the memory's are its own); clock (with
+        a cache) the frame clock of frames at.. (an int, or [B] each row's): what rotary turns by, while `at`
+        places them in the ring; with a cache, times [B, T] are a prefill's frames' clocks.
         """
         if (memory is not None or collect) and cache is not None:
             raise ValueError("a carried memory is training's; a cache is a dream's")
@@ -713,13 +748,26 @@ class Dynamics(nn.Module):
         if motion is not None and self.motion:
             x = x + self.motion_embedding(motion).to(x.dtype)
         action = self.action(button_bits(actions))                                   # [B, T, d]
+        if self.skip > 1:                              # the step's earlier frames' bytes (none: one frame a step)
+            if skipped is None:
+                skipped = torch.full((*actions.shape, self.skip - 1), -1, dtype=torch.long, device=actions.device)
+            action = action + self.skipped_action(button_bits(skipped).flatten(-2)).to(action.dtype)
         x = x + self.space_pos + (action[:, :, None] if self.action_blocks is None else 0)
         action = action if self.action_norm else None
         if z is not None:
             x = x + self.choice(z.to(x.dtype))[:, :, None]
-        if cache is not None:
+        temporal = self.blocks[0].temporal                    # rotary's table, made out here (rotary_turns)
+        half = temporal.qkv.in_features // temporal.heads // 2
+        if cache is not None:                          # the frame clock: a prefill's times, a step's clock
+            turns = None
+            if times is not None:
+                turns = rotary_turns(times, half)
+            elif clock is not None:
+                clock = torch.as_tensor(clock, device=x.device)
+                turns = rotary_turns((clock[:, None] if clock.dim() else clock) + torch.arange(t, device=x.device),
+                                     half)
             for block, layer in zip(self.blocks, cache):
-                x = block(x, layer, at, self.place, action)
+                x = block(x, layer, at, self.place, action, turns=turns)
             return self.norm(x)
         n = x.shape[2]
         keys, values = [], []
@@ -727,9 +775,16 @@ class Dynamics(nn.Module):
         if x.is_cuda and memory is None:               # recomputed block: causal_block_mask)
             window = causal_block_mask(t, self.history if self.history is not None and self.history < t else None,
                                        x.device)
-        temporal = self.blocks[0].temporal                    # rotary's table, made out here too (rotary_turns)
         m = memory.keys[0].shape[2] if memory is not None else 0
-        turns = rotary_turns(torch.arange(-m, t, device=x.device), temporal.qkv.in_features // temporal.heads // 2)
+        before = memory.times if memory is not None else None
+        if times is None and before is None:
+            turns = rotary_turns(torch.arange(-m, t, device=x.device), half)
+        else:                                         # each row's own frame clock
+            frames_at = times if times is not None else torch.arange(t, device=x.device).expand(b, t)
+            if m:
+                frames_at = torch.cat((before if before is not None else
+                                       torch.arange(-m, 0, device=x.device).expand(b, m), frames_at), 1)
+            turns = rotary_turns(frames_at, half)
         for i, block in enumerate(self.blocks):
             layer = memory.layer(i, n, t, self.history) if memory is not None else None
             spin = block.spatial.spin(self.place) if block.spatial.rope else None   # and the spatial one's
@@ -744,7 +799,8 @@ class Dynamics(nn.Module):
             else:
                 x = block(x, place=self.place, action=action, memory=layer, window=window, turns=turns, spin=spin)
         if collect:
-            return self.norm(x), Memory(keys, values, torch.full((b,), t - 1, device=x.device))
+            clock = times[:, :-1] - times[:, -1:] if times is not None else None   # the next window's first at 0
+            return self.norm(x), Memory(keys, values, torch.full((b,), t - 1, device=x.device), clock)
         return self.norm(x)
 
     embed_frames = 16                  # frames embedded at a time; ONNX export uses the window (one chunk)
@@ -1060,7 +1116,8 @@ def build(config: dict, recompute: bool = False) -> Dynamics:
                     config.get("action_blocks"), config.get("change_weight", 1.0), config.get("motion", False),
                     config.get("motion_first", False), config.get("local_attention", False),
                     config.get("motion_codes", MOTION_CODES), config.get("history"), config.get("two_layers", False),
-                    config.get("conv_ends"), config.get("shared_heads", False)).with_decode(config.get("decode"))
+                    config.get("conv_ends"), config.get("shared_heads", False),
+                    config.get("skip", 1)).with_decode(config.get("decode"))
 
 
 def stacked_source(name: str, old: int) -> str:
@@ -1446,6 +1503,9 @@ class FrameDecoder:
         self.cache = model.new_cache()
         self.act = torch.zeros(batch, 1, dtype=torch.long, device=device)
         self.at = torch.zeros((), dtype=torch.long, device=device)
+        self.clock = torch.zeros(batch, dtype=torch.long, device=device)  # each row's frame clock (skip)
+        self.skipped = (torch.full((batch, 1, model.skip - 1), -1, dtype=torch.long, device=device)
+                        if model.skip > 1 else None)                     # a skip model's: the step's earlier bytes
         self.target = torch.zeros(batch, SIZE, SIZE, dtype=torch.long, device=device) if scored else None
         # a motion model's real motion codes for the frame (scored with resync: the replaced patches' motion)
         self.target_motion = (torch.full((batch, SIZE // MOTION_CELL, SIZE // MOTION_CELL), MOTION_UNKNOWN,
@@ -1471,12 +1531,15 @@ class FrameDecoder:
         self._step = torch.compile(self._decode) if compiled and self.act.is_cuda else self._decode
 
     def prefill(self, frames: torch.Tensor, actions: torch.Tensor, motion: torch.Tensor | None = None,
-                z: torch.Tensor | None = None) -> torch.Tensor | None:
+                z: torch.Tensor | None = None, skipped: torch.Tensor | None = None,
+                times: torch.Tensor | None = None) -> torch.Tensor | None:
         """frames [B, t, 256, 256] (or soft frames or patch tokens, Dynamics.forward), incoming actions
         [B, t] (, motion codes [B, t, 32, 32], with a motion model; None: not known, as from a screenshot) ->
         positions 0..t-1. With a latent each frame goes in with its choice, as in training: z [B, t, groups *
         classes] (a dream's kept ones), else sampled from the posterior's reading of these frames (2026-10-31:
-        before, none, which training never shows); position 0's is none, as in training. -> the choices."""
+        before, none, which training never shows); position 0's is none, as in training. A skip model's frames
+        from a skip window: skipped [B, t, skip - 1] (incoming) and times [B, t] (Dynamics.forward). -> the
+        choices."""
         b, t = frames.shape[:2]
         if self.last is not None and not frames.is_floating_point():     # palette frames: the last one's colours
             self.last.copy_(background_frames(frames)[:, -1])
@@ -1486,7 +1549,8 @@ class FrameDecoder:
         with torch.no_grad():
             tokens = motion_tokens(motion, self.model.patch) if motion is not None else None
             z = self.start_choices(frames, z)
-            features = self.model(frames, actions, visible, cache=self.cache, motion=tokens, z=z)
+            features = self.model(frames, actions, visible, cache=self.cache, motion=tokens, z=z, skipped=skipped,
+                                  times=times)
             self.start_history(features, actions)
         return z
 
@@ -1532,13 +1596,22 @@ class FrameDecoder:
 
     @torch.no_grad()
     def next(self, action: torch.Tensor, at: int, target: torch.Tensor | None = None,
-             target_motion: torch.Tensor | None = None) -> dict:
+             target_motion: torch.Tensor | None = None, skipped: torch.Tensor | None = None,
+             clock: int | None = None) -> dict:
         """action [B, 1] incoming, at: the frame's position (, target [B, 256, 256] the real frame when
-        scored; target_motion [B, 32, 32] its motion codes, for a motion model's resync; None: not known) -> {"soft": [B, 256, 256, colour_dim] the soft frame that went into the context, "unsure":
+        scored; target_motion [B, 32, 32] its motion codes, for a motion model's resync; None: not known;
+        skipped [B, 1, skip - 1] a skip model's step's earlier bytes, None: none, a one-frame step; clock: the
+        frame's on the frame clock, an int or [B], None: at) -> {"soft": [B, 256, 256, colour_dim] the soft frame that went into the context, "unsure":
         [B] its ghost pixels, "tokens": [B, N, dim] its patch tokens, and "wrong": [B] its pixels expected
         wrong (scored) or "probs": [B, 256, 256, COLOURS] its colour probabilities}."""
         self.act.copy_(action)
         self.at.fill_(at)
+        if torch.is_tensor(clock) and clock.dim():
+            self.clock.copy_(clock)
+        else:
+            self.clock.fill_(at if clock is None else int(clock))
+        if self.skipped is not None:
+            self.skipped.copy_(skipped) if skipped is not None else self.skipped.fill_(-1)
         if self.target is not None:
             self.target.copy_(target)
         if self.target_motion is not None:
@@ -1571,14 +1644,17 @@ class FrameDecoder:
             blank = torch.zeros(b, 1, SIZE, SIZE, dtype=torch.uint8, device=device)
             hidden = torch.ones(b, 1, n, dtype=torch.bool, device=device)
             z = self.draw_choice()                       # this frame's choice, from the frames and presses before it
-            features = model(blank, self.act, hidden, self.cache, self.at, z=z)[:, 0]
+            step = {"skipped": self.skipped, "clock": self.clock}                  # the step's frames
+            features = model(blank, self.act, hidden, self.cache, self.at, z=z, **step)[:, 0]
             moved = model.drawn_motion(features) if model.motion else None              # [B, N, cells]: its own
             if model.motion_first:                       # the motion (in motion_steps), then the pixels given it
                 if model.motion_steps == 2:
                     committed = model.committed_motion(features)
-                    second = model(blank, self.act, hidden, self.cache, self.at, z=z, motion=committed[:, None])[:, 0]
+                    second = model(blank, self.act, hidden, self.cache, self.at, z=z, motion=committed[:, None],
+                                   **step)[:, 0]
                     moved = torch.where(committed != MOTION_UNKNOWN, committed, model.drawn_motion(second))
-                features = model(blank, self.act, hidden, self.cache, self.at, z=z, motion=moved[:, None])[:, 0]
+                features = model(blank, self.act, hidden, self.cache, self.at, z=z, motion=moved[:, None],
+                                 **step)[:, 0]
             probs = model.logits(features).float().softmax(-1)                   # [B, N, P*P, COLOURS]
             if self.last is not None:                    # (two_layers: the background's)
                 weight = self.change_weight if self.undo is None else self.change_weight * self.undo
@@ -1603,7 +1679,7 @@ class FrameDecoder:
                     real_moved = motion_tokens(self.target_motion, model.patch).to(moved.dtype)   # [B, N, cells]
                     moved = torch.where(diverged[..., None], real_moved, moved)
             written = model(tokens, self.act, torch.zeros_like(hidden), self.cache, self.at, z=z,
-                            motion=moved[:, None] if moved is not None else None)
+                            motion=moved[:, None] if moved is not None else None, **step)
             self.remember(written)                                               # for the next frames' prior
             out = {"soft": soft, "tokens": tokens[:, 0], "unsure": (probs.amax(-1) < GHOST).sum((1, 2)).float()}
             if z is not None:
@@ -1700,6 +1776,7 @@ class Dreamer:
         self.decoder = self.new_decoder(len(frames), device, autocast)     # its own: the dream's state is its cache
         self._prefill(tokens, actions, codes)
         self.t = frames.shape[1]
+        self.clock = self.t - 1                          # the newest frame's on the frame clock (frame skip)
         self.tokens, self.action, self.codes = tokens[:, -1], actions[:, -1], None if codes is None else codes[:, -1]
         self.decoder.last.copy_(background_frames(frames)[:, -1])
         if self.decoder.sprite_last is not None:          # two layers: the sprite layer's (a picture: none)
@@ -1720,17 +1797,28 @@ class Dreamer:
         self.decoder.change_weight.fill_(weight)
 
     @torch.no_grad()
-    def step(self, action) -> torch.Tensor:
+    def step(self, action, earlier=()) -> torch.Tensor:
         """The frame that `action` (the controller byte, -1 for none; batched: [B], one per dream, or one for
-        all) produces -> its colour probabilities [256, 256, COLOURS] ([B, ...] batched) float32."""
-        out = self.advance(action)
+        all) produces -> its colour probabilities [256, 256, COLOURS] ([B, ...] batched) float32. earlier (a skip
+        model's): the bytes of the frames the step skips, newest first ([k] or batched [B, k]): the step shows the
+        frame 1 + k frames on."""
+        out = self.advance(action, earlier)
         return out["probs"] if self.batched else out["probs"][0]
 
-    def advance(self, action) -> dict:
-        """One frame (step) -> the decoder's whole output."""
-        act = torch.as_tensor(action, device=self.decoder.act.device).long().reshape(-1, 1).expand(
-            self.decoder.batch, 1)
-        out = self.decoder.next(act, self.t)
+    def advance(self, action, earlier=()) -> dict:
+        """One step (1 + len(earlier) frames) -> the decoder's whole output."""
+        device, batch = self.decoder.act.device, self.decoder.batch
+        act = torch.as_tensor(action, device=device).long().reshape(-1, 1).expand(batch, 1)
+        earlier = torch.as_tensor(earlier, dtype=torch.long, device=device)
+        earlier = earlier.reshape(1, -1) if earlier.dim() < 2 else earlier          # [k]: the same for all
+        k = earlier.shape[-1]
+        if k and k >= self.model.skip:
+            raise ValueError(f"a step covers at most {self.model.skip} frames: {1 + k} asked")
+        skipped = None
+        if self.model.skip > 1:
+            skipped = F.pad(earlier.expand(batch, k), (0, self.model.skip - 1 - k), value=-1)[:, None]
+        self.clock += 1 + k
+        out = self.decoder.next(act, self.t, skipped=skipped, clock=self.clock)
         self.t += 1
         self.tokens, self.action = out["tokens"].float(), act[:, 0].clone()
         if "motion" in out:

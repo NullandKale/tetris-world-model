@@ -75,6 +75,34 @@ class LiveScoreTests(unittest.TestCase):
         none = D.live_event_scores(model, model, x, incoming, torch.zeros(2, 6, dtype=torch.long))
         self.assertEqual(none, {})
 
+    def test_a_skip_steps_swap_reaches_every_one_of_its_frames_bytes(self):
+        import train_dynamics_ui as D
+        torch.manual_seed(0)
+        model = Dynamics(dim=32, layers=2, heads=2, patch=16, frames=6, colour_dim=8, skip=4).eval()
+        x = torch.randint(0, COLOURS, (1, 6, 256, 256)).to(torch.uint8)
+        x[:, 4, 100:110, 120:130] = (x[:, 3, 100:110, 120:130] + 1) % COLOURS
+        events = torch.zeros(1, 6, dtype=torch.long)
+        events[0, 4] = 1 << EVENTS.index("rotate")
+        piece = torch.full((1, 6), J[0], dtype=torch.long)
+        incoming = torch.zeros(1, 6, dtype=torch.long)                      # the step's last frame: no press
+        skipped = torch.full((1, 6, 3), -1)
+        skipped[0, 4, :2] = A                                              # the turn pressed in its earlier frames
+        skips = {"skipped": skipped, "times": torch.tensor([[0, 1, 2, 3, 6, 7]])}
+        given = []
+
+        def forward(*args, **kwargs):                                      # what each scoring pass is given
+            given.append((args[1].clone(), kwargs["skipped"].clone()))
+            return model(*args, **kwargs)
+        with torch.no_grad():
+            out = D.live_event_scores(model, forward, x, incoming, events, piece=piece, skips=skips,
+                                      generator=torch.Generator().manual_seed(0))
+        self.assertEqual(out["turn n"], 1.0)
+        (real, real_skipped), (swapped, swapped_skipped) = given
+        self.assertTrue(torch.equal(real_skipped[0, 4], torch.tensor([A, A, -1])))
+        self.assertTrue(torch.equal(swapped_skipped[0, 4], torch.tensor([B, B, -1])))   # every byte of the step
+        self.assertTrue(torch.equal(swapped, real))                         # its last byte had no press
+        self.assertTrue(torch.equal(skipped[0, 4], torch.tensor([A, A, -1])))      # the batch's own untouched
+
 
 @unittest.skipUnless(tetris_rom().is_file() and importlib.util.find_spec("world_nes"), "needs the ROM and world_nes")
 class LiveStreamEventTests(unittest.TestCase):

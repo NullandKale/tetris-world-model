@@ -21,7 +21,8 @@ def data_fields(names) -> list[str]:
     return ["data_windows", "data_kept", *(data_field(n) for n in names), *NOVELTY_FIELDS]
 
 
-EXTRA = ("who", "effect")                         # per-frame fields carried when the stream has them
+EXTRA = ("who", "effect", "skipped", "times")     # per-frame fields carried when the stream has them (skipped,
+                                                  # times: a frame-skip stream's, world_nes_tetris SkipWindows)
 
 
 class LiveBatches:

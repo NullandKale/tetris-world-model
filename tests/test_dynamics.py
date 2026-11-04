@@ -273,12 +273,12 @@ class DynamicsTests(unittest.TestCase):
 
     def test_load_run_refuses_another_frame_layout(self):
         import tempfile
-        from token_world.data.model_frames import BORDER_VERSION
+        from token_world.data.model_frames import BLANK_BORDER, BORDER_VERSION
         from token_world.models.dynamics import load_run
         config = {"dim": 32, "layers": 2, "heads": 2, "patch": 16, "frames": 6, "colour_dim": 8}
         model = build(config)
         with tempfile.TemporaryDirectory() as folder:
-            for border, ok in ((BORDER_VERSION, True), ("blank-v1", False), (None, False)):
+            for border, ok in ((BORDER_VERSION, True), (BLANK_BORDER, True), ("tokens-v1", False), (None, False)):
                 torch.save({"step": 1, "args": {**config, "border": border}, "ema": model.state_dict()},
                            Path(folder) / "model_latest.pt")
                 if not ok:
@@ -1245,6 +1245,73 @@ def tiny_conv(two_layers=False):
     torch.manual_seed(0)
     return Dynamics(dim=32, layers=2, heads=2, patch=16, frames=6, colour_dim=8, two_layers=two_layers,
                     conv_ends=(8, 12, 16))
+
+
+class SkipTests(unittest.TestCase):
+    """2026-11-02: frame skip (Dynamics skip): steps of 1..skip frames, every frame's byte, a frame clock."""
+
+    def skip_model(self):
+        """tiny() grown to skip 4, its earlier bytes' map no longer zero (as if trained)."""
+        model = Dynamics(dim=32, layers=2, heads=2, patch=16, frames=6, colour_dim=8, skip=4).eval()
+        missing, _ = model.load_state_dict(tiny().state_dict(), strict=False)
+        self.assertEqual(sorted(missing), ["skipped_action.bias", "skipped_action.weight"])
+        return model
+
+    def test_grown_skip_model_is_the_model_at_one_frame_a_step(self):
+        base, model = tiny().eval(), self.skip_model()
+        x, actions = window(2, 4), torch.tensor([[-1, 0, 64, 1]] * 2)
+        mask = torch.zeros(2, 4, 256, dtype=torch.bool)
+        mask[:, -1] = True
+        with torch.no_grad():
+            self.assertTrue(torch.equal(base(x, actions, mask), model(x, actions, mask)))   # its map from zero
+            torch.nn.init.normal_(model.skipped_action.weight, std=0.1)
+            alone = model(x, actions, mask)
+            none = model(x, actions, mask, skipped=torch.full((2, 4, 3), -1), times=torch.arange(4).expand(2, 4))
+            self.assertTrue(torch.allclose(alone, none, atol=1e-6))        # no skipped bytes: one frame a step
+            pressed = model(x, actions, mask, skipped=torch.tensor([[[-1] * 3, [-1] * 3, [-1] * 3, [8, 8, -1]]] * 2),
+                            times=torch.tensor([[0, 1, 2, 5]] * 2))
+            self.assertFalse(torch.allclose(alone[:, -1], pressed[:, -1], atol=1e-4))   # a skipped step is another
+
+    def test_training_window_and_dream_cache_agree_on_a_skip_window(self):
+        model = self.skip_model()
+        torch.nn.init.normal_(model.skipped_action.weight, std=0.1)
+        x, actions = window(2, 5, seed=3), torch.tensor([[-1, 0, 64, 1, 0], [-1, 2, 2, 0, 128]])
+        times = torch.tensor([[0, 1, 4, 5, 9], [0, 3, 4, 8, 12]])                  # each row its own gaps
+        skipped = torch.full((2, 5, 3), -1)
+        skipped[0, 2, :2], skipped[0, 4, :3], skipped[1, 1, :2], skipped[1, 3, :3] = 64, 0, 2, 0
+        visible = torch.zeros(2, 5, 256, dtype=torch.bool)
+        with torch.no_grad():
+            whole = model(x, actions, visible, skipped=skipped, times=times)
+            cache = model.new_cache()
+            start = model(x[:, :4], actions[:, :4], visible[:, :4], cache=cache, skipped=skipped[:, :4],
+                          times=times[:, :4])
+            step = model(x[:, 4:], actions[:, 4:], visible[:, :1], cache=cache, at=4, skipped=skipped[:, 4:],
+                         clock=times[:, 4])
+        self.assertTrue(torch.allclose(start, whole[:, :4], atol=1e-5))
+        self.assertTrue(torch.allclose(step, whole[:, 4:], atol=1e-5))
+
+    def test_dreamer_steps_count_frames_on_the_clock(self):
+        model = self.skip_model()
+        with torch.no_grad():
+            dreamer = Dreamer(model, window(1, 3)[0], torch.tensor([-1, 0, 0]))
+            dreamer.step(0)
+            dreamer.step(1, earlier=[0, 0])
+            self.assertEqual((dreamer.t, dreamer.clock), (5, 2 + 1 + 3))
+            with self.assertRaises(ValueError):
+                dreamer.step(0, earlier=[0] * 4)                                   # 5 frames: past skip 4
+
+    def test_the_changed_pixels_loss_splits_by_its_steps_frames(self):
+        import train_dynamics_ui as D
+        model = self.skip_model().train()
+        x, acts = window(2, 5, seed=3), torch.randint(0, 256, (2, 5), generator=torch.Generator().manual_seed(0))
+        times = torch.tensor([[0, 1, 4, 5, 9], [0, 3, 4, 8, 12]])                 # steps of 1, 3 and 4 frames
+        losses = D.train_step(model, model, x, acts, generator=torch.Generator().manual_seed(1),
+                              skips={"skipped": torch.full((2, 5, 3), -1), "times": times})
+        sums = {k: float(v) for k, v in losses["pressed"].items()}
+        self.assertEqual((sums["skip_px_2"], sums["skip_px_5"], sums["skip_px_6"]), (0, 0, 0))
+        self.assertGreater(sums["skip_px_1"] + sums["skip_px_3"] + sums["skip_px_4"], 0)
+        whole = sum(sums[f"skip_loss_{g}"] for g in range(1, 7)) / sum(sums[f"skip_px_{g}"] for g in range(1, 7))
+        self.assertAlmostEqual(whole, float(losses["changed"]), places=4)     # the split adds up to the whole
 
 
 class ConvEndsTests(unittest.TestCase):

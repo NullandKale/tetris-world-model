@@ -42,7 +42,7 @@ from token_world.data.model_frames import blank_bands, border_slots
 from token_world.data.rom import tetris_rom
 from token_world.data.tetris_bot import A, B, BOARD, DOWN, EMPTY, LEFT, RIGHT, SELECT, START, UP, BrainSwitcher
 from token_world.data.tetris_events import ALONE, LOOKAHEAD, events_at, frame_events
-from token_world.data.tetris_motion import stream_motion
+from token_world.data.tetris_motion import GRID, UNKNOWN, frame_motion, stream_motion
 from token_world.data.world_nes_windows import window_stride, world_nes_windows, worker_seed
 
 BORDER_STATE = (0x45, 0x46)     # drawn in every frame's border: the fall timer and the autorepeat counter
@@ -492,6 +492,93 @@ def picture(x: torch.Tensor) -> np.ndarray:
     return x
 
 
+SKIP_CHUNK = 64                 # SkipWindows' observations per chunk of the emulator's stream
+
+
+def step_bytes(actions: np.ndarray, at: np.ndarray, skip: int) -> tuple[np.ndarray, np.ndarray]:
+    """A skip window's buttons (SkipWindows): stream actions [F] (actions[i] takes frame i to i + 1) and its steps'
+    frames `at` [S] -> "action" [S] (step k's to k + 1: the last frame's byte; the last entry padding, step S - 2's)
+    and "skipped" [S, skip - 1] (the bytes of the frames before it, newest first, -1 past the step's frames). What
+    the model reads is these a step later (dynamics.incoming_actions, incoming_skipped). The browser's input traces
+    are checked against this (diagnostics/input_trace.py)."""
+    acts, steps = np.asarray(actions), len(at)
+    action = np.empty(steps, np.int64)
+    skipped = np.full((steps, skip - 1), -1, np.int64)
+    for i in range(steps - 1):
+        frames = acts[at[i]:at[i + 1]][::-1]            # the step's bytes, newest first
+        if not 1 <= len(frames) <= skip:
+            raise ValueError(f"step {i}: {len(frames)} frames, a step covers 1..{skip}")
+        action[i], skipped[i, :len(frames) - 1] = frames[0], frames[1:]
+    action[-1], skipped[-1] = action[-2], skipped[-2]                                # padding
+    return action, skipped
+
+
+class SkipWindows:
+    """Frame skip (Dynamics skip, 2026-11-02): windows of `steps` steps cut from a stream's consecutive
+    observations (chunks of world_nes_windows, consecutive ones sharing one), each step 1..skip frames after the
+    one before, uniform, drawn per step (a device's pace changes as it plays). A step keeps its observation (x,
+    ram) and the bytes every frame since the step before was played with: "action" [steps] the last one (stream
+    actions: action k takes step k to k + 1; the last entry padding, as a window's), "skipped" [steps, skip - 1]
+    the ones before it, newest first, -1 past the step's frames; "times" [steps] each step on the frame clock,
+    the first at 0; "piece" its piece byte; "events" [steps] the events its picture is the first step's to show
+    (tetris_events.frame_events on every frame: a skipped picture's go to the step after it); with motion,
+    "motion" [steps, 32, 32] each step's from the step before (tetris_motion.frame_motion on the two pictures
+    and the RAM each shows; the first UNKNOWN). Consecutive windows share one step and tick counts steps (as
+    stride steps - 1: LiveBatches checks whole windows)."""
+
+    def __init__(self, steps: int, skip: int, rng: np.random.Generator, motion: bool = False):
+        self.steps, self.skip, self.rng, self.motion = steps, skip, rng, motion
+        self.x, self.ram, self.actions = [], [], []      # observations held; actions[i] took i to i + 1
+        self.start = 1                                   # the window's first step (one observation before it)
+        self.at = None                                   # its steps, once drawn
+        self.windows = 0
+
+    def __call__(self, chunks):
+        for chunk in chunks:
+            first = 0 if not self.x else 1               # a later chunk's first observation is held already
+            self.x.extend(chunk["x"].numpy()[first:])
+            self.ram.extend(chunk["ram"].numpy()[first:])
+            self.actions.extend(chunk["action"].numpy()[:-1].tolist())                # the last is padding
+            while (window := self.cut()) is not None:
+                window.update(in_game_restarts=chunk["in_game_restarts"], worker_id=chunk["worker_id"])
+                yield window
+
+    def cut(self) -> dict | None:
+        if self.at is None:
+            gaps = self.rng.integers(1, self.skip + 1, self.steps - 1)
+            self.at = self.start + np.concatenate(([0], np.cumsum(gaps)))
+        last = int(self.at[-1])
+        if len(self.x) <= last + LOOKAHEAD:              # the RAM after the last step its events may read
+            return None
+        at, acts = self.at, np.array(self.actions)
+        action, skipped = step_bytes(acts, at, self.skip)
+        x = np.stack([self.x[i] for i in at])
+        ram = np.stack([self.ram[i] for i in at])
+        lo, hi = at[0] - 1, last + LOOKAHEAD + 1         # every frame from the one before the first step
+        raw = np.stack(self.x[lo:hi])
+        pictures = picture(torch.from_numpy(raw))
+        shown = frame_events(pictures, np.stack(self.ram[lo:hi]), np.append(acts[lo:hi - 1], acts[hi - 2]))
+        events = np.zeros(self.steps, np.int64)
+        step = np.searchsorted(at, np.arange(lo, hi))   # each frame's step: the first at or after it
+        keep = (np.arange(lo, hi) >= at[0]) & (np.arange(lo, hi) <= last)
+        np.bitwise_or.at(events, step[keep], shown[keep])
+        window = {"x": torch.from_numpy(x), "action": torch.from_numpy(action), "skipped": torch.from_numpy(skipped),
+                  "times": torch.from_numpy(at - at[0]), "ram": torch.from_numpy(ram),
+                  "piece": torch.from_numpy(ram[:, PIECE].astype(np.int64)), "events": torch.from_numpy(events)}
+        if self.motion:
+            motion = np.full((self.steps, GRID, GRID), UNKNOWN, np.uint8)
+            for i in range(1, self.steps):
+                motion[i] = frame_motion(pictures[at[i - 1] - lo], pictures[at[i] - lo],
+                                         self.ram[at[i - 1] - 1], self.ram[at[i] - 1])[0]
+            window["motion"] = torch.from_numpy(motion)
+        self.windows += 1
+        window["tick"] = self.windows * (self.steps - 1)
+        drop = last - 1                                  # the next window starts at this one's last step
+        del self.x[:drop], self.ram[:drop], self.actions[:drop]
+        self.start, self.at = last - drop, None
+        return window
+
+
 def actors(session: TetrisSession, action: np.ndarray) -> np.ndarray:
     """A window's stream actions [T] (the last one padding) -> who chose each [T] (ACTORS indices), from the
     session's record: the record's last T - 1 bytes are the window's first T - 1 (act() has not yet run for the
@@ -528,13 +615,16 @@ class WorldNesTetrisStreams(IterableDataset):
     Every window also has "piece" [frames], each frame's RAM orientation byte (0x42), and "events" [frames],
     the events each picture first shows (tetris_events.frame_events). branches: workers 0 .. branches - 1 give every window a counterfactual twin under "branch" (TurnBranches;
     with its motion too), and hold their windows back until their first twin is made.
+    skip (> 1): every window is `frames` steps of 1..skip frames each (SkipWindows: also "skipped" and "times"),
+    consecutive windows sharing one step (stride frames - 1); every window kept (KEEP_ALL, without its labels:
+    no data_ counts), no branches, who or effects.
     """
 
     def __init__(self, frames: int = 64, seed: int = 17, repo: str | None = None, stride: int | None = None,
                  layered: bool = False, screens: Screens | None = None, toss: Toss | None = None,
                  sprites: bool = False, judged: int | None = None, marked: bool = False, motion: bool = False,
                  branches: int = 0, layers: bool = False, who: bool = False, effects: bool = False,
-                 blank: bool = False):
+                 blank: bool = False, skip: int = 1):
         self.frames, self.seed, self.repo, self.layered, self.motion = int(frames), int(seed), repo, layered, motion
         self.layers = layers
         self.who, self.effects = who, effects
@@ -545,6 +635,12 @@ class WorldNesTetrisStreams(IterableDataset):
         self.sprites, self.judged, self.marked = sprites, judged, marked
         self.new_frames = window_stride(self.frames, stride)
         self.screens, self.toss = screens, toss
+        self.skip = int(skip)
+        if self.skip > 1 and ((toss is not None and toss != KEEP_ALL) or branches or who or effects or layered
+                              or sprites or self.new_frames != self.frames - 1):
+            raise ValueError("skip windows are cut from the stream's every frame, consecutive windows sharing one "
+                             "step: every window kept (unlabelled), no branches, who, effects, layered or sprites, "
+                             "stride frames - 1")
 
     def __iter__(self):
         from token_world.data.nes_palette import tetris_palette
@@ -552,14 +648,19 @@ class WorldNesTetrisStreams(IterableDataset):
         rom = tetris_rom(self.repo)
         session = TetrisSession(seed) if self.screens is None else ScreensSession(seed, self.screens)
         toss = (WindowToss(self.toss, np.random.default_rng([seed, 2]), self.new_frames, self.judged, self.marked)
-                if self.toss is not None else None)
+                if self.toss is not None and self.skip == 1 else None)       # skip: every window, unlabelled
         branch = (TurnBranches(np.random.default_rng([seed, 3]), self.frames) if worker_id < self.branches
                   else None)
+        chunked = self.skip > 1                         # skip windows: cut from chunks of every frame
         windows = world_nes_windows(rom, session, border_slots(tetris_palette()), BORDER_STATE,
-                                    self.frames, self.new_frames, worker_id, toss=toss, layered=self.layered,
+                                    SKIP_CHUNK if chunked else self.frames,
+                                    SKIP_CHUNK - 1 if chunked else self.new_frames, worker_id, toss=toss,
+                                    layered=self.layered,
                                     sprites=self.sprites, branch=branch, layers=self.layers,
                                     stamp=(lambda w: w.update(who=torch.from_numpy(actors(session, w["action"].numpy()))))
                                     if self.who else None)   # who chose each press: now, before any toss
+        if chunked:
+            windows = SkipWindows(self.frames, self.skip, np.random.default_rng([seed, 4]), self.motion)(windows)
         slots = border_slots(tetris_palette())
         for window in windows:
             if branch is not None and "branch" not in window:

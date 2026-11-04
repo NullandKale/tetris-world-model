@@ -231,5 +231,36 @@ class ScreensTests(unittest.TestCase):
         self.assertEqual([SCREENS[i] for i in screens(ram)], ["play", "paused", "game over", "legal", "menu"])
 
 
+class SkipWindowTests(unittest.TestCase):
+    """2026-11-02: SkipWindows cuts frame-skip windows from chunks of every frame."""
+
+    def test_each_step_keeps_its_frame_and_every_byte_since_the_last(self):
+        from token_world.data.world_nes_tetris import SkipWindows
+
+        def chunks(n=8, size=16):                          # frame i: pixel (0, 0) = i; byte of frame i: i % 200
+            for c in range(n):
+                ids = np.arange(c * (size - 1), c * (size - 1) + size)
+                x = np.zeros((size, 256, 256), np.uint8)
+                x[:, 0, 0] = ids % 256
+                yield {"x": torch.from_numpy(x), "ram": torch.zeros(size, 2048, dtype=torch.uint8),
+                       "action": torch.from_numpy(np.append(ids[:-1] % 200, ids[-2] % 200)),
+                       "in_game_restarts": 0, "worker_id": 0}
+
+        windows = list(SkipWindows(5, 3, np.random.default_rng(1))(chunks()))
+        self.assertGreater(len(windows), 3)
+        for n, w in enumerate(windows):
+            frame = w["x"][:, 0, 0].long()
+            self.assertEqual(w["tick"], 4 * (n + 1))                        # steps, 4 new a window
+            self.assertTrue(torch.equal(w["times"], frame - frame[0]))      # the frame clock
+            gaps = frame.diff()
+            self.assertTrue(((gaps >= 1) & (gaps <= 3)).all())
+            for k in range(4):                                             # step k to k + 1: frames' bytes
+                bytes_ = list(range(int(frame[k]), int(frame[k + 1])))[::-1]   # newest first
+                self.assertEqual(int(w["action"][k]), bytes_[0])
+                self.assertEqual(w["skipped"][k].tolist(), bytes_[1:] + [-1] * (2 - len(bytes_[1:])))
+            if n:
+                self.assertTrue(torch.equal(windows[n - 1]["x"][-1], w["x"][0]))   # one step shared
+
+
 if __name__ == "__main__":
     unittest.main()
