@@ -1027,7 +1027,9 @@ frames on the frame clock, what the temporal rotary turns by; `at` still places 
 masks), and the prefill adds the "no earlier bytes" embedding to the start's frames. `dreamer.next(action,
 earlier)` takes the step's newest byte and the others, newest first. Any other model gets one frame a step, as
 before. Since 2026-11-03 the page plays the skip run (`s9_skip`), and there are no other builds to pick
-(`?model` is gone).
+(`?model` is gone). The **Frame skip** menu sets a step's frames: Auto (the frames passed, 1 to the model's skip)
+or a fixed 1..skip, where every step waits for that many frames and covers exactly them (a device too slow for it
+slows the game). The choice is kept in the browser (localStorage).
 
 The input trace makes sure the browser gives a model its buttons in training's order. `dreamer.trace` records
 what every step fed the step graph (both frames' bytes, earlier bytes, clock, ring place), and the page keeps

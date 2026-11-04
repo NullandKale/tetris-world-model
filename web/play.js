@@ -39,6 +39,9 @@ const touches = new Map();                          // on-screen button held by 
 const presses = new Presses();                      // the buttons at 60 frames a second (presses.js)
 let traced = [];                                    // every game frame's byte the steps since the last reset got,
                                                     // oldest first: the trace's own record (Save trace)
+let skipChoice = 0;                                 // the frames each step covers (the Frame skip menu): 0, the
+                                                    // frames passed since the last step (at most the model's skip)
+const SKIP_KEY = "frame-skip";                      // the choice, kept in this browser
 
 const load = logged(async (name) => {
   const response = await fetch(`model/${name}`);
@@ -82,6 +85,7 @@ async function start() {
       sessionOptions: { ...(PROFILE ? { enableProfiling: true } : {}),
                         ...(VERBOSE ? { logSeverityLevel: 0, logVerbosityLevel: 0 } : {}) } });
     if (backend === "webgpu") await watchDevice(ort);
+    setupSkip();
     log(`ready: ${dreamer.meta.parameters.toLocaleString()} parameters, ${dreamer.n} tokens a frame, ` +
         `${dreamer.meta.frames}-frame window`);
     screen.focus();
@@ -127,14 +131,34 @@ async function check() {
 const TOLERANCE = 2;                             // colour values: PyTorch's are rounded to bytes
 const median = (xs) => xs.length ? [...xs].sort((a, b) => a - b)[xs.length >> 1] : NaN;
 
-// The play loop on the game's clock (presses.js): a step starts at the earliest at the next frame's 60th of a
-// second and covers the frames since the last step's, at most MAX_SKIP (the skip: the Timeline shows each step's
-// frames and their buttons). A frame-skip model's step is all of them: the newest frame's byte and the others',
-// newest first (dreamer.next), as training gives a step (data/world_nes_tetris.py step_bytes). Any other model
-// takes one frame a step whatever the skip, from the buttons held now and those tapped since the last step.
+// The Frame skip menu: Auto (0) or 1..the model's skip (at most MAX_SKIP); a model without frame skip has only 1.
+function setupSkip() {
+  const select = $("skip"), most = dreamer.skip > 1 ? Math.min(MAX_SKIP, dreamer.skip) : 1;
+  const counts = Array.from({ length: most }, (_, i) => new Option(`${i + 1} frame${i ? "s" : ""}`, `${i + 1}`));
+  select.replaceChildren(...(most > 1 ? [new Option(`Auto (1–${most})`, "0")] : []), ...counts);
+  let saved = 0;
+  try { saved = Number(localStorage.getItem(SKIP_KEY)) || 0; } catch { /* no storage: Auto */ }
+  skipChoice = most > 1 && saved <= most ? saved : 0;
+  select.value = String(skipChoice || (most > 1 ? 0 : 1));
+  select.disabled = most === 1;
+  select.addEventListener("change", () => {
+    skipChoice = Number(select.value);
+    try { localStorage.setItem(SKIP_KEY, select.value); } catch { /* kept for this visit only */ }
+    screen.focus();
+  });
+}
+
+// The play loop on the game's clock (presses.js). Auto: a step starts at the earliest at the next frame's 60th of a
+// second and covers the frames since the last step's, at most the model's skip (MAX_SKIP at most); a chosen skip N:
+// a step starts at the earliest when N frames have passed and covers exactly N. A step slower than that most
+// slows the game down (the Timeline shows each step's frames and their buttons). A frame-skip model's step is all
+// of them: the newest frame's byte and the others', newest first (dreamer.next), as training gives a step
+// (data/world_nes_tetris.py step_bytes). Any other model takes one frame a step whatever the skip, from the
+// buttons held now and those tapped since the last step.
 async function run() {
   let average = 0, frames = 0, last = performance.now();
-  const skips = dreamer.skip > 1, most = skips ? Math.min(MAX_SKIP, dreamer.skip) : MAX_SKIP;
+  const skips = dreamer.skip > 1, cap = skips ? Math.min(MAX_SKIP, dreamer.skip) : MAX_SKIP;
+  const each = () => skips ? skipChoice : 0;          // the chosen skip; 0: Auto
   let shown = presses.frame(last);                   // the game frame on the screen
   const timings = new Timings(), graph = new FrameGraph($("frame-graph"), $("frame-legend"));
   const timeline = new Timeline($("press-timeline"), $("press-stats"));
@@ -146,8 +170,8 @@ async function run() {
       presses.restart(shown + 1, last);              // the clock stops while paused
       continue;
     }
-    const began = performance.now();
-    let reached = Math.max(shown + 1, presses.frame(began));     // the game frame this step shows
+    const began = performance.now(), most = each() || cap;
+    let reached = Math.max(shown + (each() || 1), presses.frame(began));   // the game frame this step shows
     let dropped = 0;
     if (reached - shown > most) {                    // too slow even skipping: the game slows down, and the
       for (const byte of presses.bytes(shown + 1, reached - most + 1)) dropped |= byte;   // frames it drops
@@ -171,7 +195,7 @@ async function run() {
     const took = performance.now() - began;
     average = frames++ ? 0.9 * average + 0.1 * took : took;
     if (SLOW) await sleep(SLOW - took);
-    await sleep(presses.start(shown + 1) - performance.now());
+    await sleep(presses.start(shown + (each() || 1)) - performance.now());
     const now = performance.now(), fps = 1000 / (now - last);
     graph.add(now - last, dreamer.timing.run, dreamer.timing.write, drawn);
     last = now;

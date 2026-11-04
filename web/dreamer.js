@@ -46,8 +46,9 @@ const IN_FLIGHT = 2;
 const STATE = 3;                                          // tensors a step hands the next: content, motion, last
 export const TRACE = 36_000;                              // steps a trace keeps (10 minutes at 60 a second)
 // Frames an embed run takes at most: each frame is embedded alone (a patch convolution), so a long start goes in
-// runs. 63 frames at once failed on a phone's GPU (2026-11-03, Android: "Invalid ShaderModule Conv2dMM"); 3,
-// the old start's length, played there.
+// runs. A phone's GPU failed on the 63-frame start (2026-11-03, Android: "Invalid ShaderModule Conv2dMM"), but
+// that build also carried the fused-attention graphs that failed there before (models/onnx_export.py), so which
+// broke it is not known; 3, the old start's length, is the size the phone has run.
 const EMBED_RUN = 3;
 
 export class Dreamer {
